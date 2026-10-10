@@ -127,6 +127,17 @@ button:disabled {
   opacity: 0.6;
 }
 
+.card.expired {
+  opacity: 0.75;
+  border-style: dashed;
+}
+
+.result-text {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .row {
   display: flex;
   justify-content: space-between;
@@ -214,6 +225,15 @@ fieldset {
   background: #f8c9c9;
 }
 
+.status-suspended {
+  background: #e3dcf5;
+}
+
+.status-expired {
+  background: #fff0c2;
+  border: 1px dashed #b38a00;
+}
+
 @media (min-width: 800px) {
   .columns {
     flex-direction: row;
@@ -276,6 +296,15 @@ fieldset {
 
   .status-failed {
     background: #662020;
+  }
+
+  .status-suspended {
+    background: #3a3060;
+  }
+
+  .status-expired {
+    background: #4d4010;
+    border-color: #b38a00;
   }
 
   .hint {

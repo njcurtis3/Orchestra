@@ -8,6 +8,7 @@ const LABELS: Record<SessionStatus, string> = {
   waiting_question: "Has a question",
   needs_attention: "Needs attention",
   idle: "Idle",
+  suspended: "Paused",
   ended: "Ended",
   failed: "Failed",
 };
@@ -20,6 +21,7 @@ const LIVE: Record<SessionStatus, boolean> = {
   waiting_question: true,
   needs_attention: true,
   idle: true,
+  suspended: false,
   ended: false,
   failed: false,
 };

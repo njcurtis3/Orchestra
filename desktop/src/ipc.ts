@@ -92,11 +92,26 @@ export function decodeInboxItem(v: unknown): InboxItem {
     kind: oneOf(o, "kind", INBOX_KINDS),
     created_at: num(o, "created_at"),
     resolved: bool(o, "resolved"),
+    expired: bool(o, "expired"),
     summary: str(o, "summary"),
     tool_name: strOrNull(o, "tool_name"),
     tool_input_preview: strOrNull(o, "tool_input_preview"),
     questions: qs === null || qs === undefined ? null : arr(qs, "questions").map(decodeQuestion),
+    result_text: strOrNull(o, "result_text"),
   };
+}
+
+// Whether history was loaded and is being saved. Carries no path.
+export type StorageStatus =
+  | { ok: true }
+  | { ok: false; reason: "unknown_schema_version" | "unreadable"; found_version: number | null };
+
+export function decodeStorageStatus(v: unknown): StorageStatus {
+  const o = obj(v, "storage status");
+  if (bool(o, "ok")) return { ok: true };
+  const reason = oneOf(o, "reason", ["unknown_schema_version", "unreadable"] as const);
+  const found = o.found_version;
+  return { ok: false, reason, found_version: found === null || found === undefined ? null : num(o, "found_version") };
 }
 
 export const decodeSessions = (v: unknown): SessionSummary[] =>
@@ -115,6 +130,9 @@ export async function startSession(projectId: string, prompt: string): Promise<S
   return decodeSession(
     await invoke<unknown>("start_session", { args: { project_id: projectId, prompt } }),
   );
+}
+export async function storageStatus(): Promise<StorageStatus> {
+  return decodeStorageStatus(await invoke<unknown>("storage_status"));
 }
 export async function listSessions(): Promise<SessionSummary[]> {
   return decodeSessions(await invoke<unknown>("list_sessions"));

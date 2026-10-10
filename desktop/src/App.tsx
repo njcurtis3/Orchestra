@@ -6,6 +6,8 @@ import {
   onInboxUpdated,
   onSessionUpdated,
   pickProject,
+  storageStatus,
+  type StorageStatus,
 } from "./ipc";
 import { initialState, reducer } from "./state";
 import type { Project } from "./types";
@@ -22,6 +24,7 @@ function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [projects, setProjects] = useState<Project[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [storage, setStorage] = useState<StorageStatus>({ ok: true });
 
   const fail = useCallback((e: unknown) => setError(errText(e)), []);
 
@@ -39,15 +42,17 @@ function App() {
           return;
         }
         unlisten.push(u1, u2);
-        const [sessions, items, projs] = await Promise.all([
+        const [sessions, items, projs, store] = await Promise.all([
           listSessions(),
           listInbox(),
           listProjects(),
+          storageStatus(),
         ]);
         if (cancelled) return;
         dispatch({ type: "sessions-loaded", sessions });
         dispatch({ type: "inbox-loaded", items });
         setProjects(projs);
+        setStorage(store);
       } catch (e) {
         fail(e);
       }
@@ -76,6 +81,15 @@ function App() {
         </button>
         <NewSession projects={projects} onError={fail} />
       </header>
+      {!storage.ok && (
+        <div className="banner" role="alert">
+          <span>
+            {storage.reason === "unknown_schema_version"
+              ? "Saved history was written by a newer version of Orchestra and was not loaded. Nothing will be saved this run."
+              : "Saved history could not be read and was not loaded. Nothing will be saved this run."}
+          </span>
+        </div>
+      )}
       {error && (
         <div className="banner" role="alert">
           <span>{error}</span>

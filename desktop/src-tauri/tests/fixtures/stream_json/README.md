@@ -16,6 +16,7 @@ observation (`alive_after_final_result`, `exit`). Strip `_dir` to get the wire m
 | `permission_deny.jsonl` | same, host replies deny |
 | `ask_user_question.jsonl` | model calls AskUserQuestion; host answers with `answers` |
 | `multi_turn.jsonl` | two user messages on one process |
+| `resume_unknown_id.jsonl` | `--resume` with an id claude does not know -> an error result, exit 1 |
 
 ## Redaction
 
@@ -86,5 +87,21 @@ cwd = the project directory; `--permission-prompts` left at its default (`host`)
 Write one JSON user message per line to stdin
 (`{"type":"user","message":{"role":"user","content":"<text>"}}`); read stdout line by line;
 answer every `control_request` with `can_use_tool` using the reply shape in 2/3, keyed by `request_id`.
+
+## Resume (D2)
+
+Probed by hand against `claude` 2.1.296 (Windows, model `haiku`) with the fixed args plus
+`--resume <session id>`:
+
+- Resuming a known id emits `system/init` with the **same** `session_id`, accepts a new user
+  line, returns a `result` with that id, and exits 0 when stdin closes.
+- A `can_use_tool` after resume works as before; an allow reply is honoured.
+- A request left open when the old process was killed is **not** re-emitted on resume.
+- Resuming an unknown id returns a `result` with `subtype: "error_during_execution"` and the
+  id echoed, then exits 1. `resume_unknown_id.jsonl` is **reconstructed** from that
+  observation, not a verbatim capture: `is_error` was not recorded in the probe, so the
+  fixture sets it to `true` (the `result` parser reads a missing `is_error` as `false`), and
+  `duration_ms`, `num_turns` and the `errors` text are illustrative. Ids are placeholders.
+- Not tested: resuming from a different working directory than the original session.
 
 VERDICT: CONFIRMED

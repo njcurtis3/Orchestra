@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeSession } from "./ipc";
+import { decodeInboxItem, decodeSession, decodeStorageStatus } from "./ipc";
 
 const wire = (status: unknown) => ({
   id: "s1",
@@ -19,5 +19,68 @@ describe("decodeSession status", () => {
 
   it("rejects an unknown status", () => {
     expect(() => decodeSession(wire("on_fire"))).toThrow("unknown status");
+  });
+});
+
+const itemWire = (over: Record<string, unknown> = {}) => ({
+  id: "s1-i1",
+  session_id: "s1",
+  kind: "finished",
+  created_at: 1,
+  resolved: false,
+  expired: false,
+  summary: "done",
+  tool_name: null,
+  tool_input_preview: null,
+  questions: null,
+  result_text: null,
+  ...over,
+});
+
+describe("decodeSession suspended", () => {
+  it("accepts suspended", () => {
+    expect(decodeSession(wire("suspended")).status).toBe("suspended");
+  });
+});
+
+describe("decodeInboxItem", () => {
+  it("decodes expired and result_text", () => {
+    const i = decodeInboxItem(itemWire({ resolved: true, expired: true, result_text: "full text" }));
+    expect([i.expired, i.result_text]).toEqual([true, "full text"]);
+  });
+
+  it("treats a missing result_text as null", () => {
+    const { result_text: _drop, ...rest } = itemWire();
+    expect(decodeInboxItem(rest).result_text).toBeNull();
+  });
+
+  it("rejects an item missing expired", () => {
+    const { expired: _drop, ...rest } = itemWire();
+    expect(() => decodeInboxItem(rest)).toThrow("bad field expired");
+  });
+
+  it("rejects a mistyped expired or result_text", () => {
+    expect(() => decodeInboxItem(itemWire({ expired: "yes" }))).toThrow("bad field expired");
+    expect(() => decodeInboxItem(itemWire({ result_text: 3 }))).toThrow("bad field result_text");
+  });
+});
+
+describe("decodeStorageStatus", () => {
+  it("decodes ok and the two failure reasons", () => {
+    expect(decodeStorageStatus({ ok: true })).toEqual({ ok: true });
+    expect(decodeStorageStatus({ ok: false, reason: "unknown_schema_version", found_version: 2 })).toEqual({
+      ok: false,
+      reason: "unknown_schema_version",
+      found_version: 2,
+    });
+    expect(decodeStorageStatus({ ok: false, reason: "unreadable" })).toEqual({
+      ok: false,
+      reason: "unreadable",
+      found_version: null,
+    });
+  });
+
+  it("rejects an unknown reason", () => {
+    expect(() => decodeStorageStatus({ ok: false, reason: "disk_on_fire" })).toThrow("unknown reason");
   });
 });
