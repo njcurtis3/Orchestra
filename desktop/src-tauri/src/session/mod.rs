@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::notify::{self, Notice};
 use crate::projects::{Project, Projects};
 use process::{Output, Proc, SpawnArgs};
 use settings::{Model, PermissionMode, SessionSettings};
@@ -52,6 +53,9 @@ pub enum Event {
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
 pub type Sink = Box<dyn Fn(Output) + Send>;
+/// Called with the project name and a notice after a change worth telling the user about.
+/// Runs on the reader thread with no lock held, and must not call back into `Sessions`.
+pub type Notify = Box<dyn Fn(&str, Notice) + Send + Sync>;
 /// Starts a child in the given directory with the session's settings, resuming a saved
 /// conversation when given its id; every stdout line and the exit go to the sink.
 pub type Spawner = Box<dyn Fn(&Path, &SpawnArgs, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
@@ -193,6 +197,7 @@ pub struct Sessions {
     emit_order: Mutex<()>,
     emit: Emit,
     spawner: Spawner,
+    notify: Notify,
     /// `None` when saving is off: tests, or a state file this build must not touch.
     writer: Option<Writer>,
     transcripts: TranscriptStore,
@@ -201,12 +206,19 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>, transcripts: TranscriptStore) -> Arc<Self> {
+    pub fn with_writer(
+        emit: Emit,
+        spawner: Spawner,
+        notify: Notify,
+        writer: Option<Writer>,
+        transcripts: TranscriptStore,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: Mutex::new(Inner::default()),
             emit_order: Mutex::new(()),
             emit,
             spawner,
+            notify,
             writer,
             transcripts,
             me: me.clone(),
@@ -448,6 +460,7 @@ impl Sessions {
         if inner.shutting_down {
             return;
         }
+        let before = inner.sessions.get(session_id).map(|s| (s.state.status, s.state.inbox.len()));
         if let Some(s) = inner.sessions.get_mut(session_id) {
             match (message, out) {
                 (Some(m), _) => s.state.apply(m, now),
@@ -455,6 +468,12 @@ impl Sessions {
                 (None, Output::Line(_)) => {}
             }
         }
+        // Decided under the lock, told after it: the callback runs with nothing held.
+        let notice = before.and_then(|(status, items)| {
+            let s = inner.sessions.get(session_id)?;
+            let added = if s.state.inbox.len() > items { s.state.inbox.last().map(|i| i.kind) } else { None };
+            notify::decide(status, s.state.status, added).map(|n| (s.project_name.clone(), n))
+        });
         // A line can end a session only when a resume failed; the process has no more use.
         let dead = inner
             .sessions
@@ -462,6 +481,9 @@ impl Sessions {
             .filter(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed))
             .and_then(|s| s.proc.clone());
         self.publish_line(inner, session_id, appended);
+        if let Some((project, notice)) = notice {
+            (self.notify)(&project, notice);
+        }
         if let Some(p) = dead {
             p.kill();
         }
@@ -714,6 +736,8 @@ mod tests {
         spawns: Arc<Mutex<Vec<(std::path::PathBuf, Option<String>)>>>,
         /// The settings of every spawn, in order.
         spawn_settings: Arc<Mutex<Vec<SessionSettings>>>,
+        /// Every notice the notifier was given: the project name and the kind.
+        notices: Arc<Mutex<Vec<(String, crate::notify::NoticeKind)>>>,
     }
 
     fn rig() -> (Rig, Project) {
@@ -731,7 +755,9 @@ mod tests {
         let events = Arc::new(Mutex::new(vec![]));
         let spawns = Arc::new(Mutex::new(vec![]));
         let spawn_settings = Arc::new(Mutex::new(vec![]));
-        let (f2, s2, e2, p2, g2) = (fake.clone(), sink.clone(), events.clone(), spawns.clone(), spawn_settings.clone());
+        let notices = Arc::new(Mutex::new(vec![]));
+        let (f2, s2, e2, p2, g2, n2) =
+            (fake.clone(), sink.clone(), events.clone(), spawns.clone(), spawn_settings.clone(), notices.clone());
         let sessions = Sessions::with_writer(
             Box::new(move |e| e2.lock().unwrap().push(e)),
             Box::new(move |dir, spawn, sk| {
@@ -740,11 +766,12 @@ mod tests {
                 *s2.lock().unwrap() = Some(sk);
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
+            Box::new(move |project, notice| n2.lock().unwrap().push((project.to_string(), notice.kind))),
             writer,
             TranscriptStore::memory(),
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
-        (Rig { sessions, fake, sink, events, spawns, spawn_settings }, project)
+        (Rig { sessions, fake, sink, events, spawns, spawn_settings, notices }, project)
     }
 
     impl Rig {
@@ -1386,6 +1413,93 @@ mod tests {
         let page = r.sessions.transcript("s1").unwrap();
         assert!(matches!(&page.entries[0].entry, Entry::UserPrompt { text, .. } if text == "and then?"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    mod notify {
+        use super::*;
+        use crate::notify::NoticeKind;
+
+        fn kinds(r: &Rig) -> Vec<NoticeKind> {
+            r.notices.lock().unwrap().iter().map(|(_, k)| *k).collect()
+        }
+
+        #[test]
+        fn a_session_walks_through_its_notices() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            assert!(kinds(&r).is_empty(), "starting to working is silent");
+            r.feed(PERM);
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput]);
+            let name = std::env::temp_dir().file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(r.notices.lock().unwrap()[0].0, name, "the project name goes with it");
+            let item = r.sessions.list_inbox().remove(0);
+            r.sessions.answer_permission(&item.id, Decision::Allow, None).unwrap();
+            assert_eq!(kinds(&r).len(), 1, "answering notifies nobody");
+            r.feed(DONE);
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput, NoticeKind::Finished]);
+            r.sessions.reply(&s.id, "more").unwrap();
+            r.feed(r#"{"type":"result","subtype":"error","is_error":true,"result":"boom"}"#);
+            assert_eq!(kinds(&r).last(), Some(&NoticeKind::Errored));
+        }
+
+        #[test]
+        fn a_second_request_while_waiting_is_silent() {
+            let (r, p) = rig();
+            r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.feed(PERM);
+            r.feed(&PERM.replace("r-1", "r-2"));
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput]);
+        }
+
+        #[test]
+        fn a_crash_notifies_but_stop_does_not() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            assert_eq!(kinds(&r), [NoticeKind::Failed]);
+
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.sessions.stop(&s.id).unwrap();
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            assert!(kinds(&r).is_empty(), "a stop is the user's own act");
+        }
+
+        #[test]
+        fn restore_notifies_nothing() {
+            let (r, _) = rig();
+            let dir = scratch("notifyrestore");
+            r.sessions.restore(Snapshot {
+                schema: store::SCHEMA,
+                revision: 1,
+                next_session: 2,
+                next_project: 1,
+                projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.clone() }],
+                sessions: vec![
+                    stored_session("s1", SessionStatus::WaitingPermission, vec![open_permission("s1-i1", "s1")], 1),
+                    stored_session("s2", SessionStatus::Failed, vec![], 0),
+                    stored_session("s3", SessionStatus::Idle, vec![finished_item("s3-i1", "s3")], 1),
+                ],
+            });
+            assert!(r.notices.lock().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn shutdown_notifies_nothing() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.sessions.shutdown();
+            // The kill shows up as an exit, and late lines may still arrive.
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            r.feed(PERM);
+            r.feed(DONE);
+            assert!(r.notices.lock().unwrap().is_empty());
+        }
     }
 
 }

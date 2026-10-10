@@ -1,16 +1,20 @@
 mod commands;
+mod notify;
 mod projects;
 mod session;
 mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
+use tauri_plugin_notification::NotificationExt;
 
 use commands::AppSessions;
 use session::{Event, Sessions, process, store, transcript};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init());
     // Registered on the builder so it restores the main window as it is created. The
     // frontend never calls it, so no capability is granted.
     #[cfg(desktop)]
@@ -24,6 +28,7 @@ pub fn run() {
                 window::ensure_visible(&main);
             }
             let handle = app.handle().clone();
+            let notify_handle = app.handle().clone();
             // Saving stays off for the run when the file cannot be loaded; see `store::open`.
             let data_dir = app.path().app_data_dir().ok();
             let (snapshot, status, writer) = match &data_dir {
@@ -44,6 +49,20 @@ pub fn run() {
                     };
                 }),
                 Box::new(process::spawn),
+                // Rust-only use of the plugin, as with dialog: no capability is granted.
+                Box::new(move |project, notice| {
+                    // Nothing to announce while the user is looking at the window.
+                    let focused = notify_handle.get_webview_window("main").and_then(|w| w.is_focused().ok());
+                    if focused == Some(true) {
+                        return;
+                    }
+                    let _ = notify_handle
+                        .notification()
+                        .builder()
+                        .title("Orchestra")
+                        .body(notify::body(project, notice.kind))
+                        .show();
+                }),
                 writer,
                 transcripts,
             );
