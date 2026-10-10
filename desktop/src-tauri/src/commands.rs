@@ -54,9 +54,13 @@ pub fn list_projects(sessions: State<'_, AppSessions>) -> Vec<Project> {
     sessions.list_projects()
 }
 
+/// Async so the stdin write runs on the blocking pool, not the main thread.
 #[tauri::command]
-pub fn start_session(args: StartArgs, sessions: State<'_, AppSessions>) -> Result<SessionSummary, String> {
-    sessions.inner().start(&args.project_id, &args.prompt)
+pub async fn start_session(args: StartArgs, sessions: State<'_, AppSessions>) -> Result<SessionSummary, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.start(&args.project_id, &args.prompt))
+        .await
+        .map_err(|_| "session task failed".to_string())?
 }
 
 #[tauri::command]
@@ -69,9 +73,13 @@ pub fn list_inbox(sessions: State<'_, AppSessions>) -> Vec<InboxItem> {
     sessions.list_inbox()
 }
 
+/// Async for the same reason as `start_session`.
 #[tauri::command]
-pub fn answer(args: Answer, sessions: State<'_, AppSessions>) -> Result<(), String> {
-    dispatch_answer(&sessions, args)
+pub async fn answer(args: Answer, sessions: State<'_, AppSessions>) -> Result<(), String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || dispatch_answer(&sessions, args))
+        .await
+        .map_err(|_| "answer task failed".to_string())?
 }
 
 fn dispatch_answer(sessions: &Sessions, args: Answer) -> Result<(), String> {

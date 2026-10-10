@@ -14,6 +14,8 @@ pub enum Message {
     Assistant { text: String, tool_name: Option<String> },
     /// `control_request` with subtype `can_use_tool`.
     CanUseTool { request_id: String, tool_name: String, input: Value },
+    /// `control_request` with a subtype we cannot answer. Surfaced, never answered.
+    UnsupportedControlRequest { request_id: Option<String>, subtype: String },
     /// `result`: end of a turn.
     Result { is_error: bool, text: String },
     /// A known message type that carries no status (hook events, tool results, rate limits).
@@ -54,8 +56,15 @@ pub fn parse_line(line: &str) -> Message {
         }
         Some("control_request") => {
             let req = &v["request"];
-            if req.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
-                return Message::Unknown;
+            match req.get("subtype").and_then(Value::as_str) {
+                Some("can_use_tool") => {}
+                Some(other) => {
+                    return Message::UnsupportedControlRequest {
+                        request_id: v.get("request_id").and_then(str_of),
+                        subtype: other.to_string(),
+                    };
+                }
+                None => return Message::Unknown,
             }
             match (v.get("request_id").and_then(str_of), req.get("tool_name").and_then(str_of)) {
                 (Some(request_id), Some(tool_name)) => Message::CanUseTool {
@@ -154,9 +163,21 @@ pub(crate) mod tests {
         assert_eq!(parse_line("not json"), Message::Unknown);
         assert_eq!(parse_line("{}"), Message::Unknown);
         assert_eq!(parse_line(r#"{"type":"brand_new"}"#), Message::Unknown);
-        assert_eq!(parse_line(r#"{"type":"control_request","request_id":"a","request":{"subtype":"other"}}"#), Message::Unknown);
+        assert_eq!(parse_line(r#"{"type":"control_request","request_id":"a","request":{}}"#), Message::Unknown);
         assert_eq!(parse_line(r#"{"type":"system","subtype":"hook_started"}"#), Message::Ignored);
         assert_eq!(parse_line("[1,2]"), Message::Unknown);
+    }
+
+    #[test]
+    fn unsupported_control_request_is_typed() {
+        assert_eq!(
+            parse_line(r#"{"type":"control_request","request_id":"a","request":{"subtype":"other"}}"#),
+            Message::UnsupportedControlRequest { request_id: Some("a".into()), subtype: "other".into() }
+        );
+        assert!(matches!(
+            parse_line(r#"{"type":"control_request","request":{"subtype":"hook_callback"}}"#),
+            Message::UnsupportedControlRequest { request_id: None, .. }
+        ));
     }
 
     #[test]

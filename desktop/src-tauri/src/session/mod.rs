@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use crate::projects::{Project, Projects};
 use process::{Output, Proc};
-use state::{Decision, InboxItem, SessionState, SessionStatus};
+use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
 pub const MAX_TEXT_BYTES: usize = 32768;
@@ -51,6 +51,9 @@ struct Session {
     started_at: u64,
     state: SessionState,
     proc: Option<Arc<dyn Proc>>,
+    /// Serialises build, write and commit of answers for this session. Held across the
+    /// pipe write, so it is never taken together with `Inner` and the reader never needs it.
+    gate: Arc<Mutex<()>>,
 }
 
 impl Session {
@@ -107,23 +110,33 @@ pub fn now_ms() -> u64 {
 
 pub struct Sessions {
     inner: Mutex<Inner>,
+    /// Makes publishing atomic in compute order. Lock order is always `inner` then
+    /// `emit_order`. The `emit` callback runs under it and must never call back into
+    /// `Sessions`.
+    emit_order: Mutex<()>,
     emit: Emit,
     spawner: Spawner,
 }
 
 impl Sessions {
     pub fn new(emit: Emit, spawner: Spawner) -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(Inner::default()), emit, spawner })
+        Arc::new(Self { inner: Mutex::new(Inner::default()), emit_order: Mutex::new(()), emit, spawner })
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn fire(&self, events: Vec<Event>) {
+    /// Compute the events for a session under `inner`, take the emit lock before letting
+    /// `inner` go, then fire. Two publishers therefore fire in the order they computed.
+    fn publish(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
+        let events = inner.events_for(session_id);
+        let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+        drop(inner);
         for e in events {
             (self.emit)(e);
         }
+        drop(order);
     }
 
     pub fn add_project(&self, path: &Path) -> Result<Project, String> {
@@ -146,7 +159,7 @@ impl Sessions {
     pub fn start(self: &Arc<Self>, project_id: &str, prompt: &str) -> Result<SessionSummary, String> {
         check_text(prompt)?;
         let now = now_ms();
-        let (session_id, path, summary) = {
+        let (session_id, path) = {
             let mut inner = self.lock();
             let entry = inner.projects.get(project_id).ok_or("unknown project")?;
             let (path, name) = (entry.path.clone(), entry.project.name.clone());
@@ -159,11 +172,11 @@ impl Sessions {
                 started_at: now,
                 state: SessionState::new(&id, now),
                 proc: None,
+                gate: Arc::new(Mutex::new(())),
             };
-            let summary = session.summary();
             inner.sessions.insert(id.clone(), session);
             inner.order.push(id.clone());
-            (id, path, summary)
+            (id, path)
         };
 
         let this = Arc::clone(self);
@@ -183,34 +196,32 @@ impl Sessions {
         }
         if proc.send_line(&protocol::user_message(prompt)).is_err() {
             proc.kill();
-            let events = {
-                let mut inner = self.lock();
-                if let Some(s) = inner.sessions.get_mut(&session_id) {
-                    s.state.mark_exit(None, now_ms());
-                }
-                inner.events_for(&session_id)
-            };
-            self.fire(events);
+            let mut inner = self.lock();
+            if let Some(s) = inner.sessions.get_mut(&session_id) {
+                s.state.mark_exit(None, now_ms());
+            }
+            self.publish(inner, &session_id);
             return Err("failed to send the prompt".into());
         }
-        self.fire(vec![Event::SessionUpdated(summary.clone())]);
+        // The reader may already have moved the session past Starting while the prompt was
+        // being written, so read the summary now, under the lock, and publish it in order.
+        let inner = self.lock();
+        let summary = inner.sessions.get(&session_id).map(Session::summary).ok_or("unknown session")?;
+        self.publish(inner, &session_id);
         Ok(summary)
     }
 
     /// Entry point for the reader thread: one stdout line, or the exit.
     pub fn on_output(&self, session_id: &str, out: Output) {
-        let events = {
-            let mut inner = self.lock();
-            let now = now_ms();
-            if let Some(s) = inner.sessions.get_mut(session_id) {
-                match out {
-                    Output::Line(line) => s.state.apply(protocol::parse_line(&line), now),
-                    Output::Exit(code) => s.state.mark_exit(code, now),
-                }
+        let mut inner = self.lock();
+        let now = now_ms();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            match out {
+                Output::Line(line) => s.state.apply(protocol::parse_line(&line), now),
+                Output::Exit(code) => s.state.mark_exit(code, now),
             }
-            inner.events_for(session_id)
-        };
-        self.fire(events);
+        }
+        self.publish(inner, session_id);
     }
 
     pub fn answer_permission(
@@ -222,7 +233,7 @@ impl Sessions {
         if let Some(m) = message {
             check_len(m)?;
         }
-        self.answer_item(item_id, |state, now| state.answer_permission(item_id, decision, message, now))
+        self.answer_item(item_id, |state| state.permission_line(item_id, decision, message))
     }
 
     pub fn answer_question(&self, item_id: &str, answers: &BTreeMap<String, String>) -> Result<(), String> {
@@ -231,59 +242,64 @@ impl Sessions {
         {
             return Err("answers too large".into());
         }
-        self.answer_item(item_id, |state, now| state.answer_question(item_id, answers, now))
+        self.answer_item(item_id, |state| state.question_line(item_id, answers))
     }
 
     fn answer_item(
         &self,
         item_id: &str,
-        f: impl FnOnce(&mut SessionState, u64) -> Result<String, String>,
+        build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
     ) -> Result<(), String> {
         let sid = self.lock().session_of_item(item_id).ok_or("unknown or resolved item")?;
-        self.send_through(&sid, f)
+        self.send_through(&sid, build)
     }
 
     pub fn reply(&self, session_id: &str, text: &str) -> Result<(), String> {
         check_text(text)?;
-        self.send_through(session_id, |state, now| state.reply(text, now))
+        self.send_through(session_id, |state| state.reply_line(text))
     }
 
-    /// Build the line under the lock, send it, and only then publish the new state.
+    /// Build the line without changing state, write it, and only after a successful write
+    /// commit and publish. The session's gate is held throughout so two callers cannot
+    /// answer the same item; `Inner` is not held across the write.
     fn send_through(
         &self,
         session_id: &str,
-        f: impl FnOnce(&mut SessionState, u64) -> Result<String, String>,
+        build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
     ) -> Result<(), String> {
-        let (events, proc, line) = {
-            let mut inner = self.lock();
-            let s = inner.sessions.get_mut(session_id).ok_or("unknown session")?;
+        let gate = self.lock().sessions.get(session_id).ok_or("unknown session")?.gate.clone();
+        let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let (proc, line, commit) = {
+            let inner = self.lock();
+            let s = inner.sessions.get(session_id).ok_or("unknown session")?;
             let proc = s.proc.clone().ok_or("session is not running")?;
             if matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed) {
                 return Err("session has ended".into());
             }
-            let line = f(&mut s.state, now_ms())?;
-            (inner.events_for(session_id), proc, line)
+            let (line, commit) = build(&s.state)?;
+            (proc, line, commit)
         };
         if proc.send_line(&line).is_err() {
             proc.kill();
             return Err("failed to send to session".into());
         }
-        self.fire(events);
+        let mut inner = self.lock();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.state.commit(commit, now_ms());
+        }
+        self.publish(inner, session_id);
         Ok(())
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), String> {
-        let (events, proc) = {
-            let mut inner = self.lock();
-            let s = inner.sessions.get_mut(session_id).ok_or("unknown session")?;
-            s.state.mark_stopped(now_ms());
-            let proc = s.proc.clone();
-            (inner.events_for(session_id), proc)
-        };
+        let mut inner = self.lock();
+        let s = inner.sessions.get_mut(session_id).ok_or("unknown session")?;
+        s.state.mark_stopped(now_ms());
+        let proc = s.proc.clone();
+        self.publish(inner, session_id);
         if let Some(p) = proc {
             p.kill();
         }
-        self.fire(events);
         Ok(())
     }
 
@@ -315,14 +331,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Called with the number of lines written so far, after each successful write.
+    type OnWrite = Box<dyn Fn(usize) + Send>;
+
     struct Fake {
         lines: Mutex<Vec<String>>,
         killed: AtomicBool,
+        fail: AtomicBool,
+        on_write: Mutex<Option<OnWrite>>,
     }
 
     impl Proc for Fake {
         fn send_line(&self, line: &str) -> Result<(), String> {
-            self.lines.lock().unwrap().push(line.to_string());
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("pipe closed".into());
+            }
+            let n = {
+                let mut lines = self.lines.lock().unwrap();
+                lines.push(line.to_string());
+                lines.len()
+            };
+            if let Some(f) = self.on_write.lock().unwrap().as_ref() {
+                f(n);
+            }
             Ok(())
         }
         fn kill(&self) {
@@ -338,7 +369,12 @@ mod tests {
     }
 
     fn rig() -> (Rig, Project) {
-        let fake = Arc::new(Fake { lines: Mutex::new(vec![]), killed: AtomicBool::new(false) });
+        let fake = Arc::new(Fake {
+            lines: Mutex::new(vec![]),
+            killed: AtomicBool::new(false),
+            fail: AtomicBool::new(false),
+            on_write: Mutex::new(None),
+        });
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
         let (f2, s2, e2) = (fake.clone(), sink.clone(), events.clone());
@@ -357,6 +393,26 @@ mod tests {
         fn feed(&self, line: &str) {
             let guard = self.sink.lock().unwrap();
             (guard.as_ref().unwrap())(Output::Line(line.to_string()));
+        }
+
+        /// Feed `line` through the sink while the nth write is in flight.
+        fn feed_on_write(&self, nth: usize, line: &'static str) {
+            let sink = self.sink.clone();
+            *self.fake.on_write.lock().unwrap() = Some(Box::new(move |n| {
+                if n == nth {
+                    let guard = sink.lock().unwrap();
+                    (guard.as_ref().unwrap())(Output::Line(line.to_string()));
+                }
+            }));
+        }
+
+        fn updates(&self) -> Vec<SessionSummary> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| if let Event::SessionUpdated(s) = e { Some(s.clone()) } else { None })
+                .collect()
         }
     }
 
@@ -451,6 +507,77 @@ mod tests {
         r2.sessions.start(&p2.id, "go").unwrap();
         r2.sessions.kill_all();
         assert!(r2.fake.killed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn start_publishes_post_send_summary_in_order() {
+        let (r, p) = rig();
+        r.feed_on_write(1, INIT);
+        let s = r.sessions.start(&p.id, "go").unwrap();
+        assert_eq!(s.status, SessionStatus::Working);
+        let updates = r.updates();
+        assert_eq!(updates.last().unwrap().status, SessionStatus::Working);
+        assert!(updates.iter().all(|u| u.status == SessionStatus::Working), "no stale Starting event");
+    }
+
+    #[test]
+    fn failed_answer_send_leaves_item_pending() {
+        let (r, p) = rig();
+        r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        let item = r.sessions.list_inbox().remove(0);
+        let before = r.events.lock().unwrap().len();
+        r.fake.fail.store(true, Ordering::SeqCst);
+        assert!(r.sessions.answer_permission(&item.id, Decision::Allow, None).is_err());
+        assert!(!r.sessions.list_inbox()[0].resolved);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::WaitingPermission);
+        assert_eq!(r.events.lock().unwrap().len(), before, "a failed write fires nothing");
+        assert!(r.fake.killed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_reply_send_leaves_session_idle() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT);
+        r.feed(DONE);
+        r.fake.fail.store(true, Ordering::SeqCst);
+        assert!(r.sessions.reply(&s.id, "more").is_err());
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Idle);
+        assert!(!r.sessions.list_inbox()[0].resolved);
+    }
+
+    #[test]
+    fn reader_update_during_reply_send_wins() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT);
+        r.feed(DONE);
+        r.feed_on_write(2, DONE);
+        r.sessions.reply(&s.id, "more").unwrap();
+        let inbox = r.sessions.list_inbox();
+        assert_eq!(inbox.len(), 2);
+        assert!(inbox[0].resolved && !inbox[1].resolved, "the new Finished item stays open");
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn concurrent_answers_send_once() {
+        let (r, p) = rig();
+        r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        *r.fake.on_write.lock().unwrap() = Some(Box::new(|_| std::thread::sleep(std::time::Duration::from_millis(50))));
+        let item = r.sessions.list_inbox().remove(0);
+        let results: Vec<Result<(), String>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..2)
+                .map(|_| sc.spawn(|| r.sessions.answer_permission(&item.id, Decision::Allow, None)))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(results.iter().filter(|x| x.is_ok()).count(), 1);
+        assert_eq!(r.fake.lines.lock().unwrap().len(), 2);
     }
 
     #[test]
