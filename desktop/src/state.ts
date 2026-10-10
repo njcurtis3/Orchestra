@@ -1,14 +1,15 @@
 import type { InboxItem, SessionSummary } from "./types";
 
-export type State = { sessions: SessionSummary[]; inbox: InboxItem[] };
+export type State = { sessions: SessionSummary[]; inbox: InboxItem[]; selected: string | null };
 
 export type Action =
   | { type: "sessions-loaded"; sessions: SessionSummary[] }
   | { type: "session-updated"; session: SessionSummary }
   | { type: "inbox-loaded"; items: InboxItem[] }
-  | { type: "inbox-updated"; items: InboxItem[] };
+  | { type: "inbox-updated"; items: InboxItem[] }
+  | { type: "select-session"; id: string | null };
 
-export const initialState: State = { sessions: [], inbox: [] };
+export const initialState: State = { sessions: [], inbox: [], selected: null };
 
 // Unresolved first, then newest first.
 export function sortInbox(items: InboxItem[]): InboxItem[] {
@@ -62,5 +63,7 @@ export function reducer(state: State, action: Action): State {
       for (const i of action.items) byId.set(i.id, i);
       return { ...state, inbox: sortInbox([...byId.values()]) };
     }
+    case "select-session":
+      return { ...state, selected: action.id };
   }
 }

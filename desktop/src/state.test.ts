@@ -67,6 +67,15 @@ describe("reducer", () => {
     expect(s.inbox.find((x) => x.id === "x")?.session_id).toBe("s2");
   });
 
+  it("selects a session and goes back", () => {
+    let s = reducer(initialState, { type: "select-session", id: "a" });
+    expect(s.selected).toBe("a");
+    s = reducer(s, { type: "session-updated", session: session("a", 2) });
+    expect(s.selected).toBe("a");
+    s = reducer(s, { type: "select-session", id: null });
+    expect(s.selected).toBeNull();
+  });
+
   it("does not mutate the previous state", () => {
     const before = reducer(initialState, { type: "sessions-loaded", sessions: [session("a", 1)] });
     reducer(before, { type: "session-updated", session: session("b", 2) });

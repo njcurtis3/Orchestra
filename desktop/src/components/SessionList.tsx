@@ -1,13 +1,13 @@
 import { stopSession } from "../ipc";
 import type { PermissionMode, SessionStatus, SessionSummary } from "../types";
 
-const MODE_LABELS: Record<PermissionMode, string> = {
+export const MODE_LABELS: Record<PermissionMode, string> = {
   manual: "manual",
   acceptEdits: "accept edits",
   plan: "plan",
 };
 
-const LABELS: Record<SessionStatus, string> = {
+export const STATUS_LABELS: Record<SessionStatus, string> = {
   starting: "Starting",
   working: "Working",
   waiting_permission: "Needs permission",
@@ -32,19 +32,26 @@ const LIVE: Record<SessionStatus, boolean> = {
   failed: false,
 };
 
-type Props = { sessions: SessionSummary[]; onError: (e: unknown) => void };
+type Props = {
+  sessions: SessionSummary[];
+  selected: string | null;
+  onSelect: (id: string) => void;
+  onError: (e: unknown) => void;
+};
 
-export function SessionList({ sessions, onError }: Props) {
+export function SessionList({ sessions, selected, onSelect, onError }: Props) {
   return (
     <section className="panel" aria-labelledby="sessions-h">
       <h2 id="sessions-h">Sessions</h2>
       {sessions.length === 0 && <p className="empty">No sessions yet.</p>}
       <ul className="list">
         {sessions.map((s) => (
-          <li key={s.id} className="card">
+          <li key={s.id} className={`card${s.id === selected ? " selected" : ""}`}>
             <div className="row">
-              <strong>{s.project_name}</strong>
-              <span className={`badge status-${s.status}`}>{LABELS[s.status]}</span>
+              <button type="button" className="linklike" aria-current={s.id === selected} onClick={() => onSelect(s.id)}>
+                {s.project_name}
+              </button>
+              <span className={`badge status-${s.status}`}>{STATUS_LABELS[s.status]}</span>
             </div>
             <div className="meta">
               Last activity <time dateTime={new Date(s.last_activity_at).toISOString()}>{new Date(s.last_activity_at).toLocaleString()}</time>

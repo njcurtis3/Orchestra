@@ -61,6 +61,29 @@ export type InboxItem = {
   result_text: string | null; // full result text on finished/error items, capped at 256 KiB
 };
 
+// The readable record of a session, served by get_transcript and pushed as transcript-appended.
+export type Usage = { input: number; output: number; cache_read: number; cache_creation: number };
+
+export type TranscriptEntry =
+  | { kind: "user_prompt"; text: string; truncated: boolean }
+  | { kind: "assistant_text"; text: string; truncated: boolean }
+  | { kind: "tool_use"; id: string; name: string; input_preview: string; truncated: boolean }
+  | { kind: "tool_result"; tool_use_id: string; is_error: boolean; content: string; truncated: boolean }
+  | {
+      kind: "turn_result";
+      is_error: boolean;
+      subtype: string | null;
+      total_cost_usd: number | null; // the session total as claude reports it, never a sum
+      duration_ms: number | null;
+      num_turns: number | null;
+      usage: Usage | null; // this turn
+    }
+  | { kind: "truncated" };
+
+export type TranscriptRecord = TranscriptEntry & { seq: number; at: number };
+export type TranscriptPage = { entries: TranscriptRecord[]; next_seq: number };
+export type TranscriptBatch = { session_id: string; entries: TranscriptRecord[] };
+
 export type Answer =
   | { kind: "permission"; item_id: string; decision: "allow" | "deny"; message?: string }
   | { kind: "question"; item_id: string; answers: Record<string, string> }
