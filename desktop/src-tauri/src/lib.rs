@@ -1,6 +1,7 @@
 mod commands;
 mod projects;
 mod session;
+mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
 
@@ -9,9 +10,19 @@ use session::{Event, Sessions, process, store};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    // Registered on the builder so it restores the main window as it is created. The
+    // frontend never calls it, so no capability is granted.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+    let app = builder
         .setup(|app| {
+            // The main window exists by now and the plugin has restored it: make sure
+            // the result is on a display that still exists.
+            #[cfg(desktop)]
+            if let Some(main) = app.get_webview_window("main") {
+                window::ensure_visible(&main);
+            }
             let handle = app.handle().clone();
             // Saving stays off for the run when the file cannot be loaded; see `store::open`.
             let (snapshot, status, writer) = match app.path().app_data_dir() {
