@@ -6,7 +6,7 @@ mod window;
 use tauri::{Emitter, Manager, RunEvent};
 
 use commands::AppSessions;
-use session::{Event, Sessions, process, store};
+use session::{Event, Sessions, process, store, transcript};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,19 +25,27 @@ pub fn run() {
             }
             let handle = app.handle().clone();
             // Saving stays off for the run when the file cannot be loaded; see `store::open`.
-            let (snapshot, status, writer) = match app.path().app_data_dir() {
-                Ok(dir) => store::open(&dir.join("state.json")),
-                Err(_) => (None, store::StorageStatus::unreadable(), None),
+            let data_dir = app.path().app_data_dir().ok();
+            let (snapshot, status, writer) = match &data_dir {
+                Some(dir) => store::open(&dir.join("state.json")),
+                None => (None, store::StorageStatus::unreadable(), None),
+            };
+            // Transcripts follow the state file: with saving off they stay in memory.
+            let transcripts = match (&data_dir, &writer) {
+                (Some(dir), Some(_)) => transcript::TranscriptStore::disk(dir.join("transcripts")),
+                _ => transcript::TranscriptStore::memory(),
             };
             let sessions: AppSessions = Sessions::with_writer(
                 Box::new(move |event| {
                     let _ = match event {
                         Event::SessionUpdated(s) => handle.emit("session-updated", s),
                         Event::InboxUpdated(items) => handle.emit("inbox-updated", items),
+                        Event::TranscriptAppended(batch) => handle.emit("transcript-appended", batch),
                     };
                 }),
                 Box::new(process::spawn),
                 writer,
+                transcripts,
             );
             if let Some(snapshot) = snapshot {
                 sessions.restore(snapshot);
@@ -54,6 +62,7 @@ pub fn run() {
             commands::list_inbox,
             commands::answer,
             commands::stop_session,
+            commands::get_transcript,
             commands::storage_status,
         ])
         .build(tauri::generate_context!())

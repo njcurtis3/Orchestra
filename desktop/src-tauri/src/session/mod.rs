@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod settings;
 pub mod state;
 pub mod store;
+pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -14,12 +15,14 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::projects::{Project, Projects};
 use process::{Output, Proc, SpawnArgs};
 use settings::{Model, PermissionMode, SessionSettings};
 use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
 use store::{Snapshot, StoredSession, Writer};
+use transcript::{Entry, Record, TranscriptBatch, TranscriptPage, TranscriptStore};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
 pub const MAX_TEXT_BYTES: usize = 32768;
@@ -44,6 +47,7 @@ pub struct SessionSummary {
 pub enum Event {
     SessionUpdated(SessionSummary),
     InboxUpdated(Vec<InboxItem>),
+    TranscriptAppended(TranscriptBatch),
 }
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
@@ -191,18 +195,20 @@ pub struct Sessions {
     spawner: Spawner,
     /// `None` when saving is off: tests, or a state file this build must not touch.
     writer: Option<Writer>,
+    transcripts: TranscriptStore,
     /// Lets `&self` methods hand an owning handle to a reader thread.
     me: Weak<Sessions>,
 }
 
 impl Sessions {
-    pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>) -> Arc<Self> {
+    pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>, transcripts: TranscriptStore) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: Mutex::new(Inner::default()),
             emit_order: Mutex::new(()),
             emit,
             spawner,
             writer,
+            transcripts,
             me: me.clone(),
         })
     }
@@ -258,16 +264,25 @@ impl Sessions {
     ///
     /// An explicit command always saves; a stdout line goes through `publish_line`.
     fn publish(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
-        self.publish_saving(inner, session_id, true);
+        self.publish_saving(inner, session_id, true, Vec::new());
     }
 
     /// `publish` for a stdout line: the snapshot is skipped when only text changed.
-    fn publish_line(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
-        self.publish_saving(inner, session_id, false);
+    fn publish_line(&self, inner: MutexGuard<'_, Inner>, session_id: &str, appended: Vec<Record>) {
+        self.publish_saving(inner, session_id, false, self.transcript_events(session_id, appended));
     }
 
-    fn publish_saving(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str, force: bool) {
-        let (events, significant) = inner.events_for(session_id);
+    /// A transcript batch to send with the session's events; nothing when none was recorded.
+    fn transcript_events(&self, session_id: &str, entries: Vec<Record>) -> Vec<Event> {
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        vec![Event::TranscriptAppended(TranscriptBatch { session_id: session_id.to_string(), entries })]
+    }
+
+    fn publish_saving(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str, force: bool, extra: Vec<Event>) {
+        let (mut events, significant) = inner.events_for(session_id);
+        events.extend(extra);
         let snapshot = if force || significant {
             self.next_snapshot(&mut inner)
         } else {
@@ -327,6 +342,23 @@ impl Sessions {
         self.lock().inbox()
     }
 
+    /// Record entries for a session that exists. The session map is checked first, so a file
+    /// name is only ever made from an id this manager issued.
+    fn append_transcript(&self, session_id: &str, entries: Vec<Entry>) -> Vec<Record> {
+        if !self.lock().sessions.contains_key(session_id) {
+            return Vec::new();
+        }
+        self.transcripts.append(session_id, entries, now_ms())
+    }
+
+    /// The last entries of a session's transcript.
+    pub fn transcript(&self, session_id: &str) -> Result<TranscriptPage, String> {
+        if !self.lock().sessions.contains_key(session_id) {
+            return Err("unknown session".into());
+        }
+        Ok(self.transcripts.read(session_id))
+    }
+
     pub fn start(
         self: &Arc<Self>,
         project_id: &str,
@@ -382,26 +414,45 @@ impl Sessions {
             self.publish(inner, &session_id);
             return Err("failed to send the prompt".into());
         }
+        let recorded = self.append_transcript(&session_id, vec![transcript::user_prompt(prompt)]);
         // The reader may already have moved the session past Starting while the prompt was
         // being written, so read the summary now, under the lock, and publish it in order.
         let inner = self.lock();
         let summary = inner.sessions.get(&session_id).map(Session::summary).ok_or("unknown session")?;
-        self.publish(inner, &session_id);
+        self.publish_saving(inner, &session_id, true, self.transcript_events(&session_id, recorded));
         Ok(summary)
     }
 
     /// Entry point for the reader thread: one stdout line, or the exit.
     pub fn on_output(&self, session_id: &str, out: Output) {
-        let mut inner = self.lock();
-        if inner.shutting_down {
+        // The line is parsed once: the state machine and the transcript both read this value.
+        let (message, entries) = match &out {
+            Output::Line(line) => match serde_json::from_str::<Value>(line) {
+                Ok(v) => (Some(protocol::parse_value(&v)), transcript::entries_from_value(&v)),
+                Err(_) => (Some(protocol::Message::Unknown), Vec::new()),
+            },
+            Output::Exit(_) => (None, Vec::new()),
+        };
+        let now = now_ms();
+        let live = {
+            let inner = self.lock();
             // The children are being killed on purpose; their exit is not a failure.
+            !inner.shutting_down && inner.sessions.contains_key(session_id)
+        };
+        if !live {
             return;
         }
-        let now = now_ms();
+        // Disk I/O happens here, with no lock on `inner`.
+        let appended = self.transcripts.append(session_id, entries, now);
+        let mut inner = self.lock();
+        if inner.shutting_down {
+            return;
+        }
         if let Some(s) = inner.sessions.get_mut(session_id) {
-            match out {
-                Output::Line(line) => s.state.apply(protocol::parse_line(&line), now),
-                Output::Exit(code) => s.state.mark_exit(code, now),
+            match (message, out) {
+                (Some(m), _) => s.state.apply(m, now),
+                (None, Output::Exit(code)) => s.state.mark_exit(code, now),
+                (None, Output::Line(_)) => {}
             }
         }
         // A line can end a session only when a resume failed; the process has no more use.
@@ -410,7 +461,7 @@ impl Sessions {
             .get(session_id)
             .filter(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed))
             .and_then(|s| s.proc.clone());
-        self.publish_line(inner, session_id);
+        self.publish_line(inner, session_id, appended);
         if let Some(p) = dead {
             p.kill();
         }
@@ -459,7 +510,7 @@ impl Sessions {
         if paused {
             return self.resume_with(session_id, text);
         }
-        self.send_locked(session_id, |state| state.reply_line(text))
+        self.send_locked(session_id, |state| state.reply_line(text), Some(text))
     }
 
     /// A reply to a paused session starts a new process with `--resume` and sends the reply
@@ -514,11 +565,12 @@ impl Sessions {
             proc.kill();
             return Err("failed to send to session".into());
         }
+        let recorded = self.append_transcript(session_id, vec![transcript::user_prompt(text)]);
         let mut inner = self.lock();
         if let Some(s) = inner.sessions.get_mut(session_id) {
             s.state.commit_resume(&plan.resolve);
         }
-        self.publish(inner, session_id);
+        self.publish_saving(inner, session_id, true, self.transcript_events(session_id, recorded));
         Ok(())
     }
 
@@ -532,14 +584,16 @@ impl Sessions {
     ) -> Result<(), String> {
         let gate = self.lock().sessions.get(session_id).ok_or("unknown session")?.gate.clone();
         let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.send_locked(session_id, build)
+        self.send_locked(session_id, build, None)
     }
 
-    /// `send_through` with the session's gate already held.
+    /// `send_through` with the session's gate already held. `prompt` is the user text to
+    /// record in the transcript once the line has been written.
     fn send_locked(
         &self,
         session_id: &str,
         build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
+        prompt: Option<&str>,
     ) -> Result<(), String> {
         let (proc, line, commit) = {
             let inner = self.lock();
@@ -555,11 +609,12 @@ impl Sessions {
             proc.kill();
             return Err("failed to send to session".into());
         }
+        let recorded = prompt.map(|t| self.append_transcript(session_id, vec![transcript::user_prompt(t)])).unwrap_or_default();
         let mut inner = self.lock();
         if let Some(s) = inner.sessions.get_mut(session_id) {
             s.state.commit(commit, now_ms());
         }
-        self.publish(inner, session_id);
+        self.publish_saving(inner, session_id, true, self.transcript_events(session_id, recorded));
         Ok(())
     }
 
@@ -686,6 +741,7 @@ mod tests {
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
             writer,
+            TranscriptStore::memory(),
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
         (Rig { sessions, fake, sink, events, spawns, spawn_settings }, project)
@@ -1269,6 +1325,67 @@ mod tests {
         let saved = store::load(&file).unwrap().unwrap();
         assert_eq!((saved.sessions[0].model.as_deref(), saved.sessions[0].permission_mode.as_deref()), (Some("fable"), Some("manual")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo SECRET_INPUT_MARKER"}}]}}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"SECRET_RESULT_MARKER"}]}}"#;
+
+    fn transcript_events(r: &Rig) -> Vec<transcript::TranscriptBatch> {
+        r.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| if let Event::TranscriptAppended(b) = e { Some(b.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn transcript_text_never_in_snapshot() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        r.feed(TOOL_USE);
+        r.feed(TOOL_RESULT);
+        let page = r.sessions.transcript(&s.id).unwrap();
+        let kinds: Vec<_> = page.entries.iter().map(|e| std::mem::discriminant(&e.entry)).collect();
+        assert_eq!(kinds.len(), 3, "prompt, tool call, tool result");
+        let json = serde_json::to_string(&r.sessions.lock().snapshot()).unwrap();
+        assert!(!json.contains("SECRET_RESULT_MARKER") && !json.contains("SECRET_INPUT_MARKER"));
+        let inbox = serde_json::to_string(&r.sessions.list_inbox()).unwrap();
+        assert!(!inbox.contains("SECRET_RESULT_MARKER") && !inbox.contains("SECRET_INPUT_MARKER"));
+    }
+
+    #[test]
+    fn lines_are_recorded_and_emitted_in_order() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "first", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        r.feed(TOOL_USE);
+        r.feed(TOOL_RESULT);
+        r.feed(DONE);
+        r.sessions.reply(&s.id, "second").unwrap();
+        let page = r.sessions.transcript(&s.id).unwrap();
+        let seqs: Vec<u64> = page.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        assert_eq!(page.next_seq, 6);
+        assert!(matches!(&page.entries[0].entry, Entry::UserPrompt { text, .. } if text == "first"));
+        assert!(matches!(&page.entries[3].entry, Entry::TurnResult { .. }));
+        assert!(matches!(&page.entries[4].entry, Entry::UserPrompt { text, .. } if text == "second"));
+        let emitted: Vec<u64> = transcript_events(&r).iter().flat_map(|b| b.entries.iter().map(|e| e.seq)).collect();
+        assert_eq!(emitted, seqs, "every recorded entry was emitted once, in order");
+        assert!(transcript_events(&r).iter().all(|b| b.session_id == s.id));
+        assert!(r.sessions.transcript("nope").is_err());
+    }
+
+    #[test]
+    fn a_resume_records_its_reply() {
+        let (r, _) = rig();
+        let dir = scratch("transcriptresume");
+        paused(&r, &dir);
+        r.sessions.reply("s1", "and then?").unwrap();
+        let page = r.sessions.transcript("s1").unwrap();
+        assert!(matches!(&page.entries[0].entry, Entry::UserPrompt { text, .. } if text == "and then?"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

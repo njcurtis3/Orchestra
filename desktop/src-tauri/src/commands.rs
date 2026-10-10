@@ -14,6 +14,7 @@ use crate::session::Sessions;
 use crate::session::settings::{Model, PermissionMode, SessionSettings};
 use crate::session::state::{Decision, InboxItem};
 use crate::session::store::StorageStatus;
+use crate::session::transcript::TranscriptPage;
 
 pub type AppSessions = Arc<Sessions>;
 
@@ -30,6 +31,12 @@ pub struct StartArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StopArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptArgs {
     pub session_id: String,
 }
 
@@ -100,6 +107,15 @@ fn dispatch_answer(sessions: &Sessions, args: Answer) -> Result<(), String> {
     }
 }
 
+/// Async because it reads the session's file.
+#[tauri::command]
+pub async fn get_transcript(args: TranscriptArgs, sessions: State<'_, AppSessions>) -> Result<TranscriptPage, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.transcript(&args.session_id))
+        .await
+        .map_err(|_| "transcript task failed".to_string())?
+}
+
 /// Whether history was loaded and is being saved. Carries no path.
 #[tauri::command]
 pub fn storage_status(status: State<'_, StorageStatus>) -> StorageStatus {
@@ -145,6 +161,8 @@ mod tests {
         assert!(serde_json::from_value::<StartArgs>(json!({"project_id":"p1","prompt":"x","cwd":"C:/"})).is_err());
         assert!(serde_json::from_value::<StartArgs>(json!({"project_id":"p1","prompt":"x"})).is_ok());
         assert!(serde_json::from_value::<StopArgs>(json!({"session_id":"s1","force":true})).is_err());
+        assert!(serde_json::from_value::<TranscriptArgs>(json!({"session_id":"s1","path":"C:/x"})).is_err());
+        assert!(serde_json::from_value::<TranscriptArgs>(json!({"session_id":"s1"})).is_ok());
     }
 
     #[test]
