@@ -34,6 +34,8 @@ Tauri Windows prerequisites (MSVC build tools, WebView2).
 cd desktop && npm install
 npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
+npm test                   # frontend tests (vitest)
+cd src-tauri && cargo test # Rust tests
 
 # mobile
 cd mobile && npm install
@@ -43,7 +45,7 @@ npx expo-doctor            # dependency/config check
 npx expo install <pkg>     # always, instead of npm install <pkg>
 ```
 
-No tests exist yet. Deploy is not set up: desktop releases come from
+Deploy is not set up: desktop releases come from
 `.github/workflows/desktop-release.yml` (tag `desktop-v*`, currently unsigned drafts);
 Android builds go through EAS (`eas.json`). Signing keys, the EAS project, the updater
 key and store listings are created behind the ops gate, never at scaffold time.
