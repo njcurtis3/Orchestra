@@ -11,6 +11,7 @@ use super::protocol::{self, Message};
 const MAX_MESSAGE_CHARS: usize = 500;
 const MAX_SUMMARY_CHARS: usize = 300;
 const MAX_PREVIEW_CHARS: usize = 2000;
+const MAX_SUBTYPE_CHARS: usize = 64;
 const DENY_DEFAULT: &str = "User denied";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -86,6 +87,17 @@ pub struct SessionState {
     pending_order: Vec<String>,
     pub unknown_count: u32,
     next_item: u64,
+    /// Bumped whenever status or the open requests change, so a reply built earlier can
+    /// tell whether the reader got there first.
+    epoch: u64,
+}
+
+/// What to apply once the line built by `permission_line`, `question_line` or `reply_line`
+/// has been written to the child.
+#[derive(Debug)]
+pub enum Commit {
+    Answer { item_id: String },
+    Reply { resolve: Vec<String>, epoch: u64 },
 }
 
 pub fn truncate(s: &str, max_chars: usize) -> String {
@@ -133,6 +145,7 @@ impl SessionState {
             pending_order: Vec::new(),
             unknown_count: 0,
             next_item: 0,
+            epoch: 0,
         }
     }
 
@@ -175,12 +188,6 @@ impl SessionState {
         }
     }
 
-    fn resolve_kind(&mut self, kind: InboxKind) {
-        for i in self.inbox.iter_mut().filter(|i| i.kind == kind) {
-            i.resolved = true;
-        }
-    }
-
     /// Waiting while any request is open, otherwise working.
     fn recompute(&mut self) {
         self.status = match self.pending_order.first().and_then(|id| self.inbox.iter().find(|i| &i.id == id)) {
@@ -218,6 +225,7 @@ impl SessionState {
                 }
             }
             Message::CanUseTool { request_id, tool_name, input } => {
+                self.epoch += 1;
                 let preview = serde_json::to_string(&input).ok().map(|s| truncate(&s, MAX_PREVIEW_CHARS));
                 let (kind, summary, questions) = if tool_name == "AskUserQuestion" {
                     let qs = parse_questions(&input);
@@ -232,6 +240,7 @@ impl SessionState {
                 self.recompute();
             }
             Message::Result { is_error, text } => {
+                self.epoch += 1;
                 if !text.trim().is_empty() {
                     self.last_message = Some(truncate(&text, MAX_MESSAGE_CHARS));
                 }
@@ -244,6 +253,15 @@ impl SessionState {
                     self.push_item(InboxKind::Finished, now, s, None, None, None);
                 }
                 self.status = SessionStatus::Idle;
+            }
+            Message::UnsupportedControlRequest { subtype, .. } => {
+                // Nothing is written back: the error shape is not in any fixture. The status
+                // stays as it is; the item tells the user the session may be stuck.
+                let summary = format!(
+                    "Claude sent a request Orchestra cannot answer ({}). The session may be waiting; stop it if it does not continue.",
+                    truncate(&subtype, MAX_SUBTYPE_CHARS)
+                );
+                self.push_item(InboxKind::Error, now, summary, None, None, None);
             }
             Message::Ignored => {}
             Message::Unknown => self.unknown_count += 1,
@@ -259,52 +277,75 @@ impl SessionState {
         Ok(p)
     }
 
-    /// Returns the stdin line to send. State changes only on success.
-    pub fn answer_permission(
-        &mut self,
+    /// The stdin line for a permission answer. Read-only: apply the `Commit` with
+    /// `commit` once the line has been written.
+    pub fn permission_line(
+        &self,
         item_id: &str,
         decision: Decision,
         message: Option<&str>,
-        now: u64,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Commit), String> {
         let p = self.take_pending(item_id, InboxKind::Permission)?;
         let line = match decision {
             Decision::Allow => protocol::allow_response(&p.request_id, &p.input),
             Decision::Deny => protocol::deny_response(&p.request_id, message.filter(|m| !m.trim().is_empty()).unwrap_or(DENY_DEFAULT)),
         };
-        self.close_pending(item_id);
-        self.recompute();
-        self.last_activity_at = now;
-        Ok(line)
+        Ok((line, Commit::Answer { item_id: item_id.to_string() }))
     }
 
-    pub fn answer_question(
-        &mut self,
+    pub fn question_line(
+        &self,
         item_id: &str,
         answers: &BTreeMap<String, String>,
-        now: u64,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Commit), String> {
         let p = self.take_pending(item_id, InboxKind::Question)?;
         let line = protocol::question_response(&p.request_id, &p.input, answers);
-        self.close_pending(item_id);
-        self.recompute();
-        self.last_activity_at = now;
-        Ok(line)
+        Ok((line, Commit::Answer { item_id: item_id.to_string() }))
     }
 
     /// A free-text reply is the next user turn; only valid once a turn has ended.
-    pub fn reply(&mut self, text: &str, now: u64) -> Result<String, String> {
+    pub fn reply_line(&self, text: &str) -> Result<(String, Commit), String> {
         if self.status != SessionStatus::Idle {
             return Err("session is not waiting for a reply".into());
         }
-        self.resolve_kind(InboxKind::Finished);
-        self.resolve_kind(InboxKind::Error);
-        self.status = SessionStatus::Working;
-        self.last_activity_at = now;
-        Ok(protocol::user_message(text))
+        let resolve = self
+            .inbox
+            .iter()
+            .filter(|i| matches!(i.kind, InboxKind::Finished | InboxKind::Error))
+            .map(|i| i.id.clone())
+            .collect();
+        Ok((protocol::user_message(text), Commit::Reply { resolve, epoch: self.epoch }))
+    }
+
+    /// Apply a built answer after its line was written. It only touches what is still
+    /// true: an item the reader already closed stays closed, and a reply that raced a
+    /// reader update resolves the items it captured but leaves the status to the reader.
+    pub fn commit(&mut self, commit: Commit, now: u64) {
+        match commit {
+            Commit::Answer { item_id } => {
+                if self.pending.contains_key(&item_id) {
+                    self.close_pending(&item_id);
+                    if matches!(self.status, SessionStatus::WaitingPermission | SessionStatus::WaitingQuestion) {
+                        self.recompute();
+                    }
+                }
+            }
+            Commit::Reply { resolve, epoch } => {
+                for id in &resolve {
+                    self.resolve(id);
+                }
+                if epoch == self.epoch && self.status == SessionStatus::Idle {
+                    self.status = SessionStatus::Working;
+                }
+            }
+        }
+        if !self.is_over() {
+            self.last_activity_at = now;
+        }
     }
 
     fn finish(&mut self, status: SessionStatus, now: u64) {
+        self.epoch += 1;
         let open: Vec<String> = self.pending_order.drain(..).collect();
         for id in open {
             self.pending.remove(&id);
@@ -386,6 +427,25 @@ mod tests {
     }
 
     use SessionStatus::*;
+
+    /// Build and commit at once: the old single-step answer.
+    impl SessionState {
+        fn answer_permission(&mut self, id: &str, d: Decision, m: Option<&str>, now: u64) -> Result<String, String> {
+            let (line, c) = self.permission_line(id, d, m)?;
+            self.commit(c, now);
+            Ok(line)
+        }
+        fn answer_question(&mut self, id: &str, a: &BTreeMap<String, String>, now: u64) -> Result<String, String> {
+            let (line, c) = self.question_line(id, a)?;
+            self.commit(c, now);
+            Ok(line)
+        }
+        fn reply(&mut self, text: &str, now: u64) -> Result<String, String> {
+            let (line, c) = self.reply_line(text)?;
+            self.commit(c, now);
+            Ok(line)
+        }
+    }
 
     #[test]
     fn replay_permission_allow() {
@@ -488,6 +548,30 @@ mod tests {
         let mut st = SessionState::new("s1", 0);
         st.mark_exit(Some(0), 1);
         assert_eq!(st.status, Ended);
+    }
+
+    #[test]
+    fn unsupported_control_request_surfaces_error_item() {
+        let (mut st, _) = waiting_permission();
+        let long = "x".repeat(200);
+        st.apply(Message::UnsupportedControlRequest { request_id: Some("r2".into()), subtype: long }, 5);
+        assert_eq!(st.status, WaitingPermission);
+        assert_eq!(st.unknown_count, 0);
+        let e = st.inbox.last().unwrap();
+        assert_eq!((e.kind, e.resolved), (InboxKind::Error, false));
+        assert!(e.summary.contains(&"x".repeat(64)) && !e.summary.contains(&"x".repeat(65)));
+        assert_eq!(st.pending.len(), 1, "nothing new to answer");
+    }
+
+    #[test]
+    fn reply_commit_yields_to_a_reader_update() {
+        let mut st = SessionState::new("s1", 0);
+        st.apply(Message::Result { is_error: false, text: "a".into() }, 1);
+        let (_, c) = st.reply_line("more").unwrap();
+        st.apply(Message::Result { is_error: false, text: "b".into() }, 2);
+        st.commit(c, 3);
+        assert_eq!(st.status, Idle);
+        assert_eq!((st.inbox[0].resolved, st.inbox[1].resolved), (true, false));
     }
 
     #[test]
