@@ -91,8 +91,13 @@ and allowed to drift.
 - **IPC commands validate every argument** in Rust (typed serde structs/enums). No frontend
   string is used as a path or a shell command; paths resolve against a base dir and reject
   `..` and absolute paths. Errors do not leak absolute paths or secrets.
-- **Window state persists** (window-state plugin), restored to a visible display. Not yet
-  added.
+  One recorded exception: an absolute project folder chosen in the native dialog is stored
+  by Rust in `app_data_dir/state.json` (with the sessions and inbox), never accepted from or
+  sent to the frontend, and re-validated with `is_dir` on load.
+- **Window state persists** (`tauri-plugin-window-state`, registered on the builder under
+  `cfg(desktop)`; the frontend never calls it, so no capability is granted). The plugin
+  restores size and position; `src/window.rs` then checks the title bar is reachable on a
+  current monitor and otherwise clamps to the primary monitor and centres the window.
 - **Menus follow the OS**; accelerators use `CmdOrCtrl`.
 - **Webviews differ**: WebView2 (Windows), WKWebView (macOS), WebKitGTK (Linux, the floor).
   Check web features against all three.
