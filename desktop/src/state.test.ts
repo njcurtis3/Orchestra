@@ -87,4 +87,30 @@ describe("decoders", () => {
       decodeInboxItem({ ...item("a", 1), kind: "question", questions: [{ question: 3 }] }),
     ).toThrow();
   });
+
+  it("sessions-loaded keeps a newer session from an event", () => {
+    let s = reducer(initialState, { type: "session-updated", session: session("a", 9, { status: "idle" }) });
+    s = reducer(s, { type: "sessions-loaded", sessions: [session("a", 3, { status: "starting" })] });
+    expect(s.sessions).toHaveLength(1);
+    expect(s.sessions[0].status).toBe("idle");
+  });
+
+  it("sessions-loaded adds unseen sessions and keeps ones missing from the snapshot", () => {
+    let s = reducer(initialState, { type: "session-updated", session: session("a", 5) });
+    s = reducer(s, { type: "sessions-loaded", sessions: [session("b", 2)] });
+    expect(s.sessions.map((x) => x.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("inbox-loaded keeps resolved set by an event", () => {
+    let s = reducer(initialState, { type: "inbox-updated", items: [item("i1", 1, true)] });
+    s = reducer(s, { type: "inbox-loaded", items: [item("i1", 1, false)] });
+    expect(s.inbox).toHaveLength(1);
+    expect(s.inbox[0].resolved).toBe(true);
+  });
+
+  it("inbox-loaded adds unseen items in inbox order", () => {
+    let s = reducer(initialState, { type: "inbox-updated", items: [item("i2", 5)] });
+    s = reducer(s, { type: "inbox-loaded", items: [item("i1", 1), item("i3", 9)] });
+    expect(s.inbox.map((x) => x.id)).toEqual(["i3", "i2", "i1"]);
+  });
 });

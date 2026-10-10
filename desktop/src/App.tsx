@@ -46,7 +46,7 @@ function App() {
         ]);
         if (cancelled) return;
         dispatch({ type: "sessions-loaded", sessions });
-        dispatch({ type: "inbox-updated", items });
+        dispatch({ type: "inbox-loaded", items });
         setProjects(projs);
       } catch (e) {
         fail(e);
