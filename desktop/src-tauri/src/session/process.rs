@@ -7,6 +7,8 @@ use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::state::ClaudeSessionId;
+
 #[cfg(windows)]
 mod job;
 /// Off Windows there is no job; the handle never exists.
@@ -34,6 +36,17 @@ pub const ARGS: [&str; 9] = [
     "--permission-prompt-tool",
     "stdio",
 ];
+
+/// `ARGS`, then `--resume <id>` when continuing a saved conversation. The id is a
+/// `ClaudeSessionId`, so it is a checked UUID and can never read as a flag.
+fn build_args(resume: Option<&ClaudeSessionId>) -> Vec<String> {
+    let mut args: Vec<String> = ARGS.iter().map(|a| a.to_string()).collect();
+    if let Some(id) = resume {
+        args.push("--resume".into());
+        args.push(id.as_str().to_string());
+    }
+    args
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -101,13 +114,17 @@ impl Drop for ProcessHandle {
     }
 }
 
-pub fn spawn(dir: &Path, sink: Box<dyn Fn(Output) + Send>) -> Result<Arc<dyn Proc>, String> {
+pub fn spawn(
+    dir: &Path,
+    resume: Option<&ClaudeSessionId>,
+    sink: Box<dyn Fn(Output) + Send>,
+) -> Result<Arc<dyn Proc>, String> {
     let mut cmd = std::process::Command::new(PROGRAM);
     // The child ends of these pipes are inheritable by design (std creates them so). A
     // grandchild that claude starts with handle inheritance also holds them: if it outlives
     // claude, the reader sees no EOF and Exit is late. With a job, stop and app exit still
     // kill it. This cannot be closed here because claude makes that CreateProcess call.
-    cmd.args(ARGS)
+    cmd.args(build_args(resume))
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -177,6 +194,17 @@ mod tests {
         let ms: Vec<u128> = (0..8).map(|a| reap_delay(a).as_millis()).collect();
         assert_eq!(ms, [50, 100, 200, 400, 800, 1000, 1000, 1000]);
         assert_eq!(reap_delay(u32::MAX).as_millis(), 1000);
+    }
+
+    #[test]
+    fn resume_args_follow_fixed_args() {
+        let id = ClaudeSessionId::parse("0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b").unwrap();
+        let args = build_args(Some(&id));
+        assert_eq!(args.len(), ARGS.len() + 2);
+        assert!(args.iter().zip(ARGS).all(|(a, b)| a == b), "the fixed args are untouched and first");
+        assert_eq!(&args[ARGS.len()..], ["--resume", id.as_str()]);
+        assert_eq!(build_args(None).len(), ARGS.len());
+        assert!(ClaudeSessionId::parse("--dangerous").is_none());
     }
 
     #[test]

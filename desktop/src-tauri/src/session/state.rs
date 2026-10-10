@@ -103,6 +103,15 @@ pub struct SessionState {
     /// Bumped whenever status or the open requests change, so a reply built earlier can
     /// tell whether the reader got there first.
     epoch: u64,
+    /// A resumed process has not yet produced a successful result. Not persisted.
+    resuming: bool,
+}
+
+/// What `begin_resume` hands back: the id to resume and the items the reply will resolve.
+#[derive(Debug)]
+pub struct ResumePlan {
+    pub claude_session_id: ClaudeSessionId,
+    pub resolve: Vec<String>,
 }
 
 /// What survives a restart of one session. `Pending` is deliberately absent: an open
@@ -154,6 +163,23 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// A claude session id that passed the UUID check. The only value `--resume` is given, so
+/// nothing else can reach that argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeSessionId(String);
+
+impl ClaudeSessionId {
+    pub fn parse(s: &str) -> Option<Self> {
+        is_uuid(s).then(|| Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+const RESUME_FAILED: &str = "Could not resume this session";
+
 fn parse_questions(input: &Value) -> Vec<Question> {
     let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     input
@@ -193,6 +219,7 @@ impl SessionState {
             unknown_count: 0,
             next_item: 0,
             epoch: 0,
+            resuming: false,
         }
     }
 
@@ -221,6 +248,53 @@ impl SessionState {
             unknown_count: p.unknown_count,
             next_item: p.next_item,
             epoch: 0,
+            resuming: false,
+        }
+    }
+
+    /// A suspended session is about to get a new process. Marks it working and returns what
+    /// to resume; the caller spawns, writes the reply, then calls `commit_resume`, or calls
+    /// `abort_resume` if no process could be started.
+    pub fn begin_resume(&mut self, now: u64) -> Result<ResumePlan, String> {
+        if self.status != SessionStatus::Suspended {
+            return Err("session is not paused".into());
+        }
+        let id = self.claude_session_id.as_deref().and_then(ClaudeSessionId::parse).ok_or("session cannot be resumed")?;
+        let resolve = self
+            .inbox
+            .iter()
+            .filter(|i| matches!(i.kind, InboxKind::Finished | InboxKind::Error) && !i.resolved)
+            .map(|i| i.id.clone())
+            .collect();
+        self.epoch += 1;
+        self.resuming = true;
+        self.status = SessionStatus::Working;
+        self.last_activity_at = now;
+        Ok(ResumePlan { claude_session_id: id, resolve })
+    }
+
+    /// A paused session cannot be resumed (its project folder is gone): it ends with one
+    /// error item and nothing is spawned.
+    pub fn fail_resume(&mut self, summary: &str, now: u64) {
+        if self.status == SessionStatus::Suspended {
+            self.finish(SessionStatus::Ended, now);
+            self.push_item(InboxKind::Error, now, summary.into(), None, None, None, None);
+        }
+    }
+
+    /// The reply reached the new process: it answers the items that were open.
+    pub fn commit_resume(&mut self, resolve: &[String]) {
+        for id in resolve {
+            self.resolve(id);
+        }
+    }
+
+    /// No process could be started: back to paused, still resumable.
+    pub fn abort_resume(&mut self) {
+        if self.resuming && self.status == SessionStatus::Working {
+            self.epoch += 1;
+            self.resuming = false;
+            self.status = SessionStatus::Suspended;
         }
     }
 
@@ -326,6 +400,16 @@ impl SessionState {
             }
             Message::Result { is_error, text } => {
                 self.epoch += 1;
+                if self.resuming {
+                    self.resuming = false;
+                    if is_error {
+                        // The resumed process refused the id or failed before answering.
+                        let full = (!text.trim().is_empty()).then(|| truncate_bytes(&text, MAX_RESULT_BYTES));
+                        self.finish(SessionStatus::Ended, now);
+                        self.push_item(InboxKind::Error, now, RESUME_FAILED.into(), None, None, None, full);
+                        return;
+                    }
+                }
                 if !text.trim().is_empty() {
                     self.last_message = Some(truncate(&text, MAX_MESSAGE_CHARS));
                 }
@@ -450,6 +534,7 @@ impl SessionState {
             return;
         }
         self.epoch += 1;
+        self.resuming = false;
         self.pending.clear();
         self.pending_order.clear();
         for i in &mut self.inbox {
@@ -474,8 +559,13 @@ impl SessionState {
         if self.is_over() {
             return;
         }
+        let resuming = std::mem::take(&mut self.resuming);
         if code == Some(0) {
             self.finish(SessionStatus::Ended, now);
+        } else if resuming {
+            // Still the same conversation, kept on disk by claude: not a crash of ours.
+            self.finish(SessionStatus::Ended, now);
+            self.push_item(InboxKind::Error, now, RESUME_FAILED.into(), None, None, None, None);
         } else {
             self.finish(SessionStatus::Failed, now);
             self.push_item(InboxKind::Error, now, "The session process exited unexpectedly".into(), None, None, None, None);

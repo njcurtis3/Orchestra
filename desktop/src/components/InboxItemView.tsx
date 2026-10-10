@@ -36,6 +36,7 @@ export function InboxItemView({ item, onError }: Props) {
         )}
       </div>
       <div className="meta">{new Date(item.created_at).toLocaleString()}</div>
+      {item.expired && <p className="meta">This request expired when Orchestra closed and can no longer be answered.</p>}
       {item.kind === "permission" && <Permission item={item} busy={busy} send={send} />}
       {item.kind === "question" && <Questions item={item} busy={busy} send={send} />}
       {item.kind === "finished" && <Finished item={item} busy={busy} send={send} />}

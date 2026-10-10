@@ -9,14 +9,14 @@ pub mod store;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 use crate::projects::{Project, Projects};
 use process::{Output, Proc};
-use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
+use state::{ClaudeSessionId, Commit, Decision, InboxItem, SessionState, SessionStatus};
 use store::{Snapshot, StoredSession, Writer};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
@@ -44,8 +44,9 @@ pub enum Event {
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
 pub type Sink = Box<dyn Fn(Output) + Send>;
-/// Starts a child in the given directory; every stdout line and the exit go to the sink.
-pub type Spawner = Box<dyn Fn(&Path, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
+/// Starts a child in the given directory, resuming a saved conversation when given its id;
+/// every stdout line and the exit go to the sink.
+pub type Spawner = Box<dyn Fn(&Path, Option<&ClaudeSessionId>, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
 
 struct Session {
     id: String,
@@ -127,6 +128,10 @@ impl Inner {
         }
     }
 
+    fn is_expired_item(&self, item_id: &str) -> bool {
+        self.sessions.values().any(|s| s.state.inbox.iter().any(|i| i.id == item_id && i.expired))
+    }
+
     /// The session holding an unresolved request with this item id.
     fn session_of_item(&self, item_id: &str) -> Option<String> {
         self.sessions.values().find(|s| s.state.has_pending(item_id)).map(|s| s.id.clone())
@@ -147,16 +152,19 @@ pub struct Sessions {
     spawner: Spawner,
     /// `None` when saving is off: tests, or a state file this build must not touch.
     writer: Option<Writer>,
+    /// Lets `&self` methods hand an owning handle to a reader thread.
+    me: Weak<Sessions>,
 }
 
 impl Sessions {
     pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             inner: Mutex::new(Inner::default()),
             emit_order: Mutex::new(()),
             emit,
             spawner,
             writer,
+            me: me.clone(),
         })
     }
 
@@ -286,7 +294,7 @@ impl Sessions {
         let this = Arc::clone(self);
         let sid = session_id.clone();
         let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
-        let proc = match (self.spawner)(&path, sink) {
+        let proc = match (self.spawner)(&path, None, sink) {
             Ok(p) => p,
             Err(e) => {
                 let mut inner = self.lock();
@@ -329,7 +337,16 @@ impl Sessions {
                 Output::Exit(code) => s.state.mark_exit(code, now),
             }
         }
+        // A line can end a session only when a resume failed; the process has no more use.
+        let dead = inner
+            .sessions
+            .get(session_id)
+            .filter(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed))
+            .and_then(|s| s.proc.clone());
         self.publish(inner, session_id);
+        if let Some(p) = dead {
+            p.kill();
+        }
     }
 
     pub fn answer_permission(
@@ -358,13 +375,83 @@ impl Sessions {
         item_id: &str,
         build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
     ) -> Result<(), String> {
-        let sid = self.lock().session_of_item(item_id).ok_or("unknown or resolved item")?;
+        let inner = self.lock();
+        if inner.is_expired_item(item_id) {
+            return Err("this request expired when Orchestra closed".into());
+        }
+        let sid = inner.session_of_item(item_id).ok_or("unknown or resolved item")?;
+        drop(inner);
         self.send_through(&sid, build)
     }
 
     pub fn reply(&self, session_id: &str, text: &str) -> Result<(), String> {
         check_text(text)?;
-        self.send_through(session_id, |state| state.reply_line(text))
+        let gate = self.lock().sessions.get(session_id).ok_or("unknown session")?.gate.clone();
+        let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+        let paused = self.lock().sessions.get(session_id).map(|s| s.state.status) == Some(SessionStatus::Suspended);
+        if paused {
+            return self.resume_with(session_id, text);
+        }
+        self.send_locked(session_id, |state| state.reply_line(text))
+    }
+
+    /// A reply to a paused session starts a new process with `--resume` and sends the reply
+    /// as its first user line. Called with the session's gate held; `Inner` is not held
+    /// across the spawn or the write.
+    fn resume_with(&self, session_id: &str, text: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        let s = inner.sessions.get(session_id).ok_or("unknown session")?;
+        let Some(path) = inner.projects.get(&s.project_id).map(|e| e.path.clone()) else {
+            if let Some(s) = inner.sessions.get_mut(session_id) {
+                s.state.fail_resume("The project folder no longer exists", now_ms());
+            }
+            self.publish(inner, session_id);
+            return Err("project folder no longer exists".into());
+        };
+        let plan = inner.sessions.get_mut(session_id).ok_or("unknown session")?.state.begin_resume(now_ms())?;
+        // Working is shown before the process exists; from here the reader can only move it on.
+        self.publish(inner, session_id);
+
+        let this = self.me.upgrade().ok_or("app is closing")?;
+        let sid = session_id.to_string();
+        let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
+        let proc = match (self.spawner)(&path, Some(&plan.claude_session_id), sink) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut inner = self.lock();
+                if let Some(s) = inner.sessions.get_mut(session_id) {
+                    s.state.abort_resume();
+                }
+                self.publish(inner, session_id);
+                return Err(e);
+            }
+        };
+        let mut inner = self.lock();
+        let over = inner
+            .sessions
+            .get(session_id)
+            .is_none_or(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed));
+        if over || inner.shutting_down {
+            // Stopped (or the app closed) while the process was starting.
+            drop(inner);
+            proc.kill();
+            return Err("session has ended".into());
+        }
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.proc = Some(Arc::clone(&proc));
+        }
+        drop(inner);
+        if proc.send_line(&protocol::user_message(text)).is_err() {
+            // The reader reports the exit, which ends the session as a failed resume.
+            proc.kill();
+            return Err("failed to send to session".into());
+        }
+        let mut inner = self.lock();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.state.commit_resume(&plan.resolve);
+        }
+        self.publish(inner, session_id);
+        Ok(())
     }
 
     /// Build the line without changing state, write it, and only after a successful write
@@ -377,6 +464,15 @@ impl Sessions {
     ) -> Result<(), String> {
         let gate = self.lock().sessions.get(session_id).ok_or("unknown session")?.gate.clone();
         let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+        self.send_locked(session_id, build)
+    }
+
+    /// `send_through` with the session's gate already held.
+    fn send_locked(
+        &self,
+        session_id: &str,
+        build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
+    ) -> Result<(), String> {
         let (proc, line, commit) = {
             let inner = self.lock();
             let s = inner.sessions.get(session_id).ok_or("unknown session")?;
@@ -491,6 +587,8 @@ mod tests {
         fake: Arc<Fake>,
         sink: Arc<Mutex<Option<Sink>>>,
         events: Arc<Mutex<Vec<Event>>>,
+        /// Every spawn: the directory and the id passed to `--resume`, if any.
+        spawns: Arc<Mutex<Vec<(std::path::PathBuf, Option<String>)>>>,
     }
 
     fn rig() -> (Rig, Project) {
@@ -506,17 +604,19 @@ mod tests {
         });
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
-        let (f2, s2, e2) = (fake.clone(), sink.clone(), events.clone());
+        let spawns = Arc::new(Mutex::new(vec![]));
+        let (f2, s2, e2, p2) = (fake.clone(), sink.clone(), events.clone(), spawns.clone());
         let sessions = Sessions::with_writer(
             Box::new(move |e| e2.lock().unwrap().push(e)),
-            Box::new(move |_dir, sk| {
+            Box::new(move |dir, resume, sk| {
+                p2.lock().unwrap().push((dir.to_path_buf(), resume.map(|r| r.as_str().to_string())));
                 *s2.lock().unwrap() = Some(sk);
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
             writer,
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
-        (Rig { sessions, fake, sink, events }, project)
+        (Rig { sessions, fake, sink, events, spawns }, project)
     }
 
     impl Rig {
@@ -849,4 +949,130 @@ mod tests {
         assert_eq!(project.name, dir.file_name().unwrap().to_string_lossy(), "only the folder name is exposed");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    const RESUME_UNKNOWN_ID: &str = include_str!("../../tests/fixtures/stream_json/resume_unknown_id.jsonl");
+
+    fn finished_item(id: &str, session_id: &str) -> InboxItem {
+        InboxItem { kind: state::InboxKind::Finished, summary: "all done".into(), ..open_permission(id, session_id) }
+    }
+
+    /// A restored, paused session s1 in a real scratch folder registered as p1.
+    fn paused(r: &Rig, dir: &std::path::Path) {
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 1,
+            projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.to_path_buf() }],
+            sessions: vec![stored_session("s1", SessionStatus::Idle, vec![finished_item("s1-i1", "s1")], 1)],
+        });
+    }
+
+    #[test]
+    fn no_spawn_on_restore() {
+        let (r, _) = rig();
+        let dir = scratch("nospawn");
+        paused(&r, &dir);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended);
+        assert!(r.spawns.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_to_suspended_respawns_with_resume() {
+        let (r, _) = rig();
+        let dir = scratch("respawn");
+        paused(&r, &dir);
+        r.sessions.reply("s1", "and then?").unwrap();
+        assert_eq!(*r.spawns.lock().unwrap(), [(dir.clone(), Some(CLAUDE_ID.to_string()))]);
+        let lines = r.fake.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "the reply is the first line written");
+        let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["message"]["content"], "and then?");
+        drop(lines);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Working);
+        assert!(r.sessions.list_inbox()[0].resolved, "the reply resolves the finished item");
+        r.feed(INIT_UUID);
+        r.feed(DONE);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Idle);
+        r.sessions.reply("s1", "once more").unwrap();
+        assert_eq!(r.spawns.lock().unwrap().len(), 1, "a live session is not respawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_failure_falls_back_to_ended() {
+        let (r, _) = rig();
+        let dir = scratch("resumefail");
+        paused(&r, &dir);
+        r.sessions.reply("s1", "hello again").unwrap();
+        for l in RESUME_UNKNOWN_ID.lines() {
+            let d: serde_json::Value = serde_json::from_str(l).unwrap();
+            if d["_dir"] == "in" {
+                r.feed(&d["msg"].to_string());
+            }
+        }
+        r.sessions.on_output("s1", Output::Exit(Some(1)));
+        let s = &r.sessions.list_sessions()[0];
+        assert_eq!(s.status, SessionStatus::Ended);
+        assert_eq!(s.claude_session_id.as_deref(), Some(CLAUDE_ID), "the id is kept");
+        let errors: Vec<_> = r.sessions.list_inbox().into_iter().filter(|i| i.kind == state::InboxKind::Error).collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].summary, "Could not resume this session");
+        assert!(r.fake.killed.load(Ordering::SeqCst));
+        // The same outcome when the process only exits.
+        let (r, _) = rig();
+        paused(&r, &dir);
+        r.sessions.reply("s1", "hello again").unwrap();
+        r.sessions.on_output("s1", Output::Exit(Some(1)));
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Ended);
+        assert_eq!(r.sessions.list_inbox().iter().filter(|i| i.kind == state::InboxKind::Error).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_project_folder_ends_without_spawn() {
+        let (r, _) = rig();
+        let dir = scratch("gone");
+        paused(&r, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The folder vanished after the state was loaded: the project is re-checked on restore.
+        let (r2, _) = rig();
+        let snapshot = store::Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 1,
+            projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.clone() }],
+            sessions: vec![stored_session("s1", SessionStatus::Idle, vec![finished_item("s1-i1", "s1")], 1)],
+        };
+        r2.sessions.restore(snapshot);
+        let err = r2.sessions.reply("s1", "hi").unwrap_err();
+        assert!(err.contains("no longer exists") && !err.contains(':'));
+        assert!(r2.spawns.lock().unwrap().is_empty());
+        assert_eq!(r2.sessions.list_sessions()[0].status, SessionStatus::Ended);
+        let items = r2.sessions.list_inbox();
+        assert_eq!(items.iter().filter(|i| i.kind == state::InboxKind::Error).count(), 1);
+        assert!(items.last().unwrap().summary.contains("no longer exists"));
+        drop(r);
+    }
+
+    #[test]
+    fn answering_expired_item_is_refused() {
+        let (r, _) = rig();
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 0,
+            projects: vec![],
+            sessions: vec![stored_session("s1", SessionStatus::WaitingPermission, vec![open_permission("s1-i1", "s1")], 1)],
+        });
+        let err = r.sessions.answer_permission("s1-i1", Decision::Allow, None).unwrap_err();
+        assert!(err.contains("expired"));
+        let err = r.sessions.answer_question("s1-i1", &BTreeMap::new()).unwrap_err();
+        assert!(err.contains("expired"));
+        assert!(r.spawns.lock().unwrap().is_empty() && r.fake.lines.lock().unwrap().is_empty());
+    }
+
 }
