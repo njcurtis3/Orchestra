@@ -92,9 +92,13 @@ fn dispatch_answer(sessions: &Sessions, args: Answer) -> Result<(), String> {
     }
 }
 
+/// Async for the same reason as `start_session`: the kill runs on the blocking pool.
 #[tauri::command]
-pub fn stop_session(args: StopArgs, sessions: State<'_, AppSessions>) -> Result<(), String> {
-    sessions.stop(&args.session_id)
+pub async fn stop_session(args: StopArgs, sessions: State<'_, AppSessions>) -> Result<(), String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.stop(&args.session_id))
+        .await
+        .map_err(|_| "stop task failed".to_string())?
 }
 
 #[cfg(test)]
