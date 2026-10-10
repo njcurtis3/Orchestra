@@ -12,6 +12,7 @@ use crate::projects::Project;
 use crate::session::SessionSummary;
 use crate::session::Sessions;
 use crate::session::state::{Decision, InboxItem};
+use crate::session::store::StorageStatus;
 
 pub type AppSessions = Arc<Sessions>;
 
@@ -90,6 +91,12 @@ fn dispatch_answer(sessions: &Sessions, args: Answer) -> Result<(), String> {
         Answer::Question { item_id, answers } => sessions.answer_question(&item_id, &answers),
         Answer::Reply { session_id, text } => sessions.reply(&session_id, &text),
     }
+}
+
+/// Whether history was loaded and is being saved. Carries no path.
+#[tauri::command]
+pub fn storage_status(status: State<'_, StorageStatus>) -> StorageStatus {
+    status.inner().clone()
 }
 
 /// Async for the same reason as `start_session`: the kill runs on the blocking pool.

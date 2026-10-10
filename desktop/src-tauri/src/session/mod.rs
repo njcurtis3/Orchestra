@@ -1,9 +1,11 @@
 //! Session manager: owns projects and sessions, validates every input, and glues the
-//! pure state machine (`state`) to the child process (`process`). All state is in memory.
+//! pure state machine (`state`) to the child process (`process`). State lives in memory and
+//! is mirrored to disk through `store` after every change.
 
 pub mod process;
 pub mod protocol;
 pub mod state;
+pub mod store;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -15,6 +17,7 @@ use serde::Serialize;
 use crate::projects::{Project, Projects};
 use process::{Output, Proc};
 use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
+use store::{Snapshot, StoredSession, Writer};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
 pub const MAX_TEXT_BYTES: usize = 32768;
@@ -77,6 +80,10 @@ struct Inner {
     sessions: HashMap<String, Session>,
     order: Vec<String>,
     next_session: u64,
+    /// Bumped for every snapshot computed, so the writer can tell newest from older.
+    revision: u64,
+    /// Set by `shutdown`: from then on the readers change nothing and nothing is saved.
+    shutting_down: bool,
 }
 
 impl Inner {
@@ -89,6 +96,28 @@ impl Inner {
             .collect();
         items.sort_by_key(|i| i.created_at);
         items
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            schema: store::SCHEMA,
+            revision: self.revision,
+            next_session: self.next_session,
+            next_project: self.projects.counter(),
+            projects: self.projects.to_stored(),
+            sessions: self
+                .order
+                .iter()
+                .filter_map(|id| self.sessions.get(id))
+                .map(|s| StoredSession {
+                    id: s.id.clone(),
+                    project_id: s.project_id.clone(),
+                    project_name: s.project_name.clone(),
+                    started_at: s.started_at,
+                    state: s.state.to_persisted(),
+                })
+                .collect(),
+        }
     }
 
     fn events_for(&self, session_id: &str) -> Vec<Event> {
@@ -116,11 +145,54 @@ pub struct Sessions {
     emit_order: Mutex<()>,
     emit: Emit,
     spawner: Spawner,
+    /// `None` when saving is off: tests, or a state file this build must not touch.
+    writer: Option<Writer>,
 }
 
 impl Sessions {
-    pub fn new(emit: Emit, spawner: Spawner) -> Arc<Self> {
-        Arc::new(Self { inner: Mutex::new(Inner::default()), emit_order: Mutex::new(()), emit, spawner })
+    pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner::default()),
+            emit_order: Mutex::new(()),
+            emit,
+            spawner,
+            writer,
+        })
+    }
+
+    /// Load what the state file held. Every session that was live is suspended: its process
+    /// is gone, and any request it had open can no longer be answered. Nothing is spawned.
+    pub fn restore(&self, snapshot: Snapshot) {
+        let mut inner = self.lock();
+        inner.revision = snapshot.revision;
+        inner.projects = Projects::restore(snapshot.projects, snapshot.next_project);
+        let mut next_session = snapshot.next_session;
+        for stored in snapshot.sessions {
+            if inner.sessions.contains_key(&stored.id) {
+                continue;
+            }
+            if let Some(n) = stored.id.strip_prefix("s").and_then(|n| n.parse::<u64>().ok()) {
+                next_session = next_session.max(n);
+            }
+            let mut state = SessionState::from_persisted(&stored.id, stored.state);
+            // Closing is not activity, so the last-activity time is kept.
+            let at = state.last_activity_at;
+            state.suspend(at);
+            inner.order.push(stored.id.clone());
+            inner.sessions.insert(
+                stored.id.clone(),
+                Session {
+                    id: stored.id,
+                    project_id: stored.project_id,
+                    project_name: stored.project_name,
+                    started_at: stored.started_at,
+                    state,
+                    proc: None,
+                    gate: Arc::new(Mutex::new(())),
+                },
+            );
+        }
+        inner.next_session = next_session;
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -129,18 +201,50 @@ impl Sessions {
 
     /// Compute the events for a session under `inner`, take the emit lock before letting
     /// `inner` go, then fire. Two publishers therefore fire in the order they computed.
-    fn publish(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
+    ///
+    /// The disk follows the same shape: the snapshot is computed under `inner` with the
+    /// next revision and queued under the emit lock, so the writer sees snapshots in
+    /// revision order and `inner` is never held across disk I/O.
+    fn publish(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str) {
         let events = inner.events_for(session_id);
+        let snapshot = self.next_snapshot(&mut inner);
         let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
         drop(inner);
+        self.queue_save(snapshot);
         for e in events {
             (self.emit)(e);
         }
         drop(order);
     }
 
+    /// Save without an event, for a change the frontend is not told about.
+    fn save_state(&self, mut inner: MutexGuard<'_, Inner>) {
+        let snapshot = self.next_snapshot(&mut inner);
+        let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+        drop(inner);
+        self.queue_save(snapshot);
+        drop(order);
+    }
+
+    fn next_snapshot(&self, inner: &mut Inner) -> Option<Snapshot> {
+        if self.writer.is_none() || inner.shutting_down {
+            return None;
+        }
+        inner.revision += 1;
+        Some(inner.snapshot())
+    }
+
+    fn queue_save(&self, snapshot: Option<Snapshot>) {
+        if let (Some(w), Some(s)) = (&self.writer, snapshot) {
+            w.save(s);
+        }
+    }
+
     pub fn add_project(&self, path: &Path) -> Result<Project, String> {
-        self.lock().projects.add(path)
+        let mut inner = self.lock();
+        let project = inner.projects.add(path)?;
+        self.save_state(inner);
+        Ok(project)
     }
 
     pub fn list_projects(&self) -> Vec<Project> {
@@ -214,6 +318,10 @@ impl Sessions {
     /// Entry point for the reader thread: one stdout line, or the exit.
     pub fn on_output(&self, session_id: &str, out: Output) {
         let mut inner = self.lock();
+        if inner.shutting_down {
+            // The children are being killed on purpose; their exit is not a failure.
+            return;
+        }
         let now = now_ms();
         if let Some(s) = inner.sessions.get_mut(session_id) {
             match out {
@@ -303,9 +411,26 @@ impl Sessions {
         Ok(())
     }
 
-    /// App exit: no child outlives the app.
-    pub fn kill_all(&self) {
-        let procs: Vec<Arc<dyn Proc>> = self.lock().sessions.values().filter_map(|s| s.proc.clone()).collect();
+    /// App exit: suspend every live session, write the final state and wait for it, and only
+    /// then kill the children, so no child outlives the app. Once this starts the readers
+    /// are ignored, so the exit that follows the kill cannot turn a session into a failure.
+    pub fn shutdown(&self) {
+        let mut inner = self.lock();
+        inner.shutting_down = true;
+        for s in inner.sessions.values_mut() {
+            let at = s.state.last_activity_at;
+            s.state.suspend(at);
+        }
+        let procs: Vec<Arc<dyn Proc>> = inner.sessions.values().filter_map(|s| s.proc.clone()).collect();
+        let snapshot = self.writer.as_ref().map(|_| {
+            inner.revision += 1;
+            inner.snapshot()
+        });
+        drop(inner);
+        if let (Some(w), Some(s)) = (&self.writer, snapshot) {
+            w.save(s);
+            w.flush();
+        }
         for p in procs {
             p.kill();
         }
@@ -369,6 +494,10 @@ mod tests {
     }
 
     fn rig() -> (Rig, Project) {
+        rig_with(None)
+    }
+
+    fn rig_with(writer: Option<Writer>) -> (Rig, Project) {
         let fake = Arc::new(Fake {
             lines: Mutex::new(vec![]),
             killed: AtomicBool::new(false),
@@ -378,12 +507,13 @@ mod tests {
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
         let (f2, s2, e2) = (fake.clone(), sink.clone(), events.clone());
-        let sessions = Sessions::new(
+        let sessions = Sessions::with_writer(
             Box::new(move |e| e2.lock().unwrap().push(e)),
             Box::new(move |_dir, sk| {
                 *s2.lock().unwrap() = Some(sk);
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
+            writer,
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
         (Rig { sessions, fake, sink, events }, project)
@@ -495,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_kills_child_and_kill_all_covers_app_exit() {
+    fn stop_kills_child_and_shutdown_covers_app_exit() {
         let (r, p) = rig();
         let s = r.sessions.start(&p.id, "go").unwrap();
         r.sessions.stop(&s.id).unwrap();
@@ -505,7 +635,7 @@ mod tests {
 
         let (r2, p2) = rig();
         r2.sessions.start(&p2.id, "go").unwrap();
-        r2.sessions.kill_all();
+        r2.sessions.shutdown();
         assert!(r2.fake.killed.load(Ordering::SeqCst));
     }
 
@@ -587,5 +717,136 @@ mod tests {
         r.sessions.on_output(&s.id, Output::Exit(Some(1)));
         assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Failed);
         assert!(r.sessions.list_inbox().iter().any(|i| i.kind == state::InboxKind::Error));
+    }
+
+    const CLAUDE_ID: &str = "0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b";
+    const INIT_UUID: &str = r#"{"type":"system","subtype":"init","session_id":"0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b"}"#;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orchestra-sessions-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn open_permission(id: &str, session_id: &str) -> InboxItem {
+        InboxItem {
+            id: id.into(),
+            session_id: session_id.into(),
+            kind: state::InboxKind::Permission,
+            created_at: 5,
+            resolved: false,
+            expired: false,
+            summary: "Permission to use Bash".into(),
+            tool_name: Some("Bash".into()),
+            tool_input_preview: None,
+            questions: None,
+            result_text: None,
+        }
+    }
+
+    fn stored_session(id: &str, status: SessionStatus, inbox: Vec<InboxItem>, next_item: u64) -> StoredSession {
+        StoredSession {
+            id: id.into(),
+            project_id: "p1".into(),
+            project_name: "proj".into(),
+            started_at: 1,
+            state: state::PersistedSession {
+                status,
+                last_activity_at: 7,
+                last_message: Some("hello".into()),
+                claude_session_id: Some(CLAUDE_ID.into()),
+                inbox,
+                next_item,
+                unknown_count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn quit_records_suspended_not_failed() {
+        let d = scratch("quit");
+        let file = d.join("state.json");
+        let (r, p) = rig_with(Some(Writer::new(file.clone())));
+        let s = r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT_UUID);
+        r.feed(PERM);
+        r.sessions.shutdown();
+        assert!(r.fake.killed.load(Ordering::SeqCst), "children are killed after the flush");
+        // The reader sees the kill as an exit with code 1 and must not act on it.
+        r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended);
+        assert!(r.sessions.list_inbox().iter().all(|i| i.kind != state::InboxKind::Error));
+        let saved = store::load(&file).unwrap().unwrap();
+        assert_eq!(saved.sessions[0].state.status, SessionStatus::Suspended);
+        assert!(saved.sessions[0].state.inbox.iter().all(|i| i.kind != state::InboxKind::Error));
+        assert!(saved.sessions[0].state.inbox[0].expired);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restore_continues_counters() {
+        let (r, _) = rig();
+        let dir = scratch("counters");
+        let snapshot = Snapshot {
+            schema: store::SCHEMA,
+            revision: 9,
+            next_session: 5,
+            next_project: 3,
+            projects: vec![crate::projects::StoredProject { id: "p3".into(), name: "proj".into(), path: dir.clone() }],
+            sessions: vec![stored_session("s2", SessionStatus::Idle, vec![], 4)],
+        };
+        r.sessions.restore(snapshot);
+        let listed = r.sessions.list_sessions();
+        assert_eq!((listed[0].id.as_str(), listed[0].status), ("s2", SessionStatus::Suspended));
+        assert_eq!(listed[0].last_activity_at, 7, "closing is not activity");
+        assert!(r.fake.lines.lock().unwrap().is_empty() && r.sink.lock().unwrap().is_none(), "nothing spawned");
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(r.sessions.add_project(&other).unwrap().id, "p4");
+        let started = r.sessions.start("p3", "again").unwrap();
+        assert_eq!(started.id, "s6");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_expires_items_left_open_by_crash() {
+        let (r, _) = rig();
+        let snapshot = Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 0,
+            projects: vec![],
+            sessions: vec![stored_session("s1", SessionStatus::WaitingPermission, vec![open_permission("s1-i1", "s1")], 1)],
+        };
+        r.sessions.restore(snapshot);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended);
+        let item = &r.sessions.list_inbox()[0];
+        assert!(item.resolved && item.expired);
+        assert!(r.sessions.answer_permission(&item.id, Decision::Allow, None).is_err());
+    }
+
+    #[test]
+    fn ipc_types_carry_no_path() {
+        let dir = scratch("nopath");
+        let (r, _) = rig();
+        let project = r.sessions.add_project(&dir).unwrap();
+        let s = r.sessions.start(&project.id, "go").unwrap();
+        r.feed(INIT_UUID);
+        r.feed(PERM);
+        let json = [
+            serde_json::to_string(&s).unwrap(),
+            serde_json::to_string(&r.sessions.list_sessions()).unwrap(),
+            serde_json::to_string(&r.sessions.list_inbox()).unwrap(),
+            serde_json::to_string(&r.sessions.list_projects()).unwrap(),
+            serde_json::to_string(&store::StorageStatus::unreadable()).unwrap(),
+        ]
+        .join("\n");
+        let raw = dir.to_string_lossy().into_owned();
+        let escaped = serde_json::to_string(&raw).unwrap();
+        assert!(!json.contains(&raw) && !json.contains(escaped.trim_matches('"')), "no project path over IPC");
+        assert_eq!(project.name, dir.file_name().unwrap().to_string_lossy(), "only the folder name is exposed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

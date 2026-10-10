@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeInboxItem, decodeSession } from "./ipc";
+import { decodeInboxItem, decodeSession, decodeStorageStatus } from "./ipc";
 
 const wire = (status: unknown) => ({
   id: "s1",
@@ -62,5 +62,25 @@ describe("decodeInboxItem", () => {
   it("rejects a mistyped expired or result_text", () => {
     expect(() => decodeInboxItem(itemWire({ expired: "yes" }))).toThrow("bad field expired");
     expect(() => decodeInboxItem(itemWire({ result_text: 3 }))).toThrow("bad field result_text");
+  });
+});
+
+describe("decodeStorageStatus", () => {
+  it("decodes ok and the two failure reasons", () => {
+    expect(decodeStorageStatus({ ok: true })).toEqual({ ok: true });
+    expect(decodeStorageStatus({ ok: false, reason: "unknown_schema_version", found_version: 2 })).toEqual({
+      ok: false,
+      reason: "unknown_schema_version",
+      found_version: 2,
+    });
+    expect(decodeStorageStatus({ ok: false, reason: "unreadable" })).toEqual({
+      ok: false,
+      reason: "unreadable",
+      found_version: null,
+    });
+  });
+
+  it("rejects an unknown reason", () => {
+    expect(() => decodeStorageStatus({ ok: false, reason: "disk_on_fire" })).toThrow("unknown reason");
   });
 });
