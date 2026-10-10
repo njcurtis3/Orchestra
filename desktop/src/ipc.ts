@@ -92,10 +92,12 @@ export function decodeInboxItem(v: unknown): InboxItem {
     kind: oneOf(o, "kind", INBOX_KINDS),
     created_at: num(o, "created_at"),
     resolved: bool(o, "resolved"),
+    expired: bool(o, "expired"),
     summary: str(o, "summary"),
     tool_name: strOrNull(o, "tool_name"),
     tool_input_preview: strOrNull(o, "tool_input_preview"),
     questions: qs === null || qs === undefined ? null : arr(qs, "questions").map(decodeQuestion),
+    result_text: strOrNull(o, "result_text"),
   };
 }
 

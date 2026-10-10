@@ -9,6 +9,7 @@ export const SESSION_STATUSES = [
   "waiting_question",
   "needs_attention",
   "idle",
+  "suspended",
   "ended",
   "failed",
 ] as const;
@@ -43,10 +44,12 @@ export type InboxItem = {
   kind: InboxKind;
   created_at: number;
   resolved: boolean;
+  expired: boolean; // open when Orchestra closed; implies resolved, never shown as Resolved
   summary: string; // truncated
   tool_name: string | null;
   tool_input_preview: string | null; // JSON, truncated to 2000 chars
   questions: Question[] | null;
+  result_text: string | null; // full result text on finished/error items, capped at 256 KiB
 };
 
 export type Answer =

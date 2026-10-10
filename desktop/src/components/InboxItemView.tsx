@@ -26,16 +26,25 @@ export function InboxItemView({ item, onError }: Props) {
   }
 
   return (
-    <li className={`card kind-${item.kind}${item.resolved ? " resolved" : ""}`}>
+    <li className={`card kind-${item.kind}${item.expired ? " expired" : item.resolved ? " resolved" : ""}`}>
       <div className="row">
         <strong>{item.kind}</strong>
-        {item.resolved && <span className="badge status-ended">Resolved</span>}
+        {item.expired ? (
+          <span className="badge status-expired">Expired</span>
+        ) : (
+          item.resolved && <span className="badge status-ended">Resolved</span>
+        )}
       </div>
       <div className="meta">{new Date(item.created_at).toLocaleString()}</div>
       {item.kind === "permission" && <Permission item={item} busy={busy} send={send} />}
       {item.kind === "question" && <Questions item={item} busy={busy} send={send} />}
       {item.kind === "finished" && <Finished item={item} busy={busy} send={send} />}
-      {item.kind === "error" && <p className="text">{item.summary}</p>}
+      {item.kind === "error" && (
+        <>
+          <p className="text">{item.summary}</p>
+          <ResultText item={item} />
+        </>
+      )}
     </li>
   );
 }
@@ -166,12 +175,19 @@ function Questions({ item, busy, send }: Sub) {
   );
 }
 
+// The summary is cut to 300 chars; this is the whole text, scrollable.
+function ResultText({ item }: { item: InboxItem }) {
+  if (!item.result_text || item.result_text === item.summary) return null;
+  return <pre className="result-text">{item.result_text}</pre>;
+}
+
 function Finished({ item, busy, send }: Sub) {
   const [text, setText] = useState("");
   const valid = text.trim() !== "" && !tooLong(text);
   return (
     <>
       <p className="text">{item.summary}</p>
+      <ResultText item={item} />
       {!item.resolved && (
         <>
           <label>

@@ -11,10 +11,12 @@ use super::protocol::{self, Message};
 const MAX_MESSAGE_CHARS: usize = 500;
 const MAX_SUMMARY_CHARS: usize = 300;
 const MAX_PREVIEW_CHARS: usize = 2000;
+/// Cap on the full result text kept on a Finished/Error item.
+pub const MAX_RESULT_BYTES: usize = 262_144;
 const MAX_SUBTYPE_CHARS: usize = 64;
 const DENY_DEFAULT: &str = "User denied";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Starting,
@@ -25,11 +27,13 @@ pub enum SessionStatus {
     /// until the turn ends (`Result`) or the session is over.
     NeedsAttention,
     Idle,
+    /// Not running, but holds a valid claude session id so a reply can resume it.
+    Suspended,
     Ended,
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
     Permission,
@@ -45,13 +49,13 @@ pub enum Decision {
     Deny,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuestionOption {
     pub label: String,
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Question {
     pub question: String,
     pub header: Option<String>,
@@ -59,17 +63,23 @@ pub struct Question {
     pub options: Vec<QuestionOption>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InboxItem {
     pub id: String,
     pub session_id: String,
     pub kind: InboxKind,
     pub created_at: u64,
+    /// Monotonic: once true it stays true.
     pub resolved: bool,
+    /// The request was open when Orchestra closed and can no longer be answered.
+    /// Implies `resolved`.
+    pub expired: bool,
     pub summary: String,
     pub tool_name: Option<String>,
     pub tool_input_preview: Option<String>,
     pub questions: Option<Vec<Question>>,
+    /// Full result text on Finished/Error items from a `Result`, capped at `MAX_RESULT_BYTES`.
+    pub result_text: Option<String>,
 }
 
 /// An open `can_use_tool` request waiting for an answer.
@@ -95,6 +105,19 @@ pub struct SessionState {
     epoch: u64,
 }
 
+/// What survives a restart of one session. `Pending` is deliberately absent: an open
+/// request cannot be answered once its process is gone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedSession {
+    pub status: SessionStatus,
+    pub last_activity_at: u64,
+    pub last_message: Option<String>,
+    pub claude_session_id: Option<String>,
+    pub inbox: Vec<InboxItem>,
+    pub next_item: u64,
+    pub unknown_count: u32,
+}
+
 /// What to apply once the line built by `permission_line`, `question_line` or `reply_line`
 /// has been written to the child.
 #[derive(Debug)]
@@ -108,6 +131,27 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max_chars).collect()
+}
+
+/// Cut to at most `max_bytes` on a char boundary.
+pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Canonical 8-4-4-4-12 hex UUID. Also keeps a leading dash out of the `--resume` argument.
+pub fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 fn parse_questions(input: &Value) -> Vec<Question> {
@@ -152,6 +196,34 @@ impl SessionState {
         }
     }
 
+    pub fn to_persisted(&self) -> PersistedSession {
+        PersistedSession {
+            status: self.status,
+            last_activity_at: self.last_activity_at,
+            last_message: self.last_message.clone(),
+            claude_session_id: self.claude_session_id.clone(),
+            inbox: self.inbox.clone(),
+            next_item: self.next_item,
+            unknown_count: self.unknown_count,
+        }
+    }
+
+    pub fn from_persisted(session_id: &str, p: PersistedSession) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            status: p.status,
+            last_activity_at: p.last_activity_at,
+            last_message: p.last_message,
+            claude_session_id: p.claude_session_id.filter(|id| is_uuid(id)),
+            inbox: p.inbox,
+            pending: HashMap::new(),
+            pending_order: Vec::new(),
+            unknown_count: p.unknown_count,
+            next_item: p.next_item,
+            epoch: 0,
+        }
+    }
+
     pub fn has_pending(&self, item_id: &str) -> bool {
         self.pending.contains_key(item_id)
     }
@@ -168,6 +240,7 @@ impl SessionState {
         tool_name: Option<String>,
         tool_input_preview: Option<String>,
         questions: Option<Vec<Question>>,
+        result_text: Option<String>,
     ) -> String {
         self.next_item += 1;
         let id = format!("{}-i{}", self.session_id, self.next_item);
@@ -177,10 +250,12 @@ impl SessionState {
             kind,
             created_at: now,
             resolved: false,
+            expired: false,
             summary,
             tool_name,
             tool_input_preview,
             questions,
+            result_text,
         });
         id
     }
@@ -217,8 +292,8 @@ impl SessionState {
         self.last_activity_at = now;
         match msg {
             Message::Init { session_id } => {
-                if session_id.is_some() {
-                    self.claude_session_id = session_id;
+                if let Some(id) = session_id.filter(|id| is_uuid(id)) {
+                    self.claude_session_id = Some(id);
                 }
                 if self.status == SessionStatus::Starting {
                     self.status = SessionStatus::Working;
@@ -232,6 +307,9 @@ impl SessionState {
                 }
             }
             Message::CanUseTool { request_id, tool_name, input } => {
+                if self.pending.values().any(|p| p.request_id == request_id) {
+                    return;
+                }
                 self.epoch += 1;
                 let preview = serde_json::to_string(&input).ok().map(|s| truncate(&s, MAX_PREVIEW_CHARS));
                 let (kind, summary, questions) = if tool_name == "AskUserQuestion" {
@@ -241,7 +319,7 @@ impl SessionState {
                 } else {
                     (InboxKind::Permission, truncate(&format!("Permission to use {tool_name}"), MAX_SUMMARY_CHARS), None)
                 };
-                let id = self.push_item(kind, now, summary, Some(tool_name), preview, questions);
+                let id = self.push_item(kind, now, summary, Some(tool_name), preview, questions, None);
                 self.pending.insert(id.clone(), Pending { request_id, input });
                 self.pending_order.push(id);
                 self.recompute();
@@ -252,12 +330,13 @@ impl SessionState {
                     self.last_message = Some(truncate(&text, MAX_MESSAGE_CHARS));
                 }
                 let summary = truncate(&text, MAX_SUMMARY_CHARS);
+                let full = (!text.trim().is_empty()).then(|| truncate_bytes(&text, MAX_RESULT_BYTES));
                 if is_error {
                     let s = if summary.is_empty() { "The session reported an error".to_string() } else { summary };
-                    self.push_item(InboxKind::Error, now, s, None, None, None);
+                    self.push_item(InboxKind::Error, now, s, None, None, None, full);
                 } else {
                     let s = if summary.is_empty() { "Finished".to_string() } else { summary };
-                    self.push_item(InboxKind::Finished, now, s, None, None, None);
+                    self.push_item(InboxKind::Finished, now, s, None, None, None, full);
                 }
                 self.status = SessionStatus::Idle;
             }
@@ -268,7 +347,7 @@ impl SessionState {
                     "Claude sent a request Orchestra cannot answer ({}). The session may be waiting; stop it if it does not continue.",
                     truncate(&subtype, MAX_SUBTYPE_CHARS)
                 );
-                self.push_item(InboxKind::Error, now, summary, None, None, None);
+                self.push_item(InboxKind::Error, now, summary, None, None, None, None);
                 self.status = SessionStatus::NeedsAttention;
             }
             Message::Ignored => {}
@@ -363,6 +442,26 @@ impl SessionState {
         self.last_activity_at = now;
     }
 
+    /// Orchestra is closing (or this session was loaded from disk): the process is gone but
+    /// the conversation may be resumable. Open requests can no longer be answered, so they
+    /// are resolved and marked expired. No error item: this is not a failure.
+    pub fn suspend(&mut self, now: u64) {
+        if self.is_over() {
+            return;
+        }
+        self.epoch += 1;
+        self.pending.clear();
+        self.pending_order.clear();
+        for i in &mut self.inbox {
+            if !i.resolved && matches!(i.kind, InboxKind::Permission | InboxKind::Question) {
+                i.resolved = true;
+                i.expired = true;
+            }
+        }
+        self.status = if self.claude_session_id.is_some() { SessionStatus::Suspended } else { SessionStatus::Ended };
+        self.last_activity_at = now;
+    }
+
     /// The user stopped the session.
     pub fn mark_stopped(&mut self, now: u64) {
         if !self.is_over() {
@@ -379,7 +478,7 @@ impl SessionState {
             self.finish(SessionStatus::Ended, now);
         } else {
             self.finish(SessionStatus::Failed, now);
-            self.push_item(InboxKind::Error, now, "The session process exited unexpectedly".into(), None, None, None);
+            self.push_item(InboxKind::Error, now, "The session process exited unexpectedly".into(), None, None, None, None);
         }
     }
 }
@@ -640,6 +739,94 @@ mod tests {
         st.commit(c, 3);
         assert_eq!(st.status, Idle);
         assert_eq!((st.inbox[0].resolved, st.inbox[1].resolved), (true, false));
+    }
+
+    const UUID: &str = "0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b";
+
+    fn init(st: &mut SessionState, id: &str, now: u64) {
+        st.apply(Message::Init { session_id: Some(id.into()) }, now);
+    }
+
+    #[test]
+    fn dedupes_repeated_request_id() {
+        let mut st = SessionState::new("s1", 0);
+        st.apply(can_use_bash(), 1);
+        st.apply(can_use_bash(), 2);
+        assert_eq!(st.inbox.len(), 1);
+        assert_eq!(st.pending.len(), 1);
+    }
+
+    #[test]
+    fn suspend_expires_open_requests() {
+        let mut st = SessionState::new("s1", 0);
+        init(&mut st, UUID, 1);
+        st.apply(can_use_bash(), 2);
+        st.apply(Message::Result { is_error: false, text: "done".into() }, 3);
+        st.suspend(4);
+        assert_eq!(st.status, Suspended);
+        assert!(st.pending.is_empty() && st.pending_order.is_empty());
+        let p = &st.inbox[0];
+        assert_eq!((p.resolved, p.expired), (true, true));
+        let f = &st.inbox[1];
+        assert_eq!((f.kind, f.resolved, f.expired), (InboxKind::Finished, false, false));
+        assert_eq!(st.inbox.len(), 2, "no error item");
+    }
+
+    #[test]
+    fn suspend_without_claude_id_ends() {
+        let (mut st, _) = waiting_permission();
+        st.claude_session_id = None;
+        st.suspend(5);
+        assert_eq!(st.status, Ended);
+        assert!(st.inbox.iter().all(|i| i.kind != InboxKind::Error));
+        assert!(st.inbox[0].expired);
+    }
+
+    #[test]
+    fn finished_item_keeps_full_result_text() {
+        let mut st = SessionState::new("s1", 0);
+        let text = "\u{e9}".repeat(1000);
+        st.apply(Message::Result { is_error: false, text: text.clone() }, 1);
+        let f = &st.inbox[0];
+        assert_eq!(f.result_text.as_deref(), Some(text.as_str()));
+        assert_eq!(f.summary.chars().count(), 300);
+        let big = "\u{e9}".repeat(MAX_RESULT_BYTES);
+        st.apply(Message::Result { is_error: true, text: big }, 2);
+        let e = st.inbox[1].result_text.as_ref().unwrap();
+        assert_eq!(e.len(), MAX_RESULT_BYTES);
+        assert!(e.chars().all(|c| c == '\u{e9}'));
+        assert_eq!(truncate_bytes("a\u{e9}", 2), "a", "cut lands on a char boundary");
+    }
+
+    #[test]
+    fn rejects_non_uuid_claude_session_id() {
+        let mut st = SessionState::new("s1", 0);
+        init(&mut st, "--evil", 1);
+        init(&mut st, "0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7", 2);
+        init(&mut st, "0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7g", 3);
+        assert_eq!(st.claude_session_id, None);
+        init(&mut st, UUID, 4);
+        assert_eq!(st.claude_session_id.as_deref(), Some(UUID));
+        init(&mut st, "x", 5);
+        assert_eq!(st.claude_session_id.as_deref(), Some(UUID), "a bad id never replaces a good one");
+    }
+
+    #[test]
+    fn inbox_item_serde_roundtrip() {
+        let mut st = SessionState::new("s1", 0);
+        init(&mut st, UUID, 1);
+        st.apply(can_use_bash(), 2);
+        st.apply(Message::Result { is_error: false, text: "ok".into() }, 3);
+        st.suspend(4);
+        let p = st.to_persisted();
+        let json = serde_json::to_string(&p).unwrap();
+        let back: PersistedSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        assert!(json.contains("\"suspended\"") && json.contains("\"expired\":true"));
+        let st2 = SessionState::from_persisted("s1", back);
+        assert_eq!(st2.status, Suspended);
+        assert!(st2.pending.is_empty());
+        assert_eq!(st2.inbox, st.inbox);
     }
 
     #[test]

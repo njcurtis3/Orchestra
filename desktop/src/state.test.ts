@@ -21,10 +21,12 @@ const item = (id: string, at: number, resolved = false): InboxItem => ({
   kind: "finished",
   created_at: at,
   resolved,
+  expired: false,
   summary: "",
   tool_name: null,
   tool_input_preview: null,
   questions: null,
+  result_text: null,
 });
 
 describe("reducer", () => {
