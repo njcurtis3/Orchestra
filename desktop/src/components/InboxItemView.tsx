@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { answer } from "../ipc";
+import { replyThenClear } from "../reply";
 import { MAX_TEXT_BYTES, type Answer, type InboxItem, type Question } from "../types";
 
 type Props = { item: InboxItem; onError: (e: unknown) => void };
@@ -9,13 +10,16 @@ const tooLong = (s: string) => new TextEncoder().encode(s).length > MAX_TEXT_BYT
 export function InboxItemView({ item, onError }: Props) {
   const [busy, setBusy] = useState(false);
 
-  async function send(a: Answer) {
-    if (busy) return;
+  // Resolves true only when the answer was sent.
+  async function send(a: Answer): Promise<boolean> {
+    if (busy) return false;
     setBusy(true);
     try {
       await answer(a);
+      return true;
     } catch (e) {
       onError(e);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -36,7 +40,7 @@ export function InboxItemView({ item, onError }: Props) {
   );
 }
 
-type Sub = { item: InboxItem; busy: boolean; send: (a: Answer) => void };
+type Sub = { item: InboxItem; busy: boolean; send: (a: Answer) => Promise<boolean> };
 
 function Permission({ item, busy, send }: Sub) {
   const [message, setMessage] = useState("");
@@ -178,10 +182,13 @@ function Finished({ item, busy, send }: Sub) {
             <button
               type="button"
               disabled={busy || !valid}
-              onClick={() => {
-                send({ kind: "reply", session_id: item.session_id, text });
-                setText("");
-              }}
+              onClick={() =>
+                void replyThenClear(
+                  send,
+                  { kind: "reply", session_id: item.session_id, text },
+                  () => setText(""),
+                )
+              }
             >
               Send reply
             </button>
