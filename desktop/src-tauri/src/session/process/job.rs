@@ -5,11 +5,18 @@
 //! non-inheritable. When the app dies for any reason the OS closes the handle, which
 //! kills every process still in the job. No breakaway is allowed.
 //!
-//! Known race: the child is assigned to the job after `Command::spawn` returns, because
-//! std exposes no hook between creating the process and resuming it. A grandchild that
-//! claude spawns in that window is not in the job. Children created after the assignment
-//! join the job automatically. Closing the window would need a suspended start and the
-//! primary thread handle, which std does not return.
+//! Known race, accepted: the child is assigned to the job after `Command::spawn` returns,
+//! because std exposes no hook between creating the process and resuming it. The window
+//! runs from `CreateProcessW` returning to `AssignProcessToJobObject` on the same thread,
+//! and claude cannot spawn anything before its own runtime has initialised, so a
+//! grandchild created in it is not expected. Children created after the assignment join
+//! the job automatically.
+//!
+//! Closing the window on stable would need `CREATE_SUSPENDED` plus a Toolhelp thread scan
+//! to find the primary thread (the one-thread premise is unverified), and any failure
+//! after a suspended start strands a suspended child that must then be killed. That adds
+//! more risk than it removes. Revisit when `ChildExt::main_thread_handle`
+//! (rust-lang/rust#96723) is stable and gives the real thread handle with no scan.
 
 use std::process::Child;
 
