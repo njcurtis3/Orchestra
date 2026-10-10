@@ -1,0 +1,90 @@
+import { describe, expect, it } from "vitest";
+import { decodeInboxItem, decodeSession } from "./ipc";
+import { initialState, reducer } from "./state";
+import type { InboxItem, SessionSummary } from "./types";
+
+const session = (id: string, at: number, over: Partial<SessionSummary> = {}): SessionSummary => ({
+  id,
+  project_id: "p1",
+  project_name: "proj",
+  status: "working",
+  started_at: 1,
+  last_activity_at: at,
+  last_message: null,
+  claude_session_id: null,
+  ...over,
+});
+
+const item = (id: string, at: number, resolved = false): InboxItem => ({
+  id,
+  session_id: "s1",
+  kind: "finished",
+  created_at: at,
+  resolved,
+  summary: "",
+  tool_name: null,
+  tool_input_preview: null,
+  questions: null,
+});
+
+describe("reducer", () => {
+  it("loads sessions, most recent activity first", () => {
+    const s = reducer(initialState, {
+      type: "sessions-loaded",
+      sessions: [session("a", 1), session("b", 5)],
+    });
+    expect(s.sessions.map((x) => x.id)).toEqual(["b", "a"]);
+  });
+
+  it("inserts a new session on session-updated", () => {
+    const s = reducer(initialState, { type: "session-updated", session: session("a", 1) });
+    expect(s.sessions).toHaveLength(1);
+  });
+
+  it("replaces an existing session by id", () => {
+    let s = reducer(initialState, { type: "session-updated", session: session("a", 1) });
+    s = reducer(s, { type: "session-updated", session: session("a", 2, { status: "idle" }) });
+    expect(s.sessions).toHaveLength(1);
+    expect(s.sessions[0].status).toBe("idle");
+  });
+
+  it("orders inbox unresolved first, then newest first", () => {
+    const s = reducer(initialState, {
+      type: "inbox-updated",
+      items: [item("old", 1), item("done", 9, true), item("new", 5)],
+    });
+    expect(s.inbox.map((x) => x.id)).toEqual(["new", "old", "done"]);
+  });
+
+  it("replaces the whole inbox on inbox-updated", () => {
+    let s = reducer(initialState, { type: "inbox-updated", items: [item("a", 1), item("b", 2)] });
+    s = reducer(s, { type: "inbox-updated", items: [item("c", 3)] });
+    expect(s.inbox.map((x) => x.id)).toEqual(["c"]);
+  });
+
+  it("does not mutate the previous state", () => {
+    const before = reducer(initialState, { type: "sessions-loaded", sessions: [session("a", 1)] });
+    reducer(before, { type: "session-updated", session: session("b", 2) });
+    expect(before.sessions).toHaveLength(1);
+  });
+});
+
+describe("decoders", () => {
+  it("accepts a valid session", () => {
+    expect(decodeSession(session("a", 1)).id).toBe("a");
+  });
+
+  it("rejects an unknown session status", () => {
+    expect(() => decodeSession({ ...session("a", 1), status: "sleeping" })).toThrow();
+  });
+
+  it("rejects an unknown inbox kind", () => {
+    expect(() => decodeInboxItem({ ...item("a", 1), kind: "alarm" })).toThrow();
+  });
+
+  it("rejects a malformed question", () => {
+    expect(() =>
+      decodeInboxItem({ ...item("a", 1), kind: "question", questions: [{ question: 3 }] }),
+    ).toThrow();
+  });
+});
