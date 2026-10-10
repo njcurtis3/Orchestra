@@ -55,7 +55,12 @@ export function reducer(state: State, action: Action): State {
     }
     case "inbox-loaded":
       return { ...state, inbox: sortInbox(mergeInbox(state.inbox, action.items)) };
-    case "inbox-updated":
-      return { ...state, inbox: sortInbox(action.items) };
+    case "inbox-updated": {
+      // An event carries one session's items only: upsert them, the event copy wins, and
+      // everything else in the inbox stays.
+      const byId = new Map(state.inbox.map((i) => [i.id, i]));
+      for (const i of action.items) byId.set(i.id, i);
+      return { ...state, inbox: sortInbox([...byId.values()]) };
+    }
   }
 }

@@ -48,12 +48,31 @@ pub type Sink = Box<dyn Fn(Output) + Send>;
 /// every stdout line and the exit go to the sink.
 pub type Spawner = Box<dyn Fn(&Path, Option<&ClaudeSessionId>, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
 
+/// What decides whether a stdout line needs a snapshot: a change in any of these is worth a
+/// write, a change in only the message text or the clock is not.
+#[derive(Clone, PartialEq)]
+struct SaveKey {
+    status: SessionStatus,
+    inbox_rev: u64,
+    claude_session_id: Option<String>,
+}
+
+impl SaveKey {
+    fn of(state: &SessionState) -> Self {
+        Self { status: state.status, inbox_rev: state.inbox_rev, claude_session_id: state.claude_session_id.clone() }
+    }
+}
+
 struct Session {
     id: String,
     project_id: String,
     project_name: String,
     started_at: u64,
     state: SessionState,
+    /// The inbox revision last sent to the frontend.
+    emitted_inbox_rev: u64,
+    /// The key as of the last snapshot decision.
+    saved_key: SaveKey,
     proc: Option<Arc<dyn Proc>>,
     /// Serialises build, write and commit of answers for this session. Held across the
     /// pipe write, so it is never taken together with `Inner` and the reader never needs it.
@@ -121,11 +140,22 @@ impl Inner {
         }
     }
 
-    fn events_for(&self, session_id: &str) -> Vec<Event> {
-        match self.sessions.get(session_id) {
-            Some(s) => vec![Event::SessionUpdated(s.summary()), Event::InboxUpdated(self.inbox())],
-            None => Vec::new(),
+    /// The events for a session, and whether its status, inbox or claude id changed since the
+    /// last call. The inbox event carries only this session's items and only when its inbox
+    /// changed.
+    fn events_for(&mut self, session_id: &str) -> (Vec<Event>, bool) {
+        let Some(s) = self.sessions.get_mut(session_id) else {
+            return (Vec::new(), false);
+        };
+        let mut events = vec![Event::SessionUpdated(s.summary())];
+        if s.emitted_inbox_rev != s.state.inbox_rev {
+            s.emitted_inbox_rev = s.state.inbox_rev;
+            events.push(Event::InboxUpdated(s.state.inbox.clone()));
         }
+        let key = SaveKey::of(&s.state);
+        let significant = s.saved_key != key;
+        s.saved_key = key;
+        (events, significant)
     }
 
     fn is_expired_item(&self, item_id: &str) -> bool {
@@ -194,6 +224,8 @@ impl Sessions {
                     project_id: stored.project_id,
                     project_name: stored.project_name,
                     started_at: stored.started_at,
+                    emitted_inbox_rev: state.inbox_rev,
+                    saved_key: SaveKey::of(&state),
                     state,
                     proc: None,
                     gate: Arc::new(Mutex::new(())),
@@ -213,9 +245,26 @@ impl Sessions {
     /// The disk follows the same shape: the snapshot is computed under `inner` with the
     /// next revision and queued under the emit lock, so the writer sees snapshots in
     /// revision order and `inner` is never held across disk I/O.
-    fn publish(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str) {
-        let events = inner.events_for(session_id);
-        let snapshot = self.next_snapshot(&mut inner);
+    ///
+    /// An explicit command always saves; a stdout line goes through `publish_line`.
+    fn publish(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
+        self.publish_saving(inner, session_id, true);
+    }
+
+    /// `publish` for a stdout line: the snapshot is skipped when only text changed.
+    fn publish_line(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
+        self.publish_saving(inner, session_id, false);
+    }
+
+    fn publish_saving(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str, force: bool) {
+        let (events, significant) = inner.events_for(session_id);
+        let snapshot = if force || significant {
+            self.next_snapshot(&mut inner)
+        } else {
+            // Text only: the next snapshot of any kind carries it, and `shutdown` always
+            // snapshots, so a clean exit never loses it.
+            None
+        };
         let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
         drop(inner);
         self.queue_save(snapshot);
@@ -283,6 +332,8 @@ impl Sessions {
                 project_name: name,
                 started_at: now,
                 state: SessionState::new(&id, now),
+                emitted_inbox_rev: 0,
+                saved_key: SaveKey::of(&SessionState::new(&id, now)),
                 proc: None,
                 gate: Arc::new(Mutex::new(())),
             };
@@ -343,7 +394,7 @@ impl Sessions {
             .get(session_id)
             .filter(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed))
             .and_then(|s| s.proc.clone());
-        self.publish(inner, session_id);
+        self.publish_line(inner, session_id);
         if let Some(p) = dead {
             p.kill();
         }
@@ -1073,6 +1124,67 @@ mod tests {
         let err = r.sessions.answer_question("s1-i1", &BTreeMap::new()).unwrap_err();
         assert!(err.contains("expired"));
         assert!(r.spawns.lock().unwrap().is_empty() && r.fake.lines.lock().unwrap().is_empty());
+    }
+    const TEXT: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}"#;
+
+    fn inbox_events(r: &Rig) -> Vec<Vec<InboxItem>> {
+        r.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| if let Event::InboxUpdated(i) = e { Some(i.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn text_lines_emit_no_inbox_event_and_queue_no_save() {
+        let d = scratch("textlines");
+        let (r, p) = rig_with(Some(Writer::new(d.join("state.json"))));
+        r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT_UUID);
+        let (inbox_before, rev_before) = (inbox_events(&r).len(), r.sessions.lock().revision);
+        for _ in 0..5 {
+            r.feed(TEXT);
+        }
+        assert_eq!(inbox_events(&r).len(), inbox_before, "no inbox event for text lines");
+        assert_eq!(r.sessions.lock().revision, rev_before, "no snapshot queued for text lines");
+        assert_eq!(r.sessions.list_sessions()[0].last_message.as_deref(), Some("working on it"));
+        r.feed(PERM);
+        assert_eq!(inbox_events(&r).len(), inbox_before + 1, "a new item does emit");
+        assert!(r.sessions.lock().revision > rev_before, "and does save");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inbox_event_carries_only_that_sessions_items() {
+        let (r, _) = rig();
+        let dir = scratch("onlyown");
+        paused(&r, &dir);
+        let s = r.sessions.start("p1", "go").unwrap();
+        assert_eq!(s.id, "s2");
+        r.feed(INIT_UUID);
+        r.feed(PERM);
+        let last = inbox_events(&r).pop().unwrap();
+        assert_eq!(last.len(), 1);
+        assert!(last.iter().all(|i| i.session_id == "s2"), "s1's finished item is not resent");
+        assert_eq!(r.sessions.list_inbox().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_saves_text_only_changes() {
+        let d = scratch("textshutdown");
+        let file = d.join("state.json");
+        let (r, p) = rig_with(Some(Writer::new(file.clone())));
+        r.sessions.start(&p.id, "go").unwrap();
+        r.feed(INIT_UUID);
+        let rev = r.sessions.lock().revision;
+        r.feed(TEXT);
+        assert_eq!(r.sessions.lock().revision, rev, "the text line itself saved nothing");
+        r.sessions.shutdown();
+        let saved = store::load(&file).unwrap().unwrap();
+        assert_eq!(saved.sessions[0].state.last_message.as_deref(), Some("working on it"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
 }
