@@ -1,50 +1,94 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useReducer, useState } from "react";
+import {
+  listInbox,
+  listProjects,
+  listSessions,
+  onInboxUpdated,
+  onSessionUpdated,
+  pickProject,
+} from "./ipc";
+import { initialState, reducer } from "./state";
+import type { Project } from "./types";
+import { Inbox } from "./components/Inbox";
+import { NewSession } from "./components/NewSession";
+import { SessionList } from "./components/SessionList";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+export function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+function App() {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const fail = useCallback((e: unknown) => setError(errText(e)), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisten: Array<() => void> = [];
+    // Subscribe first so nothing emitted during the initial load is missed.
+    void (async () => {
+      try {
+        const u1 = await onSessionUpdated((session) => dispatch({ type: "session-updated", session }), fail);
+        const u2 = await onInboxUpdated((items) => dispatch({ type: "inbox-updated", items }), fail);
+        if (cancelled) {
+          u1();
+          u2();
+          return;
+        }
+        unlisten.push(u1, u2);
+        const [sessions, items, projs] = await Promise.all([
+          listSessions(),
+          listInbox(),
+          listProjects(),
+        ]);
+        if (cancelled) return;
+        dispatch({ type: "sessions-loaded", sessions });
+        dispatch({ type: "inbox-updated", items });
+        setProjects(projs);
+      } catch (e) {
+        fail(e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten.forEach((u) => u());
+    };
+  }, [fail]);
+
+  async function openProject() {
+    try {
+      const p = await pickProject();
+      if (p) setProjects(await listProjects());
+    } catch (e) {
+      fail(e);
+    }
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+    <div className="app">
+      <header className="app-header">
+        <h1>Orchestra</h1>
+        <button type="button" onClick={openProject}>
+          Open project
+        </button>
+        <NewSession projects={projects} onError={fail} />
+      </header>
+      {error && (
+        <div className="banner" role="alert">
+          <span>{error}</span>
+          <button type="button" onClick={() => setError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+      <main className="columns">
+        <SessionList sessions={state.sessions} onError={fail} />
+        <Inbox items={state.inbox} onError={fail} />
+      </main>
+    </div>
   );
 }
 
