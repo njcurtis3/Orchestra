@@ -202,6 +202,10 @@ fieldset {
   background: #ffe3a8;
 }
 
+.status-needs_attention {
+  background: #ffc9a8;
+}
+
 .status-idle {
   background: #d3f0d8;
 }
@@ -260,6 +264,10 @@ fieldset {
   .status-waiting_permission,
   .status-waiting_question {
     background: #66511a;
+  }
+
+  .status-needs_attention {
+    background: #7a3512;
   }
 
   .status-idle {

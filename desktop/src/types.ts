@@ -7,6 +7,7 @@ export const SESSION_STATUSES = [
   "working",
   "waiting_permission",
   "waiting_question",
+  "needs_attention",
   "idle",
   "ended",
   "failed",
