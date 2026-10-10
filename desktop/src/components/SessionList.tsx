@@ -6,12 +6,23 @@ const LABELS: Record<SessionStatus, string> = {
   working: "Working",
   waiting_permission: "Needs permission",
   waiting_question: "Has a question",
+  needs_attention: "Needs attention",
   idle: "Idle",
   ended: "Ended",
   failed: "Failed",
 };
 
-const LIVE: SessionStatus[] = ["starting", "working", "waiting_permission", "waiting_question", "idle"];
+// Record, not a list: tsc fails if a new status is added without deciding whether Stop shows.
+const LIVE: Record<SessionStatus, boolean> = {
+  starting: true,
+  working: true,
+  waiting_permission: true,
+  waiting_question: true,
+  needs_attention: true,
+  idle: true,
+  ended: false,
+  failed: false,
+};
 
 type Props = { sessions: SessionSummary[]; onError: (e: unknown) => void };
 
@@ -31,7 +42,7 @@ export function SessionList({ sessions, onError }: Props) {
               Last activity <time dateTime={new Date(s.last_activity_at).toISOString()}>{new Date(s.last_activity_at).toLocaleString()}</time>
             </div>
             {s.last_message && <p className="text">{s.last_message}</p>}
-            {LIVE.includes(s.status) && (
+            {LIVE[s.status] && (
               <button type="button" onClick={() => stopSession(s.id).catch(onError)}>
                 Stop
               </button>

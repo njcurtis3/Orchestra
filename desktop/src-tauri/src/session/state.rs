@@ -21,6 +21,9 @@ pub enum SessionStatus {
     Working,
     WaitingPermission,
     WaitingQuestion,
+    /// Claude sent a request Orchestra cannot answer; the session may be stuck. Sticky
+    /// until the turn ends (`Result`) or the session is over.
+    NeedsAttention,
     Idle,
     Ended,
     Failed,
@@ -188,8 +191,12 @@ impl SessionState {
         }
     }
 
-    /// Waiting while any request is open, otherwise working.
+    /// Waiting while any request is open, otherwise working. `NeedsAttention` is left
+    /// alone: only a `Result` proves claude got past the request it could not answer.
     fn recompute(&mut self) {
+        if self.status == SessionStatus::NeedsAttention {
+            return;
+        }
         self.status = match self.pending_order.first().and_then(|id| self.inbox.iter().find(|i| &i.id == id)) {
             Some(i) if i.kind == InboxKind::Question => SessionStatus::WaitingQuestion,
             Some(_) => SessionStatus::WaitingPermission,
@@ -255,13 +262,14 @@ impl SessionState {
                 self.status = SessionStatus::Idle;
             }
             Message::UnsupportedControlRequest { subtype, .. } => {
-                // Nothing is written back: the error shape is not in any fixture. The status
-                // stays as it is; the item tells the user the session may be stuck.
+                // Nothing is written back: the error shape is not in any fixture. The item
+                // tells the user the session may be stuck, and the status says so too.
                 let summary = format!(
                     "Claude sent a request Orchestra cannot answer ({}). The session may be waiting; stop it if it does not continue.",
                     truncate(&subtype, MAX_SUBTYPE_CHARS)
                 );
                 self.push_item(InboxKind::Error, now, summary, None, None, None);
+                self.status = SessionStatus::NeedsAttention;
             }
             Message::Ignored => {}
             Message::Unknown => self.unknown_count += 1,
@@ -555,12 +563,72 @@ mod tests {
         let (mut st, _) = waiting_permission();
         let long = "x".repeat(200);
         st.apply(Message::UnsupportedControlRequest { request_id: Some("r2".into()), subtype: long }, 5);
-        assert_eq!(st.status, WaitingPermission);
+        assert_eq!(st.status, NeedsAttention);
         assert_eq!(st.unknown_count, 0);
         let e = st.inbox.last().unwrap();
         assert_eq!((e.kind, e.resolved), (InboxKind::Error, false));
         assert!(e.summary.contains(&"x".repeat(64)) && !e.summary.contains(&"x".repeat(65)));
         assert_eq!(st.pending.len(), 1, "nothing new to answer");
+    }
+
+    fn unsupported(st: &mut SessionState, now: u64) {
+        st.apply(Message::UnsupportedControlRequest { request_id: None, subtype: "hook_callback".into() }, now);
+    }
+
+    fn can_use_bash() -> Message {
+        Message::CanUseTool { request_id: "r1".into(), tool_name: "Bash".into(), input: serde_json::json!({"command": "x"}) }
+    }
+
+    #[test]
+    fn needs_attention_survives_init() {
+        let mut st = SessionState::new("s1", 0);
+        unsupported(&mut st, 1);
+        assert_eq!(st.status, NeedsAttention);
+        st.apply(Message::Init { session_id: Some("c".into()) }, 2);
+        assert_eq!(st.status, NeedsAttention);
+    }
+
+    #[test]
+    fn needs_attention_survives_a_later_permission_request() {
+        let mut st = SessionState::new("s1", 0);
+        st.apply(Message::Init { session_id: None }, 1);
+        unsupported(&mut st, 2);
+        st.apply(can_use_bash(), 3);
+        assert_eq!(st.status, NeedsAttention);
+        assert_eq!(st.pending.len(), 1, "the request is still answerable");
+    }
+
+    #[test]
+    fn needs_attention_survives_answering_a_permission() {
+        let mut st = SessionState::new("s1", 0);
+        unsupported(&mut st, 1);
+        st.apply(can_use_bash(), 2);
+        let id = st.inbox.last().unwrap().id.clone();
+        let (_, c) = st.permission_line(&id, Decision::Allow, None).unwrap();
+        st.commit(c, 3);
+        assert_eq!(st.status, NeedsAttention);
+        assert!(st.pending.is_empty());
+    }
+
+    #[test]
+    fn needs_attention_clears_on_result() {
+        let mut st = SessionState::new("s1", 0);
+        unsupported(&mut st, 1);
+        st.apply(Message::Result { is_error: false, text: "done".into() }, 2);
+        assert_eq!(st.status, Idle);
+    }
+
+    #[test]
+    fn needs_attention_clears_on_stop() {
+        let mut st = SessionState::new("s1", 0);
+        unsupported(&mut st, 1);
+        st.mark_stopped(2);
+        assert_eq!(st.status, Ended);
+    }
+
+    #[test]
+    fn needs_attention_serializes_snake_case() {
+        assert_eq!(serde_json::to_string(&NeedsAttention).unwrap(), "\"needs_attention\"");
     }
 
     #[test]

@@ -103,6 +103,10 @@ impl Drop for ProcessHandle {
 
 pub fn spawn(dir: &Path, sink: Box<dyn Fn(Output) + Send>) -> Result<Arc<dyn Proc>, String> {
     let mut cmd = std::process::Command::new(PROGRAM);
+    // The child ends of these pipes are inheritable by design (std creates them so). A
+    // grandchild that claude starts with handle inheritance also holds them: if it outlives
+    // claude, the reader sees no EOF and Exit is late. With a job, stop and app exit still
+    // kill it. This cannot be closed here because claude makes that CreateProcess call.
     cmd.args(ARGS)
         .current_dir(dir)
         .stdin(Stdio::piped())

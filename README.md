@@ -4,7 +4,7 @@ A desktop command center and Android remote for the coding agents running on you
 computer. See which agents are working, which need you, and which are done; answer them
 from your desk or your phone; and run larger work through an orchestrated graph of agents.
 
-Status: scaffold. Nothing works yet.
+Status: the desktop app runs on Windows. It starts Claude Code sessions, tracks their status, and answers permissions and questions from an inbox. The Android remote is not functional yet.
 
 | Part | What |
 |---|---|
