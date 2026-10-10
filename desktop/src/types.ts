@@ -15,6 +15,12 @@ export const SESSION_STATUSES = [
 ] as const;
 export type SessionStatus = (typeof SESSION_STATUSES)[number];
 
+// Per-session claude settings. Rust holds the same closed lists; `null` means no flag.
+export const MODELS = ["opus", "sonnet", "fable"] as const;
+export type Model = (typeof MODELS)[number];
+export const PERMISSION_MODES = ["manual", "acceptEdits", "plan"] as const;
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
 export type SessionSummary = {
   id: string;
   project_id: string;
@@ -24,6 +30,9 @@ export type SessionSummary = {
   last_activity_at: number; // ms epoch
   last_message: string | null; // truncated to 500 chars
   claude_session_id: string | null;
+  // Optional in the type only so older fixtures still compile; the decoder always sets them.
+  model?: Model | null;
+  permission_mode?: PermissionMode | null;
 };
 
 export const INBOX_KINDS = ["permission", "question", "finished", "error"] as const;

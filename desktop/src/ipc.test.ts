@@ -12,6 +12,22 @@ const wire = (status: unknown) => ({
   claude_session_id: null,
 });
 
+describe("decodeSession settings", () => {
+  it("decodes a listed model and mode, and null or absent as null", () => {
+    const s = decodeSession({ ...wire("working"), model: "fable", permission_mode: "acceptEdits" });
+    expect([s.model, s.permission_mode]).toEqual(["fable", "acceptEdits"]);
+    expect(decodeSession({ ...wire("working"), model: null }).model).toBeNull();
+    expect(decodeSession(wire("working")).permission_mode).toBeNull();
+  });
+
+  it("rejects a model or mode outside the lists", () => {
+    expect(() => decodeSession({ ...wire("working"), model: "haiku" })).toThrow("unknown model");
+    expect(() => decodeSession({ ...wire("working"), permission_mode: "bypassPermissions" })).toThrow(
+      "unknown permission_mode",
+    );
+  });
+});
+
 describe("decodeSession status", () => {
   it("accepts needs_attention", () => {
     expect(decodeSession(wire("needs_attention")).status).toBe("needs_attention");

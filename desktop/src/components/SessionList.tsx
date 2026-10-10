@@ -1,5 +1,11 @@
 import { stopSession } from "../ipc";
-import type { SessionStatus, SessionSummary } from "../types";
+import type { PermissionMode, SessionStatus, SessionSummary } from "../types";
+
+const MODE_LABELS: Record<PermissionMode, string> = {
+  manual: "manual",
+  acceptEdits: "accept edits",
+  plan: "plan",
+};
 
 const LABELS: Record<SessionStatus, string> = {
   starting: "Starting",
@@ -43,6 +49,11 @@ export function SessionList({ sessions, onError }: Props) {
             <div className="meta">
               Last activity <time dateTime={new Date(s.last_activity_at).toISOString()}>{new Date(s.last_activity_at).toLocaleString()}</time>
             </div>
+            {(s.model || s.permission_mode) && (
+              <div className="meta">
+                {[s.model, s.permission_mode && MODE_LABELS[s.permission_mode]].filter(Boolean).join(" · ")}
+              </div>
+            )}
             {s.last_message && <p className="text">{s.last_message}</p>}
             {LIVE[s.status] && (
               <button type="button" onClick={() => stopSession(s.id).catch(onError)}>

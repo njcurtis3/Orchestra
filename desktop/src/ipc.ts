@@ -2,9 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   INBOX_KINDS,
+  MODELS,
+  PERMISSION_MODES,
   SESSION_STATUSES,
   type Answer,
   type InboxItem,
+  type Model,
+  type PermissionMode,
   type Project,
   type Question,
   type SessionSummary,
@@ -46,6 +50,9 @@ function oneOf<T extends string>(o: Obj, k: string, allowed: readonly T[]): T {
   }
   return v as T;
 }
+function oneOfOrNull<T extends string>(o: Obj, k: string, allowed: readonly T[]): T | null {
+  return o[k] === null || o[k] === undefined ? null : oneOf(o, k, allowed);
+}
 function arr(v: unknown, what: string): unknown[] {
   if (!Array.isArray(v)) throw new Error(`bad ${what}`);
   return v;
@@ -67,6 +74,8 @@ export function decodeSession(v: unknown): SessionSummary {
     last_activity_at: num(o, "last_activity_at"),
     last_message: strOrNull(o, "last_message"),
     claude_session_id: strOrNull(o, "claude_session_id"),
+    model: oneOfOrNull(o, "model", MODELS),
+    permission_mode: oneOfOrNull(o, "permission_mode", PERMISSION_MODES),
   };
 }
 
@@ -126,10 +135,20 @@ export async function pickProject(): Promise<Project | null> {
 export async function listProjects(): Promise<Project[]> {
   return decodeProjects(await invoke<unknown>("list_projects"));
 }
-export async function startSession(projectId: string, prompt: string): Promise<SessionSummary> {
-  return decodeSession(
-    await invoke<unknown>("start_session", { args: { project_id: projectId, prompt } }),
-  );
+// A null setting is left out of the call, so Rust passes no flag for it.
+export async function startSession(
+  projectId: string,
+  prompt: string,
+  model: Model | null = null,
+  permissionMode: PermissionMode | null = null,
+): Promise<SessionSummary> {
+  const args = {
+    project_id: projectId,
+    prompt,
+    ...(model && { model }),
+    ...(permissionMode && { permission_mode: permissionMode }),
+  };
+  return decodeSession(await invoke<unknown>("start_session", { args }));
 }
 export async function storageStatus(): Promise<StorageStatus> {
   return decodeStorageStatus(await invoke<unknown>("storage_status"));

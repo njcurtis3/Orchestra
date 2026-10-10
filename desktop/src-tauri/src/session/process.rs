@@ -7,6 +7,7 @@ use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::settings::SessionSettings;
 use super::state::ClaudeSessionId;
 
 #[cfg(windows)]
@@ -37,11 +38,27 @@ pub const ARGS: [&str; 9] = [
     "stdio",
 ];
 
-/// `ARGS`, then `--resume <id>` when continuing a saved conversation. The id is a
-/// `ClaudeSessionId`, so it is a checked UUID and can never read as a flag.
-fn build_args(resume: Option<&ClaudeSessionId>) -> Vec<String> {
+/// What varies per spawn: the conversation to continue, if any, and the session's settings.
+/// A resumed process is a new spawn, so the settings are passed again each time.
+pub struct SpawnArgs<'a> {
+    pub resume: Option<&'a ClaudeSessionId>,
+    pub settings: SessionSettings,
+}
+
+/// `ARGS`, then `--model` and `--permission-mode` when set, then `--resume <id>` when
+/// continuing a saved conversation. The values are allowlisted enums mapped to static
+/// strings and a `ClaudeSessionId` (a checked UUID), so none can read as a flag.
+fn build_args(spawn: &SpawnArgs) -> Vec<String> {
     let mut args: Vec<String> = ARGS.iter().map(|a| a.to_string()).collect();
-    if let Some(id) = resume {
+    if let Some(m) = spawn.settings.model {
+        args.push("--model".into());
+        args.push(m.as_str().into());
+    }
+    if let Some(m) = spawn.settings.permission_mode {
+        args.push("--permission-mode".into());
+        args.push(m.as_str().into());
+    }
+    if let Some(id) = spawn.resume {
         args.push("--resume".into());
         args.push(id.as_str().to_string());
     }
@@ -116,7 +133,7 @@ impl Drop for ProcessHandle {
 
 pub fn spawn(
     dir: &Path,
-    resume: Option<&ClaudeSessionId>,
+    spawn_args: &SpawnArgs,
     sink: Box<dyn Fn(Output) + Send>,
 ) -> Result<Arc<dyn Proc>, String> {
     let mut cmd = std::process::Command::new(PROGRAM);
@@ -124,7 +141,7 @@ pub fn spawn(
     // grandchild that claude starts with handle inheritance also holds them: if it outlives
     // claude, the reader sees no EOF and Exit is late. With a job, stop and app exit still
     // kill it. This cannot be closed here because claude makes that CreateProcess call.
-    cmd.args(build_args(resume))
+    cmd.args(build_args(spawn_args))
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -188,6 +205,7 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::settings::{Model, PermissionMode};
 
     #[test]
     fn reap_backoff_is_capped() {
@@ -196,15 +214,28 @@ mod tests {
         assert_eq!(reap_delay(u32::MAX).as_millis(), 1000);
     }
 
+    const UUID: &str = "0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b";
+
     #[test]
     fn resume_args_follow_fixed_args() {
-        let id = ClaudeSessionId::parse("0b9f6a2c-3d4e-4f50-8a1b-2c3d4e5f6a7b").unwrap();
-        let args = build_args(Some(&id));
+        let id = ClaudeSessionId::parse(UUID).unwrap();
+        let args = build_args(&SpawnArgs { resume: Some(&id), settings: SessionSettings::default() });
         assert_eq!(args.len(), ARGS.len() + 2);
         assert!(args.iter().zip(ARGS).all(|(a, b)| a == b), "the fixed args are untouched and first");
         assert_eq!(&args[ARGS.len()..], ["--resume", id.as_str()]);
-        assert_eq!(build_args(None).len(), ARGS.len());
+        assert_eq!(build_args(&SpawnArgs { resume: None, settings: SessionSettings::default() }).len(), ARGS.len());
         assert!(ClaudeSessionId::parse("--dangerous").is_none());
+    }
+
+    #[test]
+    fn args_carry_settings_after_fixed_args() {
+        let id = ClaudeSessionId::parse(UUID).unwrap();
+        let settings = SessionSettings { model: Some(Model::Fable), permission_mode: Some(PermissionMode::AcceptEdits) };
+        let args = build_args(&SpawnArgs { resume: Some(&id), settings });
+        assert!(args.iter().zip(ARGS).all(|(a, b)| a == b), "the fixed args are untouched and first");
+        assert_eq!(&args[ARGS.len()..], ["--model", "fable", "--permission-mode", "acceptEdits", "--resume", id.as_str()]);
+        let only_mode = SessionSettings { model: None, permission_mode: Some(PermissionMode::Plan) };
+        assert_eq!(&build_args(&SpawnArgs { resume: None, settings: only_mode })[ARGS.len()..], ["--permission-mode", "plan"]);
     }
 
     #[test]

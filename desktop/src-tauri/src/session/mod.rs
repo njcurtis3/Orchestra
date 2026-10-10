@@ -4,6 +4,7 @@
 
 pub mod process;
 pub mod protocol;
+pub mod settings;
 pub mod state;
 pub mod store;
 
@@ -15,8 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::projects::{Project, Projects};
-use process::{Output, Proc};
-use state::{ClaudeSessionId, Commit, Decision, InboxItem, SessionState, SessionStatus};
+use process::{Output, Proc, SpawnArgs};
+use settings::{Model, PermissionMode, SessionSettings};
+use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
 use store::{Snapshot, StoredSession, Writer};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
@@ -34,6 +36,8 @@ pub struct SessionSummary {
     pub last_activity_at: u64,
     pub last_message: Option<String>,
     pub claude_session_id: Option<String>,
+    pub model: Option<Model>,
+    pub permission_mode: Option<PermissionMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,9 +48,9 @@ pub enum Event {
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
 pub type Sink = Box<dyn Fn(Output) + Send>;
-/// Starts a child in the given directory, resuming a saved conversation when given its id;
-/// every stdout line and the exit go to the sink.
-pub type Spawner = Box<dyn Fn(&Path, Option<&ClaudeSessionId>, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
+/// Starts a child in the given directory with the session's settings, resuming a saved
+/// conversation when given its id; every stdout line and the exit go to the sink.
+pub type Spawner = Box<dyn Fn(&Path, &SpawnArgs, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
 
 /// What decides whether a stdout line needs a snapshot: a change in any of these is worth a
 /// write, a change in only the message text or the clock is not.
@@ -68,6 +72,7 @@ struct Session {
     project_id: String,
     project_name: String,
     started_at: u64,
+    settings: SessionSettings,
     state: SessionState,
     /// The inbox revision last sent to the frontend.
     emitted_inbox_rev: u64,
@@ -90,6 +95,8 @@ impl Session {
             last_activity_at: self.state.last_activity_at,
             last_message: self.state.last_message.clone(),
             claude_session_id: self.state.claude_session_id.clone(),
+            model: self.settings.model,
+            permission_mode: self.settings.permission_mode,
         }
     }
 }
@@ -134,6 +141,8 @@ impl Inner {
                     project_id: s.project_id.clone(),
                     project_name: s.project_name.clone(),
                     started_at: s.started_at,
+                    model: s.settings.model.map(|m| m.as_str().to_string()),
+                    permission_mode: s.settings.permission_mode.map(|m| m.as_str().to_string()),
                     state: s.state.to_persisted(),
                 })
                 .collect(),
@@ -224,6 +233,7 @@ impl Sessions {
                     project_id: stored.project_id,
                     project_name: stored.project_name,
                     started_at: stored.started_at,
+                    settings: SessionSettings::from_stored(stored.model.as_deref(), stored.permission_mode.as_deref()),
                     emitted_inbox_rev: state.inbox_rev,
                     saved_key: SaveKey::of(&state),
                     state,
@@ -317,7 +327,12 @@ impl Sessions {
         self.lock().inbox()
     }
 
-    pub fn start(self: &Arc<Self>, project_id: &str, prompt: &str) -> Result<SessionSummary, String> {
+    pub fn start(
+        self: &Arc<Self>,
+        project_id: &str,
+        prompt: &str,
+        settings: SessionSettings,
+    ) -> Result<SessionSummary, String> {
         check_text(prompt)?;
         let now = now_ms();
         let (session_id, path) = {
@@ -331,6 +346,7 @@ impl Sessions {
                 project_id: project_id.to_string(),
                 project_name: name,
                 started_at: now,
+                settings,
                 state: SessionState::new(&id, now),
                 emitted_inbox_rev: 0,
                 saved_key: SaveKey::of(&SessionState::new(&id, now)),
@@ -345,7 +361,7 @@ impl Sessions {
         let this = Arc::clone(self);
         let sid = session_id.clone();
         let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
-        let proc = match (self.spawner)(&path, None, sink) {
+        let proc = match (self.spawner)(&path, &SpawnArgs { resume: None, settings }, sink) {
             Ok(p) => p,
             Err(e) => {
                 let mut inner = self.lock();
@@ -452,6 +468,7 @@ impl Sessions {
     fn resume_with(&self, session_id: &str, text: &str) -> Result<(), String> {
         let mut inner = self.lock();
         let s = inner.sessions.get(session_id).ok_or("unknown session")?;
+        let settings = s.settings;
         let Some(path) = inner.projects.get(&s.project_id).map(|e| e.path.clone()) else {
             if let Some(s) = inner.sessions.get_mut(session_id) {
                 s.state.fail_resume("The project folder no longer exists", now_ms());
@@ -466,7 +483,7 @@ impl Sessions {
         let this = self.me.upgrade().ok_or("app is closing")?;
         let sid = session_id.to_string();
         let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
-        let proc = match (self.spawner)(&path, Some(&plan.claude_session_id), sink) {
+        let proc = match (self.spawner)(&path, &SpawnArgs { resume: Some(&plan.claude_session_id), settings }, sink) {
             Ok(p) => p,
             Err(e) => {
                 let mut inner = self.lock();
@@ -640,6 +657,8 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         /// Every spawn: the directory and the id passed to `--resume`, if any.
         spawns: Arc<Mutex<Vec<(std::path::PathBuf, Option<String>)>>>,
+        /// The settings of every spawn, in order.
+        spawn_settings: Arc<Mutex<Vec<SessionSettings>>>,
     }
 
     fn rig() -> (Rig, Project) {
@@ -656,18 +675,20 @@ mod tests {
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
         let spawns = Arc::new(Mutex::new(vec![]));
-        let (f2, s2, e2, p2) = (fake.clone(), sink.clone(), events.clone(), spawns.clone());
+        let spawn_settings = Arc::new(Mutex::new(vec![]));
+        let (f2, s2, e2, p2, g2) = (fake.clone(), sink.clone(), events.clone(), spawns.clone(), spawn_settings.clone());
         let sessions = Sessions::with_writer(
             Box::new(move |e| e2.lock().unwrap().push(e)),
-            Box::new(move |dir, resume, sk| {
-                p2.lock().unwrap().push((dir.to_path_buf(), resume.map(|r| r.as_str().to_string())));
+            Box::new(move |dir, spawn, sk| {
+                p2.lock().unwrap().push((dir.to_path_buf(), spawn.resume.map(|r| r.as_str().to_string())));
+                g2.lock().unwrap().push(spawn.settings);
                 *s2.lock().unwrap() = Some(sk);
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
             writer,
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
-        (Rig { sessions, fake, sink, events, spawns }, project)
+        (Rig { sessions, fake, sink, events, spawns, spawn_settings }, project)
     }
 
     impl Rig {
@@ -704,7 +725,7 @@ mod tests {
     #[test]
     fn rejects_unknown_project_without_leaking_a_path() {
         let (r, _) = rig();
-        let err = r.sessions.start("nope", "hi").unwrap_err();
+        let err = r.sessions.start("nope", "hi", SessionSettings::default()).unwrap_err();
         assert_eq!(err, "unknown project");
         assert!(!err.contains('/') && !err.contains('\\') && !err.contains("Users") && !err.contains(":"));
     }
@@ -712,16 +733,16 @@ mod tests {
     #[test]
     fn rejects_empty_and_oversize_prompt() {
         let (r, p) = rig();
-        assert!(r.sessions.start(&p.id, "").is_err());
-        assert!(r.sessions.start(&p.id, "   ").is_err());
-        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
-        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES)).is_ok());
+        assert!(r.sessions.start(&p.id, "", SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, "   ", SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES + 1), SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES), SessionSettings::default()).is_ok());
     }
 
     #[test]
     fn start_sends_prompt_over_stdin_and_emits() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "hello").unwrap();
+        let s = r.sessions.start(&p.id, "hello", SessionSettings::default()).unwrap();
         assert_eq!(s.status, SessionStatus::Starting);
         let lines = r.fake.lines.lock().unwrap();
         assert_eq!(lines.len(), 1);
@@ -733,7 +754,7 @@ mod tests {
     #[test]
     fn answer_rejects_unknown_and_resolved_items() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         assert!(r.sessions.answer_permission("zzz", Decision::Allow, None).is_err());
         r.feed(PERM);
@@ -748,7 +769,7 @@ mod tests {
     #[test]
     fn answer_rejects_oversize_message_and_answers() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         let item = r.sessions.list_inbox().remove(0);
@@ -764,7 +785,7 @@ mod tests {
     #[test]
     fn reply_validates_session_text_and_status() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         assert!(r.sessions.reply("nope", "x").is_err());
         assert!(r.sessions.reply(&s.id, "").is_err());
         assert!(r.sessions.reply(&s.id, &"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
@@ -778,14 +799,14 @@ mod tests {
     #[test]
     fn stop_kills_child_and_shutdown_covers_app_exit() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.sessions.stop(&s.id).unwrap();
         assert!(r.fake.killed.load(Ordering::SeqCst));
         assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Ended);
         assert!(r.sessions.stop("nope").is_err());
 
         let (r2, p2) = rig();
-        r2.sessions.start(&p2.id, "go").unwrap();
+        r2.sessions.start(&p2.id, "go", SessionSettings::default()).unwrap();
         r2.sessions.shutdown();
         assert!(r2.fake.killed.load(Ordering::SeqCst));
     }
@@ -794,7 +815,7 @@ mod tests {
     fn start_publishes_post_send_summary_in_order() {
         let (r, p) = rig();
         r.feed_on_write(1, INIT);
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         assert_eq!(s.status, SessionStatus::Working);
         let updates = r.updates();
         assert_eq!(updates.last().unwrap().status, SessionStatus::Working);
@@ -804,7 +825,7 @@ mod tests {
     #[test]
     fn failed_answer_send_leaves_item_pending() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         let item = r.sessions.list_inbox().remove(0);
@@ -820,7 +841,7 @@ mod tests {
     #[test]
     fn failed_reply_send_leaves_session_idle() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(DONE);
         r.fake.fail.store(true, Ordering::SeqCst);
@@ -832,7 +853,7 @@ mod tests {
     #[test]
     fn reader_update_during_reply_send_wins() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(DONE);
         r.feed_on_write(2, DONE);
@@ -846,7 +867,7 @@ mod tests {
     #[test]
     fn concurrent_answers_send_once() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         *r.fake.on_write.lock().unwrap() = Some(Box::new(|_| std::thread::sleep(std::time::Duration::from_millis(50))));
@@ -864,7 +885,7 @@ mod tests {
     #[test]
     fn unexpected_exit_marks_failed() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.sessions.on_output(&s.id, Output::Exit(Some(1)));
         assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Failed);
         assert!(r.sessions.list_inbox().iter().any(|i| i.kind == state::InboxKind::Error));
@@ -902,6 +923,8 @@ mod tests {
             project_id: "p1".into(),
             project_name: "proj".into(),
             started_at: 1,
+            model: None,
+            permission_mode: None,
             state: state::PersistedSession {
                 status,
                 last_activity_at: 7,
@@ -919,7 +942,7 @@ mod tests {
         let d = scratch("quit");
         let file = d.join("state.json");
         let (r, p) = rig_with(Some(Writer::new(file.clone())));
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         r.feed(PERM);
         r.sessions.shutdown();
@@ -955,7 +978,7 @@ mod tests {
         let other = dir.join("other");
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(r.sessions.add_project(&other).unwrap().id, "p4");
-        let started = r.sessions.start("p3", "again").unwrap();
+        let started = r.sessions.start("p3", "again", SessionSettings::default()).unwrap();
         assert_eq!(started.id, "s6");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -983,7 +1006,7 @@ mod tests {
         let dir = scratch("nopath");
         let (r, _) = rig();
         let project = r.sessions.add_project(&dir).unwrap();
-        let s = r.sessions.start(&project.id, "go").unwrap();
+        let s = r.sessions.start(&project.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         r.feed(PERM);
         let json = [
@@ -1140,7 +1163,7 @@ mod tests {
     fn text_lines_emit_no_inbox_event_and_queue_no_save() {
         let d = scratch("textlines");
         let (r, p) = rig_with(Some(Writer::new(d.join("state.json"))));
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         let (inbox_before, rev_before) = (inbox_events(&r).len(), r.sessions.lock().revision);
         for _ in 0..5 {
@@ -1160,7 +1183,7 @@ mod tests {
         let (r, _) = rig();
         let dir = scratch("onlyown");
         paused(&r, &dir);
-        let s = r.sessions.start("p1", "go").unwrap();
+        let s = r.sessions.start("p1", "go", SessionSettings::default()).unwrap();
         assert_eq!(s.id, "s2");
         r.feed(INIT_UUID);
         r.feed(PERM);
@@ -1176,7 +1199,7 @@ mod tests {
         let d = scratch("textshutdown");
         let file = d.join("state.json");
         let (r, p) = rig_with(Some(Writer::new(file.clone())));
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         let rev = r.sessions.lock().revision;
         r.feed(TEXT);
@@ -1184,6 +1207,67 @@ mod tests {
         r.sessions.shutdown();
         let saved = store::load(&file).unwrap().unwrap();
         assert_eq!(saved.sessions[0].state.last_message.as_deref(), Some("working on it"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resume_repasses_settings() {
+        let (r, p) = rig();
+        let chosen = SessionSettings { model: Some(Model::Opus), permission_mode: Some(PermissionMode::Plan) };
+        let s = r.sessions.start(&p.id, "go", chosen).unwrap();
+        assert_eq!((s.model, s.permission_mode), (Some(Model::Opus), Some(PermissionMode::Plan)));
+        assert_eq!(*r.spawn_settings.lock().unwrap(), [chosen]);
+
+        let (r, _) = rig();
+        let dir = scratch("settings");
+        let mut stored = stored_session("s1", SessionStatus::Idle, vec![finished_item("s1-i1", "s1")], 1);
+        stored.model = Some("sonnet".into());
+        stored.permission_mode = Some("acceptEdits".into());
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 1,
+            projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.clone() }],
+            sessions: vec![stored],
+        });
+        r.sessions.reply("s1", "again").unwrap();
+        assert_eq!(
+            *r.spawn_settings.lock().unwrap(),
+            [SessionSettings { model: Some(Model::Sonnet), permission_mode: Some(PermissionMode::AcceptEdits) }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_stored_mode_loads_as_none() {
+        let (r, _) = rig();
+        let mut stored = stored_session("s1", SessionStatus::Idle, vec![], 0);
+        stored.model = Some("haiku".into());
+        stored.permission_mode = Some("bypassPermissions".into());
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 0,
+            projects: vec![],
+            sessions: vec![stored],
+        });
+        let listed = r.sessions.list_sessions();
+        assert_eq!(listed.len(), 1, "the session is still listed");
+        assert_eq!((listed[0].model, listed[0].permission_mode), (None, None));
+    }
+
+    #[test]
+    fn settings_survive_a_save_and_load() {
+        let d = scratch("settingsave");
+        let file = d.join("state.json");
+        let (r, p) = rig_with(Some(Writer::new(file.clone())));
+        let chosen = SessionSettings { model: Some(Model::Fable), permission_mode: Some(PermissionMode::Manual) };
+        r.sessions.start(&p.id, "go", chosen).unwrap();
+        r.sessions.shutdown();
+        let saved = store::load(&file).unwrap().unwrap();
+        assert_eq!((saved.sessions[0].model.as_deref(), saved.sessions[0].permission_mode.as_deref()), (Some("fable"), Some("manual")));
         let _ = std::fs::remove_dir_all(&d);
     }
 

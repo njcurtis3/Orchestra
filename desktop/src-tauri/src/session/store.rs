@@ -24,6 +24,12 @@ pub struct StoredSession {
     pub project_id: String,
     pub project_name: String,
     pub started_at: u64,
+    /// Settings as the strings the allowlist maps to. Optional within schema 1: an older
+    /// file has neither, and an unknown value loads as no setting.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     pub state: PersistedSession,
 }
 
@@ -206,6 +212,21 @@ mod tests {
         assert!(writer.is_none());
         assert_eq!(status, StorageStatus::unreadable());
         assert_eq!(fs::read(&f).unwrap(), b"not json");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn schema1_file_without_settings_loads() {
+        let d = dir("nosettings");
+        let f = d.join("state.json");
+        let old = br#"{"schema":1,"revision":4,"next_session":1,"next_project":1,
+            "projects":[],
+            "sessions":[{"id":"s1","project_id":"p1","project_name":"proj","started_at":1,
+              "state":{"status":"idle","last_activity_at":2,"last_message":null,"claude_session_id":null,
+                       "inbox":[],"next_item":0,"unknown_count":0}}]}"#;
+        fs::write(&f, old).unwrap();
+        let snap = load(&f).unwrap().unwrap();
+        assert_eq!((snap.sessions[0].model.as_deref(), snap.sessions[0].permission_mode.as_deref()), (None, None));
         let _ = fs::remove_dir_all(&d);
     }
 
