@@ -1,0 +1,93 @@
+{
+  "$comment": "Shared state for ONE work-graph run. Lives at .graph/runs/<run-id>/state.json. Every node reads this on start and appends to its OWN key on finish - the builder writes its own builders.<slice> key, including the branch it worked on. Never rewrite another node's key. Every node key carries written_by, naming the node that wrote it: that is the ONLY record of authorship this file has, and without it 'never rewrite another node's key' is unverifiable - an orchestrator hand-writing all six keys is indistinguishable from six nodes doing their jobs. verify-state.py --audit checks it. This file is the edge: it is how context crosses between agents that cannot see each other.",
+  "run_id": "<yyyy-mm-dd>-<short-slug>",
+  "goal": "one sentence, in the user's words",
+  "app": "the project's name",
+  "status": "scouting | planning | awaiting-approval | building | reviewing | integrating | done | blocked",
+  "scout": {
+    "written_by": "the node that wrote this key - here, always the string scout",
+    "facts": [
+      "verified statements about what exists today, each with a file:line"
+    ],
+    "unknowns": [
+      "questions the plan must answer or assume"
+    ],
+    "risks": []
+  },
+  "architect": {
+    "written_by": "the node that wrote this key - here, always the string architect",
+    "plan": [
+      {
+        "slice": "s1",
+        "intent": "",
+        "files": [],
+        "done_when": ""
+      }
+    ],
+    "shape": "single-loop | diamond",
+    "parallel_safe": true,
+    "rationale": "why this shape and not the cheaper one"
+  },
+  "approved_by_human": false,
+  "scope_exceptions": [
+    "ORCHESTRATOR-OWNED, normally empty. Paths a builder may write that the approved plan does not list. guard-builder-scope.py DENIES a builder's Write/Edit outside architect.plan[].files, and this is the only way through it. Adding one is a deliberate, recorded act: pair it with deviation_from_approved_plan on the slice that needed it, and say why the gate's file set was wrong. Never add a path to silence the guard on work the human did not approve."
+  ],
+  "builders": {
+    "s1": {
+      "written_by": "the node that wrote this key - here, always the string builder, never orchestrator",
+      "status": "pending|done|failed",
+      "branch": "written by the builder: the branch this slice's work landed on, or an empty string when the target is not a git repo at all",
+      "changed": [],
+      "notes": "",
+      "gate_results": "optional: this slice's done_when commands paired with their actual output, when worth keeping verbatim",
+      "deviation_from_approved_plan": "optional: set only when the orchestrator authorized work outside the architect's approved file set or intent for this slice, and why"
+    }
+  },
+  "reviews": {
+    "s1": {
+      "$comment": "RE-REVIEWS NEST, and this is the rule every reader follows. The TOP LEVEL of reviews.<slice> IS attempt 1. A re-review writes attempt_2, then attempt_3, and so on, each with the same fields as the top level. Every attempt SURVIVES PERMANENTLY - history is never overwritten, flattened, or migrated up. The LATEST attempt supplies the verdict: that is what close-run.py, brief.py and verify-state.py resolve through, and what the board's finalVerdict() has always shown. `ever_rejected` - did ANY attempt REJECT - is DISPLAY ONLY, forever, so a rejection stays visible after it is fixed; it must never gate anything, or the fleet stops being able to loop. NO NODE MAY REWRITE AN EARLIER ATTEMPT: a second reviewer writes its own attempt_N and leaves the ones before it alone, top-level verdict included - relocating that verdict would destroy the history the board keeps and leave a key stamped written_by:reviewer with someone else as its real author. The KEY INDEX numbers an attempt, not the `attempt` field inside it; the field is display. An EMPTY attempt_N is not a re-review, it is a key nobody wrote - write the whole attempt or none of it. The walk STOPS AT THE FIRST GAP, so an attempt_3 with no attempt_2 is ignored and the earlier verdict stands: A GAP IS MALFORMED AND NO NODE MAY LEAVE ONE. Write the next UNUSED N and never skip - a mis-numbered re-review is not reported anywhere, it is simply unread, and a REJECT nobody reads is a REJECT nobody acts on. The cap is attempt_9, matching the board's `for (i = 2; i < 10; i++)` exactly so the two readers cannot disagree; attempt_10 and beyond is reported loudly and resolved by nobody.",
+      "written_by": "the node that wrote this key - here, always the string reviewer, never the builder it is reviewing",
+      "verdict": "PASS|REJECT",
+      "attempt": 1,
+      "summary": "optional: one paragraph a human can read without opening findings[]",
+      "findings": [
+        {
+          "file": "",
+          "line": 0,
+          "issue": "",
+          "severity": "",
+          "origin": "optional: scout|architect|builder|'' - which upstream node's miss this traces to, per reviewer.md's failure-mode triage. Blank when a finding doesn't trace to one node cleanly"
+        }
+      ],
+      "attempt_2": {
+        "written_by": "the node that wrote this key - here, always the string reviewer, and never the reviewer of an earlier attempt",
+        "verdict": "PASS|REJECT",
+        "attempt": 2,
+        "summary": "optional: one paragraph a human can read without opening findings[]",
+        "findings": [
+          {
+            "file": "",
+            "line": 0,
+            "issue": "",
+            "severity": "",
+            "origin": "optional: scout|architect|builder|'' - which upstream node's miss this traces to, per reviewer.md's failure-mode triage. Blank when a finding doesn't trace to one node cleanly"
+          }
+        ]
+      }
+    }
+  },
+  "integrator": {
+    "written_by": "the node that wrote this key - here, always the string integrator",
+    "merged": [],
+    "conflicts": [],
+    "verification": "what command proved it works, and its output"
+  },
+  "ops": {
+    "written_by": "the node that wrote this key - here, always the string ops",
+    "gated": true,
+    "actions": []
+  },
+  "log": [
+    "append-only: node, what it did, timestamp"
+  ]
+}

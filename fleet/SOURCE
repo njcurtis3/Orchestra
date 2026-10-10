@@ -1,0 +1,42 @@
+{
+  "upstream_repo": "graph_agents",
+  "upstream_commit": "506afe9571a1b438db99c7fd34c762c3fd882220",
+  "upstream_commit_date": "2026-10-09T17:14:18-05:00",
+  "sync_tool_version": "1",
+  "token": {
+    "@FLEET@": "fleet root, render at install"
+  },
+  "files": {
+    ".claude/agents/architect.md": "5c299f6cb4802c63240cc7200f87531b50633899525ffd3d02efb8ff135de3de",
+    ".claude/agents/builder.md": "b1698f1b677093d75d5dd747f9afbaf694376b06b1a47945829adfdcf609084b",
+    ".claude/agents/integrator.md": "d981c00793e7ab92ad3174e0e65178b97076d9b698b92568ac7d624718565c50",
+    ".claude/agents/ops.md": "081aeb9694fae486cb9688542d554d42a0be9ce4899a2bec685f3e52bcf70b73",
+    ".claude/agents/reviewer.md": "ee2591e5ea37cfcfcf864024654d675ee49e0f0a1198e6669c9af3e2f1f8f0b0",
+    ".claude/agents/scout.md": "f3b8cfd54346b2b54b3fe937d6f0ce0be78b52ddbc30a14d33bca7cb15ebab50",
+    ".claude/hooks/bash_write_targets.py": "d63c1721d84ac7451be05b078dbc9481eab519da3fc347daf9b461a90dab629e",
+    ".claude/hooks/flag-state-gap.py": "207c4d6e16893daa9cf35914f1d294e7b8ad971c47dfdf0d0c6f2f7f19f22eef",
+    ".claude/hooks/guard-builder-scope.py": "86cbaec5d5d8132fc2a73f2adb0259ad9e4f2927cdc765dbac61e6f09b3becfb",
+    ".claude/hooks/record-activity.py": "e316fe008460627bde2ad44e929bd458ef6f3bb2943dcd9a7df6566bb5e974bf",
+    ".claude/hooks/show-board.py": "eb3a418f2cb44466f0e68b5b00601db06033cfd7e2cb35e8e0218648478a2a47",
+    ".claude/settings.json": "460b2612ad0bc1013455096ea75d34ef9f71c3c6caddae2eb0223390a671bda0",
+    ".claude/skills/close-run/SKILL.md": "5b40d2767a90e49d632272869746d1104b3feebee1a3fb6fa5792e628b67014b",
+    ".claude/skills/feature-graph/SKILL.md": "a9bf94737e238b375081fb56c837fc96a5a830d2dc2084ab2a6e7becef862e3b",
+    ".claude/skills/rlm/SKILL.md": "1e25bd42baa3fc23bd896d4a487d156573834fe675e4cd14527b9c87fe33d1e7",
+    ".graph/brief.py": "7c69b85af1e99f143aae77c82540e86cd83fd6696cbd61761fa9b280e5a34888",
+    ".graph/check-return-cap.py": "1d3cbb413ebaa982f7f47252b86e7a848dd8324c83dc5d79f987697bf7cd6e59",
+    ".graph/close-run.py": "ad39b5e6e379b870929b25fa44a32b47981a01313e2cc0c2db6c1df0098824b6",
+    ".graph/rlm.py": "6e2d68050b5a68a44717b94bcb3e13fa072fd2e7c143e70355ad47f2e262660e",
+    ".graph/runs/_schema.json": "2fcf35cf8253893c2de529c3d8f4bde0223400dab1b2774ad7b81818dfc67a9a",
+    ".graph/scout-facts.py": "e8264313b83bac36e799a5565246984692602fed6c80780baab3c160858b7d55",
+    ".graph/verify-state.py": "306838b2e20ac0765791edc4914cec749bd47e9b3fe4c4c422cd45d3d39f5bf9",
+    "GRAPH.md": "51229639676ee9cc6640fbde99d9b0d60cc5622ef0eb5f2e82b9ff24cccd327e"
+  },
+  "dropped_hooks": [
+    "guard-commit-trailers",
+    "flag-stale-state",
+    "flag-cross-app-import"
+  ],
+  "unmanaged": [
+    "README.md"
+  ]
+}

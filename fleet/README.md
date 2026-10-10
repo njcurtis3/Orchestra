@@ -17,4 +17,12 @@ Rules:
 - **A sync is a normal change.** Review the diff, commit it, and note the upstream commit
   in the message.
 
-Empty until the first sync. The sync tool is being built separately, upstream.
+This README is the one file here the sync does not manage; everything else under `fleet/`
+is listed, with its hash, in `SOURCE`.
+
+What ships: the six agents (scout, architect, builder, reviewer, integrator, ops), the
+`feature-graph`, `close-run` and `rlm` skills, `GRAPH.md`, the hooks (plan-scope guard,
+activity recorder, board, state-gap check) and the run-state scripts. Paths to the fleet
+appear as the `@FLEET@` placeholder, which Orchestra fills in when it installs the fleet
+into a user's project. This directory is a template: nothing runs in place here, so no run
+state, `__pycache__` or other generated files belong in it (the sync refuses on extras).

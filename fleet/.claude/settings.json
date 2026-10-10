@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/guard-builder-scope.py\"",
+            "timeout": 10,
+            "statusMessage": "checking the approved plan's file set"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/flag-state-gap.py\" || true",
+            "timeout": 10,
+            "statusMessage": "auditing run-state edges"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/record-activity.py\" || true",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/show-board.py\" || true",
+            "timeout": 10,
+            "statusMessage": "rendering the run board"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/record-activity.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR:-.}/@FLEET@/.claude/hooks/record-activity.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
