@@ -21,7 +21,7 @@ export function SessionDetail({ session, onBack, onError }: Props) {
     void (async () => {
       try {
         const u = await onTranscriptAppended((batch) => {
-          if (batch.session_id === id) setEntries((cur) => mergeTranscript(cur, batch.entries));
+          if (!cancelled && batch.session_id === id) setEntries((cur) => mergeTranscript(cur, batch.entries));
         }, onError);
         if (cancelled) {
           u();

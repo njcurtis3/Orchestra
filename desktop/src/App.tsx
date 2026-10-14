@@ -110,6 +110,7 @@ function App() {
         />
         {selectedSession ? (
           <SessionDetail
+            key={selectedSession.id}
             session={selectedSession}
             onBack={() => dispatch({ type: "select-session", id: null })}
             onError={fail}
