@@ -1,4 +1,5 @@
 mod commands;
+mod git;
 mod notify;
 mod projects;
 mod session;
