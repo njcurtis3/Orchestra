@@ -2037,6 +2037,74 @@ mod tests {
         tidy(&r, &repo);
     }
 
+    /// Commit in the task worktree with `message` read from a file, so it can hold any byte.
+    fn worktree_commit_raw(r: &Rig, wt: &Path, message: &str) {
+        let f = r.base.join("msg.txt");
+        std::fs::write(&f, message).unwrap();
+        std::fs::write(wt.join("b.txt"), "from the task").unwrap();
+        git_in(wt, &["add", "."]);
+        git_in(wt, &["commit", "-F", f.to_str().unwrap()]);
+    }
+
+    #[test]
+    fn land_refuses_when_the_task_commits_cannot_be_read_and_stays_replyable() {
+        let (r, p, repo) = rig_repo("landunread");
+        let sid = done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        // A forged record header inside a message, with a trailer in it.
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        let forged = format!("{}\u{1f}x@y\u{1f}x@y\u{1f}{trailer}", "b".repeat(40));
+        worktree_commit_raw(&r, &wt, &format!("t1: add b\n\n\u{1e}{forged}"));
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+        let tip = git_out(&repo, &["rev-parse", "orchestra/t1"]);
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert_eq!(err, "could not read every task commit");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert!(!r.sessions.list_tasks()[0].session_over);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git_out(&repo, &["rev-parse", "orchestra/t1"]), tip);
+        assert!(wt.is_dir() && !repo.join("b.txt").exists());
+        assert!(r.sessions.get_task_diff("t1").is_err(), "the review does not show a partial list either");
+        r.sessions.reply(&sid, "please reword that commit").unwrap();
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_catches_a_trailer_after_a_separator_in_the_message() {
+        let (r, p, repo) = rig_repo("landsep");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        worktree_commit_raw(&r, &wt, &format!("t1: add b\n\nfine\u{1e}no header here\u{1f}x\n{trailer}"));
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("Claude attribution"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert!(!repo.join("b.txt").exists());
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_a_trailer_hidden_by_a_replace_ref() {
+        let (r, p, repo) = rig_repo("landreplace");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        worktree_commit(&wt, "b.txt", &format!("t1: add b\n\n{trailer}"));
+        let tip = git_out(&repo, &["rev-parse", "orchestra/t1"]);
+        let base = git_out(&repo, &["rev-parse", "HEAD"]);
+        let clean = git_out(&repo, &["commit-tree", &format!("{tip}^{{tree}}"), "-p", &base, "-m", "t1: add b"]);
+        git_in(&repo, &["replace", &tip, &clean]);
+        assert!(!git_out(&repo, &["log", "-1", "--format=%B", &tip]).contains("Claude"), "plain git is fooled");
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("Claude attribution"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), base);
+        assert!(!repo.join("b.txt").exists());
+        tidy(&r, &repo);
+    }
+
     #[test]
     fn land_refuses_a_noreply_author_and_accepts_prose_about_claude() {
         let (r, p, repo) = rig_repo("landauthor");

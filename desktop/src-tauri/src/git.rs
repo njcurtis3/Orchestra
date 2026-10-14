@@ -74,10 +74,11 @@ impl Output {
 /// read the code (`show-ref --quiet`); use `run_ok` when it should be an error.
 pub fn run(repo: &Path, args: &[&str], cap: usize, timeout: Duration) -> Result<Output, GitError> {
     let mut cmd = Command::new(GIT);
-    cmd.args(["-c", "core.longpaths=true", "-c", "core.quotepath=false", "--no-pager", "-C"])
+    cmd.args(["-c", "core.longpaths=true", "-c", "core.quotepath=false", "--no-pager", "--no-replace-objects", "-C"])
         .arg(repo)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
     if args.first() == Some(&"status") {
         cmd.env("GIT_OPTIONAL_LOCKS", "0");
     }
@@ -656,6 +657,7 @@ pub struct CommitInfo {
 }
 
 const SHORT_ID: usize = 7;
+const UNREAD: &str = "could not read every task commit";
 const FIELD: char = '\u{1f}';
 const RECORD: char = '\u{1e}';
 
@@ -669,8 +671,10 @@ impl CommitInfo {
     }
 }
 
-/// Every commit in `base..refs/heads/<branch>`, newest first. Output that does not fit
-/// `LIST_CAP` is an error: a commit that was not read cannot be cleared.
+/// Every commit in `base..refs/heads/<branch>`, newest first. Fails closed: output that does not fit
+/// `LIST_CAP`, a leading chunk that is not a record, or a parsed count that differs from
+/// `rev-list --count` is an error: a commit that was not read cannot be cleared. Replace refs
+/// are ignored (`run` passes `--no-replace-objects`).
 pub fn commits(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<Vec<CommitInfo>, GitError> {
     let range = format!("{}..refs/heads/{}", base.as_str(), branch.as_str());
     // Flags that make the format the same whatever the user's git config says: signature
@@ -691,7 +695,18 @@ pub fn commits(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<Vec<
     if out.truncated {
         return Err(GitError::Invalid("too many commits to check"));
     }
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let list = parse_records(&String::from_utf8_lossy(&out.stdout))?;
+    // The backstop: a header forged inside a message adds an entry, an unreadable record
+    // removes one; either way the count differs from git's own.
+    if list.len() != commits_ahead(repo, base, branch)? {
+        return Err(GitError::Invalid(UNREAD));
+    }
+    Ok(list)
+}
+
+/// The records of the `commits` format. A chunk that is not a record stays with the commit
+/// before it; with none before it the output is not what was asked for, and that is an error.
+fn parse_records(text: &str) -> Result<Vec<CommitInfo>, GitError> {
     let mut list: Vec<CommitInfo> = Vec::new();
     for chunk in text.split(RECORD) {
         let chunk = chunk.trim_start_matches('\n');
@@ -719,9 +734,13 @@ pub fn commits(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<Vec<
         }
         // Not a record of ours: a message that held the separator. It stays with the
         // commit before it, so the attribution check still reads it.
-        if let Some(last) = list.last_mut() {
-            last.message.push('\n');
-            last.message.push_str(chunk);
+        // With no commit before it there is nothing to attach it to: refuse.
+        match list.last_mut() {
+            Some(last) => {
+                last.message.push('\n');
+                last.message.push_str(chunk);
+            }
+            None => return Err(GitError::Invalid(UNREAD)),
         }
     }
     Ok(list)
@@ -1302,6 +1321,75 @@ mod tests {
         assert!(list[0].body.len() <= BODY_CAP_BYTES);
         assert!(!list[0].body.contains("Claude-Session"), "cut off for display");
         assert!(list[0].carries_claude_attribution(), "but still found");
+    }
+
+    /// A commit whose message holds the record and field separators, as a task could write it.
+    fn commit_message_file(wt: &Path, message: &str) {
+        let f = wt.parent().unwrap().join("msg.txt");
+        std::fs::write(&f, message).unwrap();
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(wt).unwrap();
+        git(wt, &["commit", "-F", f.to_str().unwrap()]);
+    }
+
+    fn task_repo(name: &str) -> (PathBuf, RepoInfo, TaskBranch, PathBuf) {
+        let repo = repo_with_commit(name);
+        let info = repo_info(&repo).unwrap();
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let base = scratch(&format!("{name}-base"));
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+        (repo, info, branch, wt)
+    }
+
+    #[test]
+    fn parse_records_refuses_an_unparseable_leading_chunk() {
+        let good = format!("{}{FIELD}a@b{FIELD}c@d{FIELD}msg\n{RECORD}", "a".repeat(40));
+        assert_eq!(parse_records(&good).unwrap().len(), 1);
+        for bad in [format!("Good signature\n{good}"), format!("junk{RECORD}{good}"), format!("{FIELD}x{RECORD}")] {
+            assert_eq!(parse_records(&bad).unwrap_err(), GitError::Invalid(UNREAD), "{bad:?}");
+        }
+        // A non-record chunk after a record joins it, and a blank output is no commits.
+        let joined = format!("{}{FIELD}a@b{FIELD}c@d{FIELD}msg{RECORD}more{RECORD}", "a".repeat(40));
+        let list = parse_records(&joined).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].message.ends_with("more"));
+        assert!(parse_records("\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn commits_errors_when_a_forged_header_makes_the_count_differ() {
+        let (repo, info, branch, wt) = task_repo("forged");
+        let forged = format!("{}{FIELD}x@y{FIELD}x@y{FIELD}Co-Authored-By: Claude <noreply@anthropic.com>", "b".repeat(40));
+        commit_message_file(&wt, &format!("t1: x\n\n{RECORD}{forged}"));
+        assert_eq!(commits_ahead(&repo, &info.head_commit, &branch).unwrap(), 1);
+        assert_eq!(commits(&repo, &info.head_commit, &branch).unwrap_err(), GitError::Invalid(UNREAD));
+    }
+
+    #[test]
+    fn commits_keeps_a_separator_continuation_with_its_commit() {
+        let (repo, info, branch, wt) = task_repo("sepmsg");
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        commit_message_file(&wt, &format!("t1: x\n\nfine{RECORD}not a header{FIELD}still not\n{trailer}"));
+        let list = commits(&repo, &info.head_commit, &branch).unwrap();
+        assert_eq!(list.len(), 1, "nothing extra and nothing hidden");
+        assert!(list[0].carries_claude_attribution());
+    }
+
+    #[test]
+    fn commits_ignores_a_replace_ref() {
+        let (repo, info, branch, wt) = task_repo("replace");
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        commit_message_file(&wt, &format!("t1: x\n\n{trailer}"));
+        let tip = git(&repo, &["rev-parse", "refs/heads/orchestra/t1"]).text();
+        let clean = git(&repo, &["commit-tree", &format!("{tip}^{{tree}}"), "-p", info.head_commit.as_str(), "-m", "clean"]).text();
+        git(&repo, &["replace", &tip, &clean]);
+        // Plain git now shows the clean message; the scan must not.
+        let shown = Command::new(GIT).args(["-C"]).arg(&repo).args(["log", "-1", "--format=%B", &tip]).output().unwrap();
+        assert!(String::from_utf8_lossy(&shown.stdout).contains("clean"), "the replace hides the message from plain git");
+        let list = commits(&repo, &info.head_commit, &branch).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].carries_claude_attribution(), "the real message was read");
     }
 
     #[test]
