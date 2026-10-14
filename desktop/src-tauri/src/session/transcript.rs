@@ -198,6 +198,8 @@ struct FileState {
     bytes: u64,
     /// The cap was reached: nothing more is written.
     full: bool,
+    /// The file ends in a torn line (no trailing newline): the next write starts a new line.
+    needs_newline: bool,
     /// The JSONL lines, when the backend is memory.
     mem: Vec<String>,
 }
@@ -249,10 +251,13 @@ impl TranscriptStore {
         st.next_seq = 1;
         if let Some(text) = self.path(id).and_then(|p| fs::read_to_string(p).ok()) {
             st.bytes = text.len() as u64;
-            if let Some(last) = parse_lines(text.lines().rev().take(1)).pop() {
-                st.next_seq = last.seq + 1;
-                st.full = last.entry == Entry::Truncated;
+            st.needs_newline = !text.is_empty() && !text.ends_with('\n');
+            // Every parseable line counts: a torn tail or a garbage line must not reset the numbering.
+            let records = parse_lines(text.lines());
+            if let Some(max) = records.iter().map(|r| r.seq).max() {
+                st.next_seq = max + 1;
             }
+            st.full = records.iter().any(|r| r.entry == Entry::Truncated);
         }
     }
 
@@ -284,14 +289,18 @@ impl TranscriptStore {
             text.push('\n');
             out.push(rec);
         }
-        st.bytes += text.len() as u64;
         match (&self.backend, self.path(id)) {
             (Backend::Disk(dir), Some(path)) => {
+                if st.needs_newline && !text.is_empty() {
+                    text.insert(0, '\n');
+                    st.needs_newline = false;
+                }
                 let _ = fs::create_dir_all(dir);
                 let _ = OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(text.as_bytes()));
             }
             _ => st.mem.extend(text.lines().map(str::to_string)),
         }
+        st.bytes += text.len() as u64;
         out
     }
 
@@ -435,6 +444,46 @@ mod tests {
         assert_eq!((page.entries.len(), page.next_seq), (3, 4));
         assert_eq!(page.entries[0].seq, 1);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    fn seeded(name: &str, file: &str, body: &str) -> (PathBuf, TranscriptStore) {
+        let d = scratch(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(file), body).unwrap();
+        let store = TranscriptStore::disk(d.clone());
+        (d, store)
+    }
+
+    fn complete_lines(n: u64) -> String {
+        (1..=n).map(|seq| serde_json::to_string(&Record { seq, at: 1, entry: user_prompt("x") }).unwrap() + "\n").collect()
+    }
+
+    #[test]
+    fn torn_tail_keeps_max_seq_and_starts_on_a_new_line() {
+        let body = complete_lines(7) + "{\"seq\":8,\"at\":1,\"kind\":\"user_pr";
+        let (d, store) = seeded("torn", "s5.jsonl", &body);
+        let r = store.append("s5", vec![user_prompt("after")], 2);
+        assert_eq!(r[0].seq, 8);
+        let text = fs::read_to_string(d.join("s5.jsonl")).unwrap();
+        assert!(text.ends_with('\n'));
+        let last = text.lines().last().unwrap();
+        assert_eq!(serde_json::from_str::<Record>(last).unwrap().seq, 8);
+        assert_eq!(parse_lines(text.lines()).len(), 8, "the 7 complete lines and the new one parse");
+        assert_eq!(text.lines().count(), 9, "the fragment keeps its own line");
+        assert_eq!(store.read("s5").next_seq, 9);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn garbage_line_in_the_middle_does_not_reset_seq() {
+        let body = complete_lines(3) + "not json at all\n" + &complete_lines(5)[complete_lines(3).len()..];
+        let (d, store) = seeded("garbage", "s6.jsonl", &body);
+        assert_eq!(store.append("s6", vec![user_prompt("after")], 2)[0].seq, 6);
+        // A garbage last line, too: numbering still comes from the best earlier line.
+        let (d2, store2) = seeded("garbage-tail", "s6.jsonl", &(complete_lines(4) + "garbage\n"));
+        assert_eq!(store2.append("s6", vec![user_prompt("after")], 2)[0].seq, 5);
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&d2);
     }
 
     #[test]
