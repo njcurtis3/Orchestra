@@ -95,6 +95,9 @@ pub struct SessionState {
     pub last_message: Option<String>,
     pub claude_session_id: Option<String>,
     pub inbox: Vec<InboxItem>,
+    /// Bumped on every inbox mutation (item added, resolved or expired), so the manager can
+    /// tell whether a line touched the inbox without comparing it. Not persisted.
+    pub inbox_rev: u64,
     /// Open requests by inbox item id, in arrival order for `status` recomputation.
     pending: HashMap<String, Pending>,
     pending_order: Vec<String>,
@@ -214,6 +217,7 @@ impl SessionState {
             last_message: None,
             claude_session_id: None,
             inbox: Vec::new(),
+            inbox_rev: 0,
             pending: HashMap::new(),
             pending_order: Vec::new(),
             unknown_count: 0,
@@ -243,6 +247,7 @@ impl SessionState {
             last_message: p.last_message,
             claude_session_id: p.claude_session_id.filter(|id| is_uuid(id)),
             inbox: p.inbox,
+            inbox_rev: 0,
             pending: HashMap::new(),
             pending_order: Vec::new(),
             unknown_count: p.unknown_count,
@@ -317,6 +322,7 @@ impl SessionState {
         result_text: Option<String>,
     ) -> String {
         self.next_item += 1;
+        self.inbox_rev += 1;
         let id = format!("{}-i{}", self.session_id, self.next_item);
         self.inbox.push(InboxItem {
             id: id.clone(),
@@ -335,8 +341,9 @@ impl SessionState {
     }
 
     fn resolve(&mut self, item_id: &str) {
-        if let Some(i) = self.inbox.iter_mut().find(|i| i.id == item_id) {
+        if let Some(i) = self.inbox.iter_mut().find(|i| i.id == item_id && !i.resolved) {
             i.resolved = true;
+            self.inbox_rev += 1;
         }
     }
 
@@ -541,6 +548,7 @@ impl SessionState {
             if !i.resolved && matches!(i.kind, InboxKind::Permission | InboxKind::Question) {
                 i.resolved = true;
                 i.expired = true;
+                self.inbox_rev += 1;
             }
         }
         self.status = if self.claude_session_id.is_some() { SessionStatus::Suspended } else { SessionStatus::Ended };

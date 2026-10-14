@@ -58,10 +58,22 @@ describe("reducer", () => {
     expect(s.inbox.map((x) => x.id)).toEqual(["new", "old", "done"]);
   });
 
-  it("replaces the whole inbox on inbox-updated", () => {
-    let s = reducer(initialState, { type: "inbox-updated", items: [item("a", 1), item("b", 2)] });
-    s = reducer(s, { type: "inbox-updated", items: [item("c", 3)] });
-    expect(s.inbox.map((x) => x.id)).toEqual(["c"]);
+  it("inbox-updated upserts and keeps items of other sessions", () => {
+    const other = { ...item("x", 2), session_id: "s2" };
+    let s = reducer(initialState, { type: "inbox-updated", items: [item("a", 1), other] });
+    s = reducer(s, { type: "inbox-updated", items: [item("a", 1, true), item("c", 3)] });
+    expect(s.inbox.map((x) => x.id)).toEqual(["c", "x", "a"]);
+    expect(s.inbox.find((x) => x.id === "a")?.resolved).toBe(true);
+    expect(s.inbox.find((x) => x.id === "x")?.session_id).toBe("s2");
+  });
+
+  it("selects a session and goes back", () => {
+    let s = reducer(initialState, { type: "select-session", id: "a" });
+    expect(s.selected).toBe("a");
+    s = reducer(s, { type: "session-updated", session: session("a", 2) });
+    expect(s.selected).toBe("a");
+    s = reducer(s, { type: "select-session", id: null });
+    expect(s.selected).toBeNull();
   });
 
   it("does not mutate the previous state", () => {

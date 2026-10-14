@@ -1,12 +1,21 @@
 import { useState } from "react";
 import { startSession } from "../ipc";
-import { MAX_TEXT_BYTES, type Project } from "../types";
+import { MAX_TEXT_BYTES, MODELS, PERMISSION_MODES, type Model, type PermissionMode, type Project } from "../types";
+
+const MODE_LABELS: Record<PermissionMode, string> = {
+  manual: "Manual",
+  acceptEdits: "Accept edits",
+  plan: "Plan",
+};
 
 type Props = { projects: Project[]; onError: (e: unknown) => void };
 
 export function NewSession({ projects, onError }: Props) {
   const [projectId, setProjectId] = useState("");
   const [prompt, setPrompt] = useState("");
+  // "" is Default: no flag, so claude uses its own setting.
+  const [model, setModel] = useState<Model | "">("");
+  const [mode, setMode] = useState<PermissionMode | "">("");
   const [busy, setBusy] = useState(false);
 
   const selected = projectId || projects[0]?.id || "";
@@ -18,7 +27,7 @@ export function NewSession({ projects, onError }: Props) {
     if (!valid || busy) return;
     setBusy(true);
     try {
-      await startSession(selected, prompt);
+      await startSession(selected, prompt, model || null, mode || null);
       setPrompt("");
     } catch (err) {
       onError(err);
@@ -36,6 +45,28 @@ export function NewSession({ projects, onError }: Props) {
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Model
+        <select value={model} onChange={(e) => setModel(e.target.value as Model | "")}>
+          <option value="">Default</option>
+          {MODELS.map((m) => (
+            <option key={m} value={m}>
+              {m.charAt(0).toUpperCase() + m.slice(1)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Permission mode
+        <select value={mode} onChange={(e) => setMode(e.target.value as PermissionMode | "")}>
+          <option value="">Default</option>
+          {PERMISSION_MODES.map((m) => (
+            <option key={m} value={m}>
+              {MODE_LABELS[m]}
             </option>
           ))}
         </select>

@@ -24,10 +24,17 @@ pub enum Message {
     Unknown,
 }
 
+/// Test-only: the manager parses with `serde_json` itself and calls `parse_value`.
+#[cfg(test)]
 pub fn parse_line(line: &str) -> Message {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return Message::Unknown;
-    };
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => parse_value(&v),
+        Err(_) => Message::Unknown,
+    }
+}
+
+/// `parse_line` for a line already parsed, so the manager reads each line once.
+pub fn parse_value(v: &Value) -> Message {
     let str_of = |v: &Value| v.as_str().map(str::to_string);
     match v.get("type").and_then(Value::as_str) {
         Some("system") => match v.get("subtype").and_then(Value::as_str) {

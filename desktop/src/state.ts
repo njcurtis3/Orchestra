@@ -1,14 +1,15 @@
 import type { InboxItem, SessionSummary } from "./types";
 
-export type State = { sessions: SessionSummary[]; inbox: InboxItem[] };
+export type State = { sessions: SessionSummary[]; inbox: InboxItem[]; selected: string | null };
 
 export type Action =
   | { type: "sessions-loaded"; sessions: SessionSummary[] }
   | { type: "session-updated"; session: SessionSummary }
   | { type: "inbox-loaded"; items: InboxItem[] }
-  | { type: "inbox-updated"; items: InboxItem[] };
+  | { type: "inbox-updated"; items: InboxItem[] }
+  | { type: "select-session"; id: string | null };
 
-export const initialState: State = { sessions: [], inbox: [] };
+export const initialState: State = { sessions: [], inbox: [], selected: null };
 
 // Unresolved first, then newest first.
 export function sortInbox(items: InboxItem[]): InboxItem[] {
@@ -55,7 +56,14 @@ export function reducer(state: State, action: Action): State {
     }
     case "inbox-loaded":
       return { ...state, inbox: sortInbox(mergeInbox(state.inbox, action.items)) };
-    case "inbox-updated":
-      return { ...state, inbox: sortInbox(action.items) };
+    case "inbox-updated": {
+      // An event carries one session's items only: upsert them, the event copy wins, and
+      // everything else in the inbox stays.
+      const byId = new Map(state.inbox.map((i) => [i.id, i]));
+      for (const i of action.items) byId.set(i.id, i);
+      return { ...state, inbox: sortInbox([...byId.values()]) };
+    }
+    case "select-session":
+      return { ...state, selected: action.id };
   }
 }

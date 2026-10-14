@@ -1,16 +1,20 @@
 mod commands;
+mod notify;
 mod projects;
 mod session;
 mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
+use tauri_plugin_notification::NotificationExt;
 
 use commands::AppSessions;
-use session::{Event, Sessions, process, store};
+use session::{Event, Sessions, process, store, transcript};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init());
     // Registered on the builder so it restores the main window as it is created. The
     // frontend never calls it, so no capability is granted.
     #[cfg(desktop)]
@@ -24,20 +28,43 @@ pub fn run() {
                 window::ensure_visible(&main);
             }
             let handle = app.handle().clone();
+            let notify_handle = app.handle().clone();
             // Saving stays off for the run when the file cannot be loaded; see `store::open`.
-            let (snapshot, status, writer) = match app.path().app_data_dir() {
-                Ok(dir) => store::open(&dir.join("state.json")),
-                Err(_) => (None, store::StorageStatus::unreadable(), None),
+            let data_dir = app.path().app_data_dir().ok();
+            let (snapshot, status, writer) = match &data_dir {
+                Some(dir) => store::open(&dir.join("state.json")),
+                None => (None, store::StorageStatus::unreadable(), None),
+            };
+            // Transcripts follow the state file: with saving off they stay in memory.
+            let transcripts = match (&data_dir, &writer) {
+                (Some(dir), Some(_)) => transcript::TranscriptStore::disk(dir.join("transcripts")),
+                _ => transcript::TranscriptStore::memory(),
             };
             let sessions: AppSessions = Sessions::with_writer(
                 Box::new(move |event| {
                     let _ = match event {
                         Event::SessionUpdated(s) => handle.emit("session-updated", s),
                         Event::InboxUpdated(items) => handle.emit("inbox-updated", items),
+                        Event::TranscriptAppended(batch) => handle.emit("transcript-appended", batch),
                     };
                 }),
                 Box::new(process::spawn),
+                // Rust-only use of the plugin, as with dialog: no capability is granted.
+                Box::new(move |project, notice| {
+                    // Nothing to announce while the user is looking at the window.
+                    let focused = notify_handle.get_webview_window("main").and_then(|w| w.is_focused().ok());
+                    if focused == Some(true) {
+                        return;
+                    }
+                    let _ = notify_handle
+                        .notification()
+                        .builder()
+                        .title("Orchestra")
+                        .body(notify::body(project, notice.kind))
+                        .show();
+                }),
                 writer,
+                transcripts,
             );
             if let Some(snapshot) = snapshot {
                 sessions.restore(snapshot);
@@ -54,6 +81,7 @@ pub fn run() {
             commands::list_inbox,
             commands::answer,
             commands::stop_session,
+            commands::get_transcript,
             commands::storage_status,
         ])
         .build(tauri::generate_context!())

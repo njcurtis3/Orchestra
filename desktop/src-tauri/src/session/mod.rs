@@ -4,8 +4,10 @@
 
 pub mod process;
 pub mod protocol;
+pub mod settings;
 pub mod state;
 pub mod store;
+pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -13,11 +15,15 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use serde_json::Value;
 
+use crate::notify::{self, Notice};
 use crate::projects::{Project, Projects};
-use process::{Output, Proc};
-use state::{ClaudeSessionId, Commit, Decision, InboxItem, SessionState, SessionStatus};
+use process::{Output, Proc, SpawnArgs};
+use settings::{Model, PermissionMode, SessionSettings};
+use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
 use store::{Snapshot, StoredSession, Writer};
+use transcript::{Entry, Record, TranscriptBatch, TranscriptPage, TranscriptStore};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
 pub const MAX_TEXT_BYTES: usize = 32768;
@@ -34,26 +40,52 @@ pub struct SessionSummary {
     pub last_activity_at: u64,
     pub last_message: Option<String>,
     pub claude_session_id: Option<String>,
+    pub model: Option<Model>,
+    pub permission_mode: Option<PermissionMode>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Event {
     SessionUpdated(SessionSummary),
     InboxUpdated(Vec<InboxItem>),
+    TranscriptAppended(TranscriptBatch),
 }
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
 pub type Sink = Box<dyn Fn(Output) + Send>;
-/// Starts a child in the given directory, resuming a saved conversation when given its id;
-/// every stdout line and the exit go to the sink.
-pub type Spawner = Box<dyn Fn(&Path, Option<&ClaudeSessionId>, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
+/// Called with the project name and a notice after a change worth telling the user about.
+/// Runs on the reader thread with no lock held, and must not call back into `Sessions`.
+pub type Notify = Box<dyn Fn(&str, Notice) + Send + Sync>;
+/// Starts a child in the given directory with the session's settings, resuming a saved
+/// conversation when given its id; every stdout line and the exit go to the sink.
+pub type Spawner = Box<dyn Fn(&Path, &SpawnArgs, Sink) -> Result<Arc<dyn Proc>, String> + Send + Sync>;
+
+/// What decides whether a stdout line needs a snapshot: a change in any of these is worth a
+/// write, a change in only the message text or the clock is not.
+#[derive(Clone, PartialEq)]
+struct SaveKey {
+    status: SessionStatus,
+    inbox_rev: u64,
+    claude_session_id: Option<String>,
+}
+
+impl SaveKey {
+    fn of(state: &SessionState) -> Self {
+        Self { status: state.status, inbox_rev: state.inbox_rev, claude_session_id: state.claude_session_id.clone() }
+    }
+}
 
 struct Session {
     id: String,
     project_id: String,
     project_name: String,
     started_at: u64,
+    settings: SessionSettings,
     state: SessionState,
+    /// The inbox revision last sent to the frontend.
+    emitted_inbox_rev: u64,
+    /// The key as of the last snapshot decision.
+    saved_key: SaveKey,
     proc: Option<Arc<dyn Proc>>,
     /// Serialises build, write and commit of answers for this session. Held across the
     /// pipe write, so it is never taken together with `Inner` and the reader never needs it.
@@ -71,6 +103,8 @@ impl Session {
             last_activity_at: self.state.last_activity_at,
             last_message: self.state.last_message.clone(),
             claude_session_id: self.state.claude_session_id.clone(),
+            model: self.settings.model,
+            permission_mode: self.settings.permission_mode,
         }
     }
 }
@@ -115,17 +149,30 @@ impl Inner {
                     project_id: s.project_id.clone(),
                     project_name: s.project_name.clone(),
                     started_at: s.started_at,
+                    model: s.settings.model.map(|m| m.as_str().to_string()),
+                    permission_mode: s.settings.permission_mode.map(|m| m.as_str().to_string()),
                     state: s.state.to_persisted(),
                 })
                 .collect(),
         }
     }
 
-    fn events_for(&self, session_id: &str) -> Vec<Event> {
-        match self.sessions.get(session_id) {
-            Some(s) => vec![Event::SessionUpdated(s.summary()), Event::InboxUpdated(self.inbox())],
-            None => Vec::new(),
+    /// The events for a session, and whether its status, inbox or claude id changed since the
+    /// last call. The inbox event carries only this session's items and only when its inbox
+    /// changed.
+    fn events_for(&mut self, session_id: &str) -> (Vec<Event>, bool) {
+        let Some(s) = self.sessions.get_mut(session_id) else {
+            return (Vec::new(), false);
+        };
+        let mut events = vec![Event::SessionUpdated(s.summary())];
+        if s.emitted_inbox_rev != s.state.inbox_rev {
+            s.emitted_inbox_rev = s.state.inbox_rev;
+            events.push(Event::InboxUpdated(s.state.inbox.clone()));
         }
+        let key = SaveKey::of(&s.state);
+        let significant = s.saved_key != key;
+        s.saved_key = key;
+        (events, significant)
     }
 
     fn is_expired_item(&self, item_id: &str) -> bool {
@@ -150,20 +197,30 @@ pub struct Sessions {
     emit_order: Mutex<()>,
     emit: Emit,
     spawner: Spawner,
+    notify: Notify,
     /// `None` when saving is off: tests, or a state file this build must not touch.
     writer: Option<Writer>,
+    transcripts: TranscriptStore,
     /// Lets `&self` methods hand an owning handle to a reader thread.
     me: Weak<Sessions>,
 }
 
 impl Sessions {
-    pub fn with_writer(emit: Emit, spawner: Spawner, writer: Option<Writer>) -> Arc<Self> {
+    pub fn with_writer(
+        emit: Emit,
+        spawner: Spawner,
+        notify: Notify,
+        writer: Option<Writer>,
+        transcripts: TranscriptStore,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             inner: Mutex::new(Inner::default()),
             emit_order: Mutex::new(()),
             emit,
             spawner,
+            notify,
             writer,
+            transcripts,
             me: me.clone(),
         })
     }
@@ -194,6 +251,9 @@ impl Sessions {
                     project_id: stored.project_id,
                     project_name: stored.project_name,
                     started_at: stored.started_at,
+                    settings: SessionSettings::from_stored(stored.model.as_deref(), stored.permission_mode.as_deref()),
+                    emitted_inbox_rev: state.inbox_rev,
+                    saved_key: SaveKey::of(&state),
                     state,
                     proc: None,
                     gate: Arc::new(Mutex::new(())),
@@ -213,9 +273,35 @@ impl Sessions {
     /// The disk follows the same shape: the snapshot is computed under `inner` with the
     /// next revision and queued under the emit lock, so the writer sees snapshots in
     /// revision order and `inner` is never held across disk I/O.
-    fn publish(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str) {
-        let events = inner.events_for(session_id);
-        let snapshot = self.next_snapshot(&mut inner);
+    ///
+    /// An explicit command always saves; a stdout line goes through `publish_line`.
+    fn publish(&self, inner: MutexGuard<'_, Inner>, session_id: &str) {
+        self.publish_saving(inner, session_id, true, Vec::new());
+    }
+
+    /// `publish` for a stdout line: the snapshot is skipped when only text changed.
+    fn publish_line(&self, inner: MutexGuard<'_, Inner>, session_id: &str, appended: Vec<Record>) {
+        self.publish_saving(inner, session_id, false, self.transcript_events(session_id, appended));
+    }
+
+    /// A transcript batch to send with the session's events; nothing when none was recorded.
+    fn transcript_events(&self, session_id: &str, entries: Vec<Record>) -> Vec<Event> {
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        vec![Event::TranscriptAppended(TranscriptBatch { session_id: session_id.to_string(), entries })]
+    }
+
+    fn publish_saving(&self, mut inner: MutexGuard<'_, Inner>, session_id: &str, force: bool, extra: Vec<Event>) {
+        let (mut events, significant) = inner.events_for(session_id);
+        events.extend(extra);
+        let snapshot = if force || significant {
+            self.next_snapshot(&mut inner)
+        } else {
+            // Text only: the next snapshot of any kind carries it, and `shutdown` always
+            // snapshots, so a clean exit never loses it.
+            None
+        };
         let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
         drop(inner);
         self.queue_save(snapshot);
@@ -268,7 +354,29 @@ impl Sessions {
         self.lock().inbox()
     }
 
-    pub fn start(self: &Arc<Self>, project_id: &str, prompt: &str) -> Result<SessionSummary, String> {
+    /// Record entries for a session that exists. The session map is checked first, so a file
+    /// name is only ever made from an id this manager issued.
+    fn append_transcript(&self, session_id: &str, entries: Vec<Entry>) -> Vec<Record> {
+        if !self.lock().sessions.contains_key(session_id) {
+            return Vec::new();
+        }
+        self.transcripts.append(session_id, entries, now_ms())
+    }
+
+    /// The last entries of a session's transcript.
+    pub fn transcript(&self, session_id: &str) -> Result<TranscriptPage, String> {
+        if !self.lock().sessions.contains_key(session_id) {
+            return Err("unknown session".into());
+        }
+        Ok(self.transcripts.read(session_id))
+    }
+
+    pub fn start(
+        self: &Arc<Self>,
+        project_id: &str,
+        prompt: &str,
+        settings: SessionSettings,
+    ) -> Result<SessionSummary, String> {
         check_text(prompt)?;
         let now = now_ms();
         let (session_id, path) = {
@@ -282,7 +390,10 @@ impl Sessions {
                 project_id: project_id.to_string(),
                 project_name: name,
                 started_at: now,
+                settings,
                 state: SessionState::new(&id, now),
+                emitted_inbox_rev: 0,
+                saved_key: SaveKey::of(&SessionState::new(&id, now)),
                 proc: None,
                 gate: Arc::new(Mutex::new(())),
             };
@@ -294,7 +405,7 @@ impl Sessions {
         let this = Arc::clone(self);
         let sid = session_id.clone();
         let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
-        let proc = match (self.spawner)(&path, None, sink) {
+        let proc = match (self.spawner)(&path, &SpawnArgs { resume: None, settings }, sink) {
             Ok(p) => p,
             Err(e) => {
                 let mut inner = self.lock();
@@ -315,35 +426,64 @@ impl Sessions {
             self.publish(inner, &session_id);
             return Err("failed to send the prompt".into());
         }
+        let recorded = self.append_transcript(&session_id, vec![transcript::user_prompt(prompt)]);
         // The reader may already have moved the session past Starting while the prompt was
         // being written, so read the summary now, under the lock, and publish it in order.
         let inner = self.lock();
         let summary = inner.sessions.get(&session_id).map(Session::summary).ok_or("unknown session")?;
-        self.publish(inner, &session_id);
+        self.publish_saving(inner, &session_id, true, self.transcript_events(&session_id, recorded));
         Ok(summary)
     }
 
     /// Entry point for the reader thread: one stdout line, or the exit.
     pub fn on_output(&self, session_id: &str, out: Output) {
-        let mut inner = self.lock();
-        if inner.shutting_down {
+        // The line is parsed once: the state machine and the transcript both read this value.
+        let (message, entries) = match &out {
+            Output::Line(line) => match serde_json::from_str::<Value>(line) {
+                Ok(v) => (Some(protocol::parse_value(&v)), transcript::entries_from_value(&v)),
+                Err(_) => (Some(protocol::Message::Unknown), Vec::new()),
+            },
+            Output::Exit(_) => (None, Vec::new()),
+        };
+        let now = now_ms();
+        let live = {
+            let inner = self.lock();
             // The children are being killed on purpose; their exit is not a failure.
+            !inner.shutting_down && inner.sessions.contains_key(session_id)
+        };
+        if !live {
             return;
         }
-        let now = now_ms();
+        // Disk I/O happens here, with no lock on `inner`.
+        let appended = self.transcripts.append(session_id, entries, now);
+        let mut inner = self.lock();
+        if inner.shutting_down {
+            return;
+        }
+        let before = inner.sessions.get(session_id).map(|s| (s.state.status, s.state.inbox.len()));
         if let Some(s) = inner.sessions.get_mut(session_id) {
-            match out {
-                Output::Line(line) => s.state.apply(protocol::parse_line(&line), now),
-                Output::Exit(code) => s.state.mark_exit(code, now),
+            match (message, out) {
+                (Some(m), _) => s.state.apply(m, now),
+                (None, Output::Exit(code)) => s.state.mark_exit(code, now),
+                (None, Output::Line(_)) => {}
             }
         }
+        // Decided under the lock, told after it: the callback runs with nothing held.
+        let notice = before.and_then(|(status, items)| {
+            let s = inner.sessions.get(session_id)?;
+            let added = if s.state.inbox.len() > items { s.state.inbox.last().map(|i| i.kind) } else { None };
+            notify::decide(status, s.state.status, added).map(|n| (s.project_name.clone(), n))
+        });
         // A line can end a session only when a resume failed; the process has no more use.
         let dead = inner
             .sessions
             .get(session_id)
             .filter(|s| matches!(s.state.status, SessionStatus::Ended | SessionStatus::Failed))
             .and_then(|s| s.proc.clone());
-        self.publish(inner, session_id);
+        self.publish_line(inner, session_id, appended);
+        if let Some((project, notice)) = notice {
+            (self.notify)(&project, notice);
+        }
         if let Some(p) = dead {
             p.kill();
         }
@@ -392,7 +532,7 @@ impl Sessions {
         if paused {
             return self.resume_with(session_id, text);
         }
-        self.send_locked(session_id, |state| state.reply_line(text))
+        self.send_locked(session_id, |state| state.reply_line(text), Some(text))
     }
 
     /// A reply to a paused session starts a new process with `--resume` and sends the reply
@@ -401,6 +541,7 @@ impl Sessions {
     fn resume_with(&self, session_id: &str, text: &str) -> Result<(), String> {
         let mut inner = self.lock();
         let s = inner.sessions.get(session_id).ok_or("unknown session")?;
+        let settings = s.settings;
         let Some(path) = inner.projects.get(&s.project_id).map(|e| e.path.clone()) else {
             if let Some(s) = inner.sessions.get_mut(session_id) {
                 s.state.fail_resume("The project folder no longer exists", now_ms());
@@ -415,7 +556,7 @@ impl Sessions {
         let this = self.me.upgrade().ok_or("app is closing")?;
         let sid = session_id.to_string();
         let sink: Sink = Box::new(move |out| this.on_output(&sid, out));
-        let proc = match (self.spawner)(&path, Some(&plan.claude_session_id), sink) {
+        let proc = match (self.spawner)(&path, &SpawnArgs { resume: Some(&plan.claude_session_id), settings }, sink) {
             Ok(p) => p,
             Err(e) => {
                 let mut inner = self.lock();
@@ -446,11 +587,12 @@ impl Sessions {
             proc.kill();
             return Err("failed to send to session".into());
         }
+        let recorded = self.append_transcript(session_id, vec![transcript::user_prompt(text)]);
         let mut inner = self.lock();
         if let Some(s) = inner.sessions.get_mut(session_id) {
             s.state.commit_resume(&plan.resolve);
         }
-        self.publish(inner, session_id);
+        self.publish_saving(inner, session_id, true, self.transcript_events(session_id, recorded));
         Ok(())
     }
 
@@ -464,14 +606,16 @@ impl Sessions {
     ) -> Result<(), String> {
         let gate = self.lock().sessions.get(session_id).ok_or("unknown session")?.gate.clone();
         let _gate = gate.lock().unwrap_or_else(|e| e.into_inner());
-        self.send_locked(session_id, build)
+        self.send_locked(session_id, build, None)
     }
 
-    /// `send_through` with the session's gate already held.
+    /// `send_through` with the session's gate already held. `prompt` is the user text to
+    /// record in the transcript once the line has been written.
     fn send_locked(
         &self,
         session_id: &str,
         build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
+        prompt: Option<&str>,
     ) -> Result<(), String> {
         let (proc, line, commit) = {
             let inner = self.lock();
@@ -487,11 +631,12 @@ impl Sessions {
             proc.kill();
             return Err("failed to send to session".into());
         }
+        let recorded = prompt.map(|t| self.append_transcript(session_id, vec![transcript::user_prompt(t)])).unwrap_or_default();
         let mut inner = self.lock();
         if let Some(s) = inner.sessions.get_mut(session_id) {
             s.state.commit(commit, now_ms());
         }
-        self.publish(inner, session_id);
+        self.publish_saving(inner, session_id, true, self.transcript_events(session_id, recorded));
         Ok(())
     }
 
@@ -589,6 +734,10 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         /// Every spawn: the directory and the id passed to `--resume`, if any.
         spawns: Arc<Mutex<Vec<(std::path::PathBuf, Option<String>)>>>,
+        /// The settings of every spawn, in order.
+        spawn_settings: Arc<Mutex<Vec<SessionSettings>>>,
+        /// Every notice the notifier was given: the project name and the kind.
+        notices: Arc<Mutex<Vec<(String, crate::notify::NoticeKind)>>>,
     }
 
     fn rig() -> (Rig, Project) {
@@ -605,18 +754,24 @@ mod tests {
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
         let spawns = Arc::new(Mutex::new(vec![]));
-        let (f2, s2, e2, p2) = (fake.clone(), sink.clone(), events.clone(), spawns.clone());
+        let spawn_settings = Arc::new(Mutex::new(vec![]));
+        let notices = Arc::new(Mutex::new(vec![]));
+        let (f2, s2, e2, p2, g2, n2) =
+            (fake.clone(), sink.clone(), events.clone(), spawns.clone(), spawn_settings.clone(), notices.clone());
         let sessions = Sessions::with_writer(
             Box::new(move |e| e2.lock().unwrap().push(e)),
-            Box::new(move |dir, resume, sk| {
-                p2.lock().unwrap().push((dir.to_path_buf(), resume.map(|r| r.as_str().to_string())));
+            Box::new(move |dir, spawn, sk| {
+                p2.lock().unwrap().push((dir.to_path_buf(), spawn.resume.map(|r| r.as_str().to_string())));
+                g2.lock().unwrap().push(spawn.settings);
                 *s2.lock().unwrap() = Some(sk);
                 Ok(f2.clone() as Arc<dyn Proc>)
             }),
+            Box::new(move |project, notice| n2.lock().unwrap().push((project.to_string(), notice.kind))),
             writer,
+            TranscriptStore::memory(),
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
-        (Rig { sessions, fake, sink, events, spawns }, project)
+        (Rig { sessions, fake, sink, events, spawns, spawn_settings, notices }, project)
     }
 
     impl Rig {
@@ -653,7 +808,7 @@ mod tests {
     #[test]
     fn rejects_unknown_project_without_leaking_a_path() {
         let (r, _) = rig();
-        let err = r.sessions.start("nope", "hi").unwrap_err();
+        let err = r.sessions.start("nope", "hi", SessionSettings::default()).unwrap_err();
         assert_eq!(err, "unknown project");
         assert!(!err.contains('/') && !err.contains('\\') && !err.contains("Users") && !err.contains(":"));
     }
@@ -661,16 +816,16 @@ mod tests {
     #[test]
     fn rejects_empty_and_oversize_prompt() {
         let (r, p) = rig();
-        assert!(r.sessions.start(&p.id, "").is_err());
-        assert!(r.sessions.start(&p.id, "   ").is_err());
-        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
-        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES)).is_ok());
+        assert!(r.sessions.start(&p.id, "", SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, "   ", SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES + 1), SessionSettings::default()).is_err());
+        assert!(r.sessions.start(&p.id, &"a".repeat(MAX_TEXT_BYTES), SessionSettings::default()).is_ok());
     }
 
     #[test]
     fn start_sends_prompt_over_stdin_and_emits() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "hello").unwrap();
+        let s = r.sessions.start(&p.id, "hello", SessionSettings::default()).unwrap();
         assert_eq!(s.status, SessionStatus::Starting);
         let lines = r.fake.lines.lock().unwrap();
         assert_eq!(lines.len(), 1);
@@ -682,7 +837,7 @@ mod tests {
     #[test]
     fn answer_rejects_unknown_and_resolved_items() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         assert!(r.sessions.answer_permission("zzz", Decision::Allow, None).is_err());
         r.feed(PERM);
@@ -697,7 +852,7 @@ mod tests {
     #[test]
     fn answer_rejects_oversize_message_and_answers() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         let item = r.sessions.list_inbox().remove(0);
@@ -713,7 +868,7 @@ mod tests {
     #[test]
     fn reply_validates_session_text_and_status() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         assert!(r.sessions.reply("nope", "x").is_err());
         assert!(r.sessions.reply(&s.id, "").is_err());
         assert!(r.sessions.reply(&s.id, &"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
@@ -727,14 +882,14 @@ mod tests {
     #[test]
     fn stop_kills_child_and_shutdown_covers_app_exit() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.sessions.stop(&s.id).unwrap();
         assert!(r.fake.killed.load(Ordering::SeqCst));
         assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Ended);
         assert!(r.sessions.stop("nope").is_err());
 
         let (r2, p2) = rig();
-        r2.sessions.start(&p2.id, "go").unwrap();
+        r2.sessions.start(&p2.id, "go", SessionSettings::default()).unwrap();
         r2.sessions.shutdown();
         assert!(r2.fake.killed.load(Ordering::SeqCst));
     }
@@ -743,7 +898,7 @@ mod tests {
     fn start_publishes_post_send_summary_in_order() {
         let (r, p) = rig();
         r.feed_on_write(1, INIT);
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         assert_eq!(s.status, SessionStatus::Working);
         let updates = r.updates();
         assert_eq!(updates.last().unwrap().status, SessionStatus::Working);
@@ -753,7 +908,7 @@ mod tests {
     #[test]
     fn failed_answer_send_leaves_item_pending() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         let item = r.sessions.list_inbox().remove(0);
@@ -769,7 +924,7 @@ mod tests {
     #[test]
     fn failed_reply_send_leaves_session_idle() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(DONE);
         r.fake.fail.store(true, Ordering::SeqCst);
@@ -781,7 +936,7 @@ mod tests {
     #[test]
     fn reader_update_during_reply_send_wins() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(DONE);
         r.feed_on_write(2, DONE);
@@ -795,7 +950,7 @@ mod tests {
     #[test]
     fn concurrent_answers_send_once() {
         let (r, p) = rig();
-        r.sessions.start(&p.id, "go").unwrap();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT);
         r.feed(PERM);
         *r.fake.on_write.lock().unwrap() = Some(Box::new(|_| std::thread::sleep(std::time::Duration::from_millis(50))));
@@ -813,7 +968,7 @@ mod tests {
     #[test]
     fn unexpected_exit_marks_failed() {
         let (r, p) = rig();
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.sessions.on_output(&s.id, Output::Exit(Some(1)));
         assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Failed);
         assert!(r.sessions.list_inbox().iter().any(|i| i.kind == state::InboxKind::Error));
@@ -851,6 +1006,8 @@ mod tests {
             project_id: "p1".into(),
             project_name: "proj".into(),
             started_at: 1,
+            model: None,
+            permission_mode: None,
             state: state::PersistedSession {
                 status,
                 last_activity_at: 7,
@@ -868,7 +1025,7 @@ mod tests {
         let d = scratch("quit");
         let file = d.join("state.json");
         let (r, p) = rig_with(Some(Writer::new(file.clone())));
-        let s = r.sessions.start(&p.id, "go").unwrap();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         r.feed(PERM);
         r.sessions.shutdown();
@@ -904,7 +1061,7 @@ mod tests {
         let other = dir.join("other");
         std::fs::create_dir_all(&other).unwrap();
         assert_eq!(r.sessions.add_project(&other).unwrap().id, "p4");
-        let started = r.sessions.start("p3", "again").unwrap();
+        let started = r.sessions.start("p3", "again", SessionSettings::default()).unwrap();
         assert_eq!(started.id, "s6");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -932,7 +1089,7 @@ mod tests {
         let dir = scratch("nopath");
         let (r, _) = rig();
         let project = r.sessions.add_project(&dir).unwrap();
-        let s = r.sessions.start(&project.id, "go").unwrap();
+        let s = r.sessions.start(&project.id, "go", SessionSettings::default()).unwrap();
         r.feed(INIT_UUID);
         r.feed(PERM);
         let json = [
@@ -1073,6 +1230,276 @@ mod tests {
         let err = r.sessions.answer_question("s1-i1", &BTreeMap::new()).unwrap_err();
         assert!(err.contains("expired"));
         assert!(r.spawns.lock().unwrap().is_empty() && r.fake.lines.lock().unwrap().is_empty());
+    }
+    const TEXT: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}"#;
+
+    fn inbox_events(r: &Rig) -> Vec<Vec<InboxItem>> {
+        r.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| if let Event::InboxUpdated(i) = e { Some(i.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn text_lines_emit_no_inbox_event_and_queue_no_save() {
+        let d = scratch("textlines");
+        let (r, p) = rig_with(Some(Writer::new(d.join("state.json"))));
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        let (inbox_before, rev_before) = (inbox_events(&r).len(), r.sessions.lock().revision);
+        for _ in 0..5 {
+            r.feed(TEXT);
+        }
+        assert_eq!(inbox_events(&r).len(), inbox_before, "no inbox event for text lines");
+        assert_eq!(r.sessions.lock().revision, rev_before, "no snapshot queued for text lines");
+        assert_eq!(r.sessions.list_sessions()[0].last_message.as_deref(), Some("working on it"));
+        r.feed(PERM);
+        assert_eq!(inbox_events(&r).len(), inbox_before + 1, "a new item does emit");
+        assert!(r.sessions.lock().revision > rev_before, "and does save");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn inbox_event_carries_only_that_sessions_items() {
+        let (r, _) = rig();
+        let dir = scratch("onlyown");
+        paused(&r, &dir);
+        let s = r.sessions.start("p1", "go", SessionSettings::default()).unwrap();
+        assert_eq!(s.id, "s2");
+        r.feed(INIT_UUID);
+        r.feed(PERM);
+        let last = inbox_events(&r).pop().unwrap();
+        assert_eq!(last.len(), 1);
+        assert!(last.iter().all(|i| i.session_id == "s2"), "s1's finished item is not resent");
+        assert_eq!(r.sessions.list_inbox().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shutdown_saves_text_only_changes() {
+        let d = scratch("textshutdown");
+        let file = d.join("state.json");
+        let (r, p) = rig_with(Some(Writer::new(file.clone())));
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        let rev = r.sessions.lock().revision;
+        r.feed(TEXT);
+        assert_eq!(r.sessions.lock().revision, rev, "the text line itself saved nothing");
+        r.sessions.shutdown();
+        let saved = store::load(&file).unwrap().unwrap();
+        assert_eq!(saved.sessions[0].state.last_message.as_deref(), Some("working on it"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn resume_repasses_settings() {
+        let (r, p) = rig();
+        let chosen = SessionSettings { model: Some(Model::Opus), permission_mode: Some(PermissionMode::Plan) };
+        let s = r.sessions.start(&p.id, "go", chosen).unwrap();
+        assert_eq!((s.model, s.permission_mode), (Some(Model::Opus), Some(PermissionMode::Plan)));
+        assert_eq!(*r.spawn_settings.lock().unwrap(), [chosen]);
+
+        let (r, _) = rig();
+        let dir = scratch("settings");
+        let mut stored = stored_session("s1", SessionStatus::Idle, vec![finished_item("s1-i1", "s1")], 1);
+        stored.model = Some("sonnet".into());
+        stored.permission_mode = Some("acceptEdits".into());
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 1,
+            projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.clone() }],
+            sessions: vec![stored],
+        });
+        r.sessions.reply("s1", "again").unwrap();
+        assert_eq!(
+            *r.spawn_settings.lock().unwrap(),
+            [SessionSettings { model: Some(Model::Sonnet), permission_mode: Some(PermissionMode::AcceptEdits) }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_stored_mode_loads_as_none() {
+        let (r, _) = rig();
+        let mut stored = stored_session("s1", SessionStatus::Idle, vec![], 0);
+        stored.model = Some("haiku".into());
+        stored.permission_mode = Some("bypassPermissions".into());
+        r.sessions.restore(Snapshot {
+            schema: store::SCHEMA,
+            revision: 1,
+            next_session: 1,
+            next_project: 0,
+            projects: vec![],
+            sessions: vec![stored],
+        });
+        let listed = r.sessions.list_sessions();
+        assert_eq!(listed.len(), 1, "the session is still listed");
+        assert_eq!((listed[0].model, listed[0].permission_mode), (None, None));
+    }
+
+    #[test]
+    fn settings_survive_a_save_and_load() {
+        let d = scratch("settingsave");
+        let file = d.join("state.json");
+        let (r, p) = rig_with(Some(Writer::new(file.clone())));
+        let chosen = SessionSettings { model: Some(Model::Fable), permission_mode: Some(PermissionMode::Manual) };
+        r.sessions.start(&p.id, "go", chosen).unwrap();
+        r.sessions.shutdown();
+        let saved = store::load(&file).unwrap().unwrap();
+        assert_eq!((saved.sessions[0].model.as_deref(), saved.sessions[0].permission_mode.as_deref()), (Some("fable"), Some("manual")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    const TOOL_USE: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo SECRET_INPUT_MARKER"}}]}}"#;
+    const TOOL_RESULT: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"SECRET_RESULT_MARKER"}]}}"#;
+
+    fn transcript_events(r: &Rig) -> Vec<transcript::TranscriptBatch> {
+        r.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| if let Event::TranscriptAppended(b) = e { Some(b.clone()) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn transcript_text_never_in_snapshot() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        r.feed(TOOL_USE);
+        r.feed(TOOL_RESULT);
+        let page = r.sessions.transcript(&s.id).unwrap();
+        let kinds: Vec<_> = page.entries.iter().map(|e| std::mem::discriminant(&e.entry)).collect();
+        assert_eq!(kinds.len(), 3, "prompt, tool call, tool result");
+        let json = serde_json::to_string(&r.sessions.lock().snapshot()).unwrap();
+        assert!(!json.contains("SECRET_RESULT_MARKER") && !json.contains("SECRET_INPUT_MARKER"));
+        let inbox = serde_json::to_string(&r.sessions.list_inbox()).unwrap();
+        assert!(!inbox.contains("SECRET_RESULT_MARKER") && !inbox.contains("SECRET_INPUT_MARKER"));
+    }
+
+    #[test]
+    fn lines_are_recorded_and_emitted_in_order() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "first", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        r.feed(TOOL_USE);
+        r.feed(TOOL_RESULT);
+        r.feed(DONE);
+        r.sessions.reply(&s.id, "second").unwrap();
+        let page = r.sessions.transcript(&s.id).unwrap();
+        let seqs: Vec<u64> = page.entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        assert_eq!(page.next_seq, 6);
+        assert!(matches!(&page.entries[0].entry, Entry::UserPrompt { text, .. } if text == "first"));
+        assert!(matches!(&page.entries[3].entry, Entry::TurnResult { .. }));
+        assert!(matches!(&page.entries[4].entry, Entry::UserPrompt { text, .. } if text == "second"));
+        let emitted: Vec<u64> = transcript_events(&r).iter().flat_map(|b| b.entries.iter().map(|e| e.seq)).collect();
+        assert_eq!(emitted, seqs, "every recorded entry was emitted once, in order");
+        assert!(transcript_events(&r).iter().all(|b| b.session_id == s.id));
+        assert!(r.sessions.transcript("nope").is_err());
+    }
+
+    #[test]
+    fn a_resume_records_its_reply() {
+        let (r, _) = rig();
+        let dir = scratch("transcriptresume");
+        paused(&r, &dir);
+        r.sessions.reply("s1", "and then?").unwrap();
+        let page = r.sessions.transcript("s1").unwrap();
+        assert!(matches!(&page.entries[0].entry, Entry::UserPrompt { text, .. } if text == "and then?"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    mod notify {
+        use super::*;
+        use crate::notify::NoticeKind;
+
+        fn kinds(r: &Rig) -> Vec<NoticeKind> {
+            r.notices.lock().unwrap().iter().map(|(_, k)| *k).collect()
+        }
+
+        #[test]
+        fn a_session_walks_through_its_notices() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            assert!(kinds(&r).is_empty(), "starting to working is silent");
+            r.feed(PERM);
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput]);
+            let name = std::env::temp_dir().file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(r.notices.lock().unwrap()[0].0, name, "the project name goes with it");
+            let item = r.sessions.list_inbox().remove(0);
+            r.sessions.answer_permission(&item.id, Decision::Allow, None).unwrap();
+            assert_eq!(kinds(&r).len(), 1, "answering notifies nobody");
+            r.feed(DONE);
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput, NoticeKind::Finished]);
+            r.sessions.reply(&s.id, "more").unwrap();
+            r.feed(r#"{"type":"result","subtype":"error","is_error":true,"result":"boom"}"#);
+            assert_eq!(kinds(&r).last(), Some(&NoticeKind::Errored));
+        }
+
+        #[test]
+        fn a_second_request_while_waiting_is_silent() {
+            let (r, p) = rig();
+            r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.feed(PERM);
+            r.feed(&PERM.replace("r-1", "r-2"));
+            assert_eq!(kinds(&r), [NoticeKind::NeedsInput]);
+        }
+
+        #[test]
+        fn a_crash_notifies_but_stop_does_not() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            assert_eq!(kinds(&r), [NoticeKind::Failed]);
+
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.sessions.stop(&s.id).unwrap();
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            assert!(kinds(&r).is_empty(), "a stop is the user's own act");
+        }
+
+        #[test]
+        fn restore_notifies_nothing() {
+            let (r, _) = rig();
+            let dir = scratch("notifyrestore");
+            r.sessions.restore(Snapshot {
+                schema: store::SCHEMA,
+                revision: 1,
+                next_session: 2,
+                next_project: 1,
+                projects: vec![crate::projects::StoredProject { id: "p1".into(), name: "proj".into(), path: dir.clone() }],
+                sessions: vec![
+                    stored_session("s1", SessionStatus::WaitingPermission, vec![open_permission("s1-i1", "s1")], 1),
+                    stored_session("s2", SessionStatus::Failed, vec![], 0),
+                    stored_session("s3", SessionStatus::Idle, vec![finished_item("s3-i1", "s3")], 1),
+                ],
+            });
+            assert!(r.notices.lock().unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn shutdown_notifies_nothing() {
+            let (r, p) = rig();
+            let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+            r.feed(INIT);
+            r.sessions.shutdown();
+            // The kill shows up as an exit, and late lines may still arrive.
+            r.sessions.on_output(&s.id, Output::Exit(Some(1)));
+            r.feed(PERM);
+            r.feed(DONE);
+            assert!(r.notices.lock().unwrap().is_empty());
+        }
     }
 
 }

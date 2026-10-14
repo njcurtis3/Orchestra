@@ -13,6 +13,7 @@ import { initialState, reducer } from "./state";
 import type { Project } from "./types";
 import { Inbox } from "./components/Inbox";
 import { NewSession } from "./components/NewSession";
+import { SessionDetail } from "./components/SessionDetail";
 import { SessionList } from "./components/SessionList";
 import "./App.css";
 
@@ -72,6 +73,8 @@ function App() {
     }
   }
 
+  const selectedSession = state.sessions.find((s) => s.id === state.selected);
+
   return (
     <div className="app">
       <header className="app-header">
@@ -99,8 +102,22 @@ function App() {
         </div>
       )}
       <main className="columns">
-        <SessionList sessions={state.sessions} onError={fail} />
-        <Inbox items={state.inbox} onError={fail} />
+        <SessionList
+          sessions={state.sessions}
+          selected={state.selected}
+          onSelect={(id) => dispatch({ type: "select-session", id })}
+          onError={fail}
+        />
+        {selectedSession ? (
+          <SessionDetail
+            key={selectedSession.id}
+            session={selectedSession}
+            onBack={() => dispatch({ type: "select-session", id: null })}
+            onError={fail}
+          />
+        ) : (
+          <Inbox items={state.inbox} onError={fail} />
+        )}
       </main>
     </div>
   );

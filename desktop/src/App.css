@@ -234,6 +234,45 @@ fieldset {
   border: 1px dashed #b38a00;
 }
 
+.linklike {
+  padding: 0;
+  min-height: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-align: left;
+}
+
+.card.selected {
+  border-color: #2563eb;
+}
+
+.detail h2 {
+  margin: 0;
+}
+
+.cost {
+  margin: 8px 0;
+}
+
+.transcript {
+  margin: 8px 0;
+}
+
+.entry summary {
+  cursor: pointer;
+}
+
+.prompt {
+  margin-top: 8px;
+}
+
+.prompt textarea {
+  width: 100%;
+}
+
 @media (min-width: 800px) {
   .columns {
     flex-direction: row;
