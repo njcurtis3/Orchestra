@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { startSession } from "../ipc";
-import { MAX_TEXT_BYTES, MODELS, PERMISSION_MODES, type Model, type PermissionMode, type Project } from "../types";
+import { createTask, startSession } from "../ipc";
+import { MAX_TEXT_BYTES, MODELS, PERMISSION_MODES, type Model, type PermissionMode, type Project, type TaskSummary } from "../types";
 
 const MODE_LABELS: Record<PermissionMode, string> = {
   manual: "Manual",
@@ -8,14 +8,16 @@ const MODE_LABELS: Record<PermissionMode, string> = {
   plan: "Plan",
 };
 
-type Props = { projects: Project[]; onError: (e: unknown) => void };
+type Props = { projects: Project[]; onTask: (t: TaskSummary) => void; onError: (e: unknown) => void };
 
-export function NewSession({ projects, onError }: Props) {
+export function NewSession({ projects, onTask, onError }: Props) {
   const [projectId, setProjectId] = useState("");
   const [prompt, setPrompt] = useState("");
   // "" is Default: no flag, so claude uses its own setting.
   const [model, setModel] = useState<Model | "">("");
   const [mode, setMode] = useState<PermissionMode | "">("");
+  // A task runs in its own git worktree of the project and waits in a queue.
+  const [asTask, setAsTask] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const selected = projectId || projects[0]?.id || "";
@@ -27,7 +29,8 @@ export function NewSession({ projects, onError }: Props) {
     if (!valid || busy) return;
     setBusy(true);
     try {
-      await startSession(selected, prompt, model || null, mode || null);
+      if (asTask) onTask(await createTask(selected, prompt, model || null, mode || null));
+      else await startSession(selected, prompt, model || null, mode || null);
       setPrompt("");
     } catch (err) {
       onError(err);
@@ -80,8 +83,12 @@ export function NewSession({ projects, onError }: Props) {
           placeholder="What should Claude do?"
         />
       </label>
+      <label className="option">
+        <input type="checkbox" checked={asTask} onChange={(e) => setAsTask(e.target.checked)} />
+        Run as task (own worktree)
+      </label>
       <button type="submit" disabled={!valid || busy}>
-        Start session
+        {asTask ? "Queue task" : "Start session"}
       </button>
       {bytes > MAX_TEXT_BYTES && <p className="hint">Prompt is too long.</p>}
     </form>

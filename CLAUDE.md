@@ -27,7 +27,8 @@ their own.
 ## Commands
 
 Prerequisites: Node 22+, and for the desktop app a Rust toolchain (`rustup`) plus the
-Tauri Windows prerequisites (MSVC build tools, WebView2).
+Tauri Windows prerequisites (MSVC build tools, WebView2) and Git (Git for Windows; tasks
+run in git worktrees, plain sessions do not need it).
 
 ```bash
 # desktop
@@ -93,7 +94,10 @@ and allowed to drift.
   `..` and absolute paths. Errors do not leak absolute paths or secrets.
   One recorded exception: an absolute project folder chosen in the native dialog is stored
   by Rust in `app_data_dir/state.json` (with the sessions and inbox), never accepted from or
-  sent to the frontend, and re-validated with `is_dir` on load.
+  sent to the frontend, and re-validated with `is_dir` on load. It extends to task
+  worktrees: Rust derives `app_data_dir/worktrees/<project id>/<task id>` itself, stores it
+  in `state.json`, never sends it over IPC, and on load re-checks it with `is_dir` and a
+  containment check (inside `app_data_dir/worktrees`, no `..`, links resolved) before any use.
 - **Window state persists** (`tauri-plugin-window-state`, registered on the builder under
   `cfg(desktop)`; the frontend never calls it, so no capability is granted). The plugin
   restores size and position; `src/window.rs` then checks the title bar is reachable on a

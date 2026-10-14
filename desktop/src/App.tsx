@@ -3,18 +3,22 @@ import {
   listInbox,
   listProjects,
   listSessions,
+  listTasks,
   onInboxUpdated,
   onSessionUpdated,
+  onTaskUpdated,
   pickProject,
   storageStatus,
   type StorageStatus,
 } from "./ipc";
 import { initialState, reducer } from "./state";
-import type { Project } from "./types";
+import type { Project, TaskSummary } from "./types";
 import { Inbox } from "./components/Inbox";
 import { NewSession } from "./components/NewSession";
 import { SessionDetail } from "./components/SessionDetail";
 import { SessionList } from "./components/SessionList";
+import { TaskDetail } from "./components/TaskDetail";
+import { TaskList } from "./components/TaskList";
 import "./App.css";
 
 export function errText(e: unknown): string {
@@ -37,21 +41,25 @@ function App() {
       try {
         const u1 = await onSessionUpdated((session) => dispatch({ type: "session-updated", session }), fail);
         const u2 = await onInboxUpdated((items) => dispatch({ type: "inbox-updated", items }), fail);
+        const u3 = await onTaskUpdated((task) => dispatch({ type: "task-updated", task }), fail);
         if (cancelled) {
           u1();
           u2();
+          u3();
           return;
         }
-        unlisten.push(u1, u2);
-        const [sessions, items, projs, store] = await Promise.all([
+        unlisten.push(u1, u2, u3);
+        const [sessions, items, tasks, projs, store] = await Promise.all([
           listSessions(),
           listInbox(),
+          listTasks(fail),
           listProjects(),
           storageStatus(),
         ]);
         if (cancelled) return;
         dispatch({ type: "sessions-loaded", sessions });
         dispatch({ type: "inbox-loaded", items });
+        dispatch({ type: "tasks-loaded", tasks });
         setProjects(projs);
         setStorage(store);
       } catch (e) {
@@ -74,6 +82,10 @@ function App() {
   }
 
   const selectedSession = state.sessions.find((s) => s.id === state.selected);
+  const selectedTask = state.tasks.find((t) => t.id === state.selectedTask);
+  // A created task is queued; an event may already say more, so an existing copy wins.
+  const addTask = useCallback((task: TaskSummary) => dispatch({ type: "tasks-loaded", tasks: [task] }), []);
+  const upsertTask = useCallback((task: TaskSummary) => dispatch({ type: "task-updated", task }), []);
 
   return (
     <div className="app">
@@ -82,7 +94,7 @@ function App() {
         <button type="button" onClick={openProject}>
           Open project
         </button>
-        <NewSession projects={projects} onError={fail} />
+        <NewSession projects={projects} onTask={addTask} onError={fail} />
       </header>
       {!storage.ok && (
         <div className="banner" role="alert">
@@ -108,7 +120,23 @@ function App() {
           onSelect={(id) => dispatch({ type: "select-session", id })}
           onError={fail}
         />
-        {selectedSession ? (
+        <TaskList
+          tasks={state.tasks}
+          selected={state.selectedTask}
+          onSelect={(id) => dispatch({ type: "select-task", id })}
+          onTask={upsertTask}
+          onError={fail}
+        />
+        {selectedTask ? (
+          <TaskDetail
+            key={selectedTask.id}
+            task={selectedTask}
+            hasSession={state.sessions.some((s) => s.id === selectedTask.session_id)}
+            onOpenSession={(id) => dispatch({ type: "select-session", id })}
+            onTask={upsertTask}
+            onBack={() => dispatch({ type: "select-task", id: null })}
+          />
+        ) : selectedSession ? (
           <SessionDetail
             key={selectedSession.id}
             session={selectedSession}

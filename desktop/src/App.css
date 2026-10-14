@@ -350,3 +350,127 @@ fieldset {
     color: #fbd0d0;
   }
 }
+
+/* Tasks */
+.task-group {
+  margin-bottom: 12px;
+}
+
+.task-group h3,
+.review h3,
+.review h4 {
+  margin: 8px 0 4px;
+  font-size: 0.95rem;
+}
+
+.task-group summary {
+  cursor: pointer;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.task-queued {
+  background: #e3e3ea;
+}
+
+.task-running {
+  background: #cfe0ff;
+}
+
+.task-needs_input,
+.task-landing {
+  background: #ffe9a8;
+}
+
+.task-done,
+.task-landed {
+  background: #cdeed6;
+}
+
+.task-error,
+.task-cleanup_pending {
+  background: #f8c9c9;
+}
+
+.task-discarded {
+  background: #e3dcf5;
+}
+
+.confirm {
+  margin: 8px 0;
+  border-color: #b38a00;
+}
+
+.files li {
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.commit-body {
+  max-height: 12rem;
+  margin: 4px 0 0;
+}
+
+pre.diff {
+  max-height: 32rem;
+  white-space: pre;
+  overflow: auto;
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+.diff-add {
+  background: #d6f2dc;
+}
+
+.diff-del {
+  background: #f8d4d4;
+}
+
+.diff-hunk {
+  background: #dfe6f7;
+}
+
+.diff-head {
+  font-weight: 700;
+}
+
+@media (prefers-color-scheme: dark) {
+  .task-queued {
+    background: #3a3a42;
+  }
+
+  .task-running {
+    background: #1d3a66;
+  }
+
+  .task-needs_input,
+  .task-landing {
+    background: #66511a;
+  }
+
+  .task-done,
+  .task-landed {
+    background: #1d4a2a;
+  }
+
+  .task-error,
+  .task-cleanup_pending {
+    background: #662020;
+  }
+
+  .task-discarded {
+    background: #3a3060;
+  }
+
+  .diff-add {
+    background: #14361e;
+  }
+
+  .diff-del {
+    background: #4a1a1a;
+  }
+
+  .diff-hunk {
+    background: #1d2a48;
+  }
+}

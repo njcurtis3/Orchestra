@@ -1,17 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  DIFF_FILE_STATUSES,
   INBOX_KINDS,
   MODELS,
   PERMISSION_MODES,
   SESSION_STATUSES,
+  TASK_STATUSES,
   type Answer,
+  type CommitView,
+  type DiffFile,
   type InboxItem,
   type Model,
   type PermissionMode,
   type Project,
   type Question,
   type SessionSummary,
+  type TaskDiff,
+  type TaskSummary,
   type TranscriptBatch,
   type TranscriptPage,
   type TranscriptRecord,
@@ -189,6 +195,66 @@ export function decodeTranscriptBatch(v: unknown): TranscriptBatch {
   return { session_id: str(o, "session_id"), entries: decodeTranscriptEntries(o.entries) };
 }
 
+// Only the listed fields are read, so an extra field (a path-like one, say) never reaches
+// the app. An unknown status throws and the caller drops the task.
+export function decodeTask(v: unknown): TaskSummary {
+  const o = obj(v, "task");
+  return {
+    id: str(o, "id"),
+    project_id: str(o, "project_id"),
+    project_name: str(o, "project_name"),
+    status: oneOf(o, "status", TASK_STATUSES),
+    title: str(o, "title"),
+    created_at: num(o, "created_at"),
+    session_id: strOrNull(o, "session_id"),
+    branch: strOrNull(o, "branch"),
+    base_branch: str(o, "base_branch"),
+    note: strOrNull(o, "note"),
+    last_turn_error: bool(o, "last_turn_error"),
+    session_over: bool(o, "session_over"),
+  };
+}
+
+function decodeDiffFile(v: unknown): DiffFile {
+  const o = obj(v, "diff file");
+  return {
+    path: str(o, "path"),
+    status: oneOf(o, "status", DIFF_FILE_STATUSES),
+    added: num(o, "added"),
+    removed: num(o, "removed"),
+    binary: bool(o, "binary"),
+  };
+}
+
+function decodeCommit(v: unknown): CommitView {
+  const o = obj(v, "commit");
+  return { id: str(o, "id"), subject: str(o, "subject"), body: str(o, "body") };
+}
+
+export function decodeTaskDiff(v: unknown): TaskDiff {
+  const o = obj(v, "task diff");
+  return {
+    files: arr(o.files, "files").map(decodeDiffFile),
+    files_truncated: bool(o, "files_truncated"),
+    patch: str(o, "patch"),
+    truncated: bool(o, "truncated"),
+    commits: arr(o.commits, "commits").map(decodeCommit),
+    base_branch: str(o, "base_branch"),
+  };
+}
+
+// One bad task is dropped, not the whole list. Each drop is reported through onDrop.
+export function decodeTasks(v: unknown, onDrop: (e: unknown) => void = () => {}): TaskSummary[] {
+  return arr(v, "tasks").flatMap((x) => {
+    try {
+      return [decodeTask(x)];
+    } catch (e) {
+      onDrop(e);
+      return [];
+    }
+  });
+}
+
 // Whether history was loaded and is being saved. Carries no path.
 export type StorageStatus =
   | { ok: true }
@@ -248,6 +314,39 @@ export async function stopSession(sessionId: string): Promise<void> {
   await invoke<void>("stop_session", { args: { session_id: sessionId } });
 }
 
+export async function createTask(
+  projectId: string,
+  prompt: string,
+  model: Model | null = null,
+  permissionMode: PermissionMode | null = null,
+): Promise<TaskSummary> {
+  const args = {
+    project_id: projectId,
+    prompt,
+    ...(model && { model }),
+    ...(permissionMode && { permission_mode: permissionMode }),
+  };
+  return decodeTask(await invoke<unknown>("create_task", { args }));
+}
+export async function listTasks(onDrop?: (e: unknown) => void): Promise<TaskSummary[]> {
+  return decodeTasks(await invoke<unknown>("list_tasks"), onDrop);
+}
+export async function cancelTask(taskId: string): Promise<void> {
+  await invoke<void>("cancel_task", { args: { task_id: taskId } });
+}
+export async function getTaskDiff(taskId: string): Promise<TaskDiff> {
+  return decodeTaskDiff(await invoke<unknown>("get_task_diff", { args: { task_id: taskId } }));
+}
+export async function landTask(taskId: string): Promise<TaskSummary> {
+  return decodeTask(await invoke<unknown>("land_task", { args: { task_id: taskId } }));
+}
+export async function discardTask(taskId: string): Promise<TaskSummary> {
+  return decodeTask(await invoke<unknown>("discard_task", { args: { task_id: taskId } }));
+}
+export async function retryCleanup(taskId: string): Promise<TaskSummary> {
+  return decodeTask(await invoke<unknown>("retry_cleanup", { args: { task_id: taskId } }));
+}
+
 // A payload that fails to decode is dropped (reported via onError), never applied.
 export function onSessionUpdated(
   cb: (s: SessionSummary) => void,
@@ -280,6 +379,18 @@ export function onTranscriptAppended(
   return listen<unknown>("transcript-appended", (e) => {
     try {
       cb(decodeTranscriptBatch(e.payload));
+    } catch (err) {
+      onError(err);
+    }
+  });
+}
+export function onTaskUpdated(
+  cb: (t: TaskSummary) => void,
+  onError: (e: unknown) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("task-updated", (e) => {
+    try {
+      cb(decodeTask(e.payload));
     } catch (err) {
       onError(err);
     }

@@ -1,4 +1,5 @@
 mod commands;
+mod git;
 mod notify;
 mod projects;
 mod session;
@@ -40,12 +41,18 @@ pub fn run() {
                 (Some(dir), Some(_)) => transcript::TranscriptStore::disk(dir.join("transcripts")),
                 _ => transcript::TranscriptStore::memory(),
             };
+            // Task worktrees live under the app data dir, nowhere near the projects.
+            let worktree_base = match &data_dir {
+                Some(dir) => dir.join("worktrees"),
+                None => std::env::temp_dir().join("orchestra-worktrees"),
+            };
             let sessions: AppSessions = Sessions::with_writer(
                 Box::new(move |event| {
                     let _ = match event {
                         Event::SessionUpdated(s) => handle.emit("session-updated", s),
                         Event::InboxUpdated(items) => handle.emit("inbox-updated", items),
                         Event::TranscriptAppended(batch) => handle.emit("transcript-appended", batch),
+                        Event::TaskUpdated(task) => handle.emit("task-updated", task),
                     };
                 }),
                 Box::new(process::spawn),
@@ -65,10 +72,15 @@ pub fn run() {
                 }),
                 writer,
                 transcripts,
+                worktree_base,
             );
             if let Some(snapshot) = snapshot {
                 sessions.restore(snapshot);
             }
+            // Restore spawns nothing; queued tasks start now, off the setup thread.
+            sessions.pump_in_background();
+            // Cleanups left pending get one more try now that no child can be holding a folder.
+            sessions.retry_pending_in_background();
             app.manage(sessions);
             app.manage(status);
             Ok(())
@@ -81,6 +93,13 @@ pub fn run() {
             commands::list_inbox,
             commands::answer,
             commands::stop_session,
+            commands::create_task,
+            commands::list_tasks,
+            commands::cancel_task,
+            commands::get_task_diff,
+            commands::land_task,
+            commands::discard_task,
+            commands::retry_cleanup,
             commands::get_transcript,
             commands::storage_status,
         ])
