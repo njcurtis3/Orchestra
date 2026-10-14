@@ -18,6 +18,9 @@
   <img src="https://img.shields.io/badge/agent-Claude%20Code-8f8c84.svg?style=flat-square" alt="Claude Code" style="height: 20px;">
   <img src="https://img.shields.io/badge/mobile-Expo%20(Android)-8f8c84.svg?style=flat-square&logo=expo&logoColor=white" alt="Expo, Android" style="height: 20px;">
   <img src="https://img.shields.io/badge/status-pre--alpha-c9a227.svg?style=flat-square" alt="status: pre-alpha" style="height: 20px;">
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-all%20rights%20reserved-8f8c84.svg?style=flat-square" alt="license: all rights reserved" style="height: 20px;">
+  </a>
 </h4>
 
 <p align="center">
@@ -175,4 +178,8 @@ workspace.
 
 ## License
 
-No license has been chosen yet. Until one is, all rights are reserved.
+Copyright (c) 2026 Nathan Curtis. All rights reserved.
+
+Orchestra is proprietary. It may not be copied, reproduced, modified or
+distributed, in whole or in part, without Nathan Curtis's prior written
+consent. See [LICENSE](LICENSE).

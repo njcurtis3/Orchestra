@@ -2,7 +2,9 @@
 name = "orchestra"
 version = "0.1.0"
 description = "Orchestra desktop: command center for coding agents"
-authors = ["njcurtis3"]
+authors = ["Nathan Curtis"]
+license-file = "../../LICENSE"
+publish = false
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
