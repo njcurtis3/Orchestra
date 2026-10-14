@@ -11,6 +11,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 /// Resolved on PATH by std: no shell, no `.cmd` shim.
 const GIT: &str = "git";
 
@@ -321,6 +323,314 @@ pub fn worktree_remove(repo: &Path, base: &Path, path: &Path) -> Result<(), GitE
     removed.map(|_| ())
 }
 
+/// `git worktree prune`: forget worktrees whose folder is gone.
+pub fn worktree_prune(repo: &Path) -> Result<(), GitError> {
+    run_ok(repo, &["worktree", "prune"], SMALL_CAP, TIMEOUT).map(|_| ())
+}
+
+/// Remove an empty folder under `base`, never recursively. This finishes a removal that
+/// git left half done (the checkout deleted and unregistered, the empty folder still there).
+/// `path` must pass `is_within`; a folder with anything in it is left alone.
+pub fn remove_empty_dir(base: &Path, path: &Path) -> Result<(), GitError> {
+    if !is_within(base, path) {
+        return Err(GitError::Invalid("the worktree path is outside the worktree folder"));
+    }
+    std::fs::remove_dir(path).map_err(|_| GitError::Io)
+}
+
+/// Largest patch handed to the frontend (gate G10), cut on a line boundary.
+pub const DIFF_CAP_BYTES: usize = 1024 * 1024;
+/// Most files listed for one diff.
+pub const MAX_DIFF_FILES: usize = 5000;
+/// Longest commit body kept for display.
+pub const BODY_CAP_BYTES: usize = 4096;
+/// Room for the file list and the commit log; more than this is refused, not guessed at.
+const LIST_CAP: usize = 4 * 1024 * 1024;
+
+/// Stage everything in the work tree, new files included.
+pub fn stage_all(worktree: &Path) -> Result<(), GitError> {
+    run_ok(worktree, &["add", "-A"], SMALL_CAP, LONG_TIMEOUT).map(|_| ())
+}
+
+/// Something is staged (`diff --cached --quiet` exits 1).
+pub fn has_staged(worktree: &Path) -> Result<bool, GitError> {
+    match run(worktree, &["diff", "--cached", "--quiet"], SMALL_CAP, TIMEOUT)?.code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        code => Err(GitError::Failed(code)),
+    }
+}
+
+/// Commit what is staged. Hooks run. No `--author` and no trailer: the identity is the one
+/// configured for the repository.
+pub fn commit(worktree: &Path, message: &str) -> Result<(), GitError> {
+    run_ok(worktree, &["commit", "-m", message], SMALL_CAP, LONG_TIMEOUT).map(|_| ())
+}
+
+/// No tracked file is modified or staged. Untracked files do not count.
+pub fn is_clean_tracked(repo: &Path) -> Result<bool, GitError> {
+    let out = run_ok(repo, &["status", "--porcelain", "--untracked-files=no"], SMALL_CAP, TIMEOUT)?;
+    Ok(out.stdout.is_empty() && !out.truncated)
+}
+
+/// The branch HEAD is on; an error when HEAD is detached.
+pub fn current_branch(repo: &Path) -> Result<String, GitError> {
+    Ok(run_ok(repo, &["symbolic-ref", "--short", "HEAD"], SMALL_CAP, TIMEOUT)?.text())
+}
+
+pub fn head_commit(repo: &Path) -> Result<CommitId, GitError> {
+    CommitId::parse(&run_ok(repo, &["rev-parse", "--verify", "HEAD"], SMALL_CAP, TIMEOUT)?.text())
+}
+
+/// How many commits `branch` has beyond `base`.
+pub fn commits_ahead(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<usize, GitError> {
+    let range = format!("{}..refs/heads/{}", base.as_str(), branch.as_str());
+    let out = run_ok(repo, &["rev-list", "--count", &range], SMALL_CAP, TIMEOUT)?;
+    out.text().parse().map_err(|_| GitError::Io)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    /// The merge stopped on conflicts and was aborted; nothing changed in the checkout.
+    Conflict,
+}
+
+/// `merge --no-ff --no-edit -m <message> <branch>` in `repo` (gate G3). A failed merge is
+/// aborted, so no merge is ever left in progress. Hooks run.
+pub fn merge(repo: &Path, branch: &TaskBranch, message: &str) -> Result<MergeOutcome, GitError> {
+    let args = ["merge", "--no-ff", "--no-edit", "-m", message, branch.as_str()];
+    let result = run(repo, &args, SMALL_CAP, LONG_TIMEOUT);
+    if matches!(&result, Ok(out) if out.success()) {
+        return Ok(MergeOutcome::Merged);
+    }
+    let in_progress = run(repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], SMALL_CAP, TIMEOUT)
+        .map(|o| o.success())
+        .unwrap_or(false);
+    let _ = run(repo, &["merge", "--abort"], SMALL_CAP, TIMEOUT);
+    match result {
+        Ok(_) if in_progress => Ok(MergeOutcome::Conflict),
+        Ok(out) => Err(GitError::Failed(out.code)),
+        Err(e) => Err(e),
+    }
+}
+
+/// `branch -d` (merged only) or `-D`. `branch` is a task branch, so it cannot be an option.
+pub fn branch_delete(repo: &Path, branch: &TaskBranch, force: bool) -> Result<(), GitError> {
+    let flag = if force { "-D" } else { "-d" };
+    run_ok(repo, &["branch", flag, branch.as_str()], SMALL_CAP, TIMEOUT).map(|_| ())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffFile {
+    pub path: String,
+    /// `added`, `modified` or `deleted`.
+    pub status: &'static str,
+    pub added: u64,
+    pub removed: u64,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Diff {
+    pub files: Vec<DiffFile>,
+    /// More files changed than `MAX_DIFF_FILES`.
+    pub files_truncated: bool,
+    pub patch: String,
+    /// The patch was cut at `cap` bytes.
+    pub truncated: bool,
+}
+
+/// What is staged in `worktree` against `base`. Call `stage_all` first. The file list comes
+/// from `--numstat`, so binary files show up as binary with no patch text.
+pub fn diff(worktree: &Path, base: &CommitId, cap: usize) -> Result<Diff, GitError> {
+    const COMMON: [&str; 6] = ["diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames"];
+    let call = |extra: &[&str], cap: usize, timeout: Duration| {
+        let mut args: Vec<&str> = COMMON.to_vec();
+        args.extend_from_slice(extra);
+        args.push(base.as_str());
+        args.push("--");
+        run_ok(worktree, &args, cap, timeout)
+    };
+    let names = call(&["--name-status", "-z"], LIST_CAP, TIMEOUT)?;
+    let numstat = call(&["--numstat", "-z"], LIST_CAP, TIMEOUT)?;
+    let patch = call(&[], cap, LONG_TIMEOUT)?;
+
+    let mut status = std::collections::HashMap::new();
+    let mut fields = String::from_utf8_lossy(&names.stdout).into_owned();
+    if names.truncated {
+        fields.truncate(fields.rfind('\0').unwrap_or(0));
+    }
+    let mut it = fields.split('\0');
+    while let (Some(code), Some(path)) = (it.next(), it.next()) {
+        let s = match code.chars().next() {
+            Some('A') => "added",
+            Some('D') => "deleted",
+            _ => "modified",
+        };
+        status.insert(path.to_string(), s);
+    }
+
+    let text = String::from_utf8_lossy(&numstat.stdout).into_owned();
+    let mut records: Vec<&str> = text.split('\0').collect();
+    // The last piece is empty after a final NUL, or a torn record when the output was cut.
+    records.pop();
+    let mut files = Vec::new();
+    let mut files_truncated = numstat.truncated;
+    for rec in records {
+        let mut parts = rec.splitn(3, '\t');
+        let (Some(a), Some(r), Some(path)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if files.len() >= MAX_DIFF_FILES {
+            files_truncated = true;
+            break;
+        }
+        files.push(DiffFile {
+            path: path.to_string(),
+            status: status.get(path).copied().unwrap_or("modified"),
+            added: a.parse().unwrap_or(0),
+            removed: r.parse().unwrap_or(0),
+            binary: a == "-" && r == "-",
+        });
+    }
+
+    let mut bytes = patch.stdout;
+    if patch.truncated {
+        let keep = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        bytes.truncate(keep);
+    }
+    Ok(Diff {
+        files,
+        files_truncated,
+        patch: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated: patch.truncated,
+    })
+}
+
+/// One commit of `base..branch`. `message` is the whole message, for the attribution
+/// check; `body` is the capped part that is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub id: String,
+    pub subject: String,
+    pub body: String,
+    pub message: String,
+    pub author_email: String,
+    pub committer_email: String,
+}
+
+const SHORT_ID: usize = 7;
+const FIELD: char = '\u{1f}';
+const RECORD: char = '\u{1e}';
+
+impl CommitInfo {
+    pub fn short_id(&self) -> &str {
+        &self.id[..SHORT_ID.min(self.id.len())]
+    }
+
+    pub fn carries_claude_attribution(&self) -> bool {
+        carries_claude_attribution(&self.author_email, &self.committer_email, &self.message)
+    }
+}
+
+/// Every commit in `base..refs/heads/<branch>`, newest first. Output that does not fit
+/// `LIST_CAP` is an error: a commit that was not read cannot be cleared.
+pub fn commits(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<Vec<CommitInfo>, GitError> {
+    let range = format!("{}..refs/heads/{}", base.as_str(), branch.as_str());
+    let out = run_ok(repo, &["log", "--no-color", "--format=%H%x1f%ae%x1f%ce%x1f%B%x1e", &range], LIST_CAP, TIMEOUT)?;
+    if out.truncated {
+        return Err(GitError::Invalid("too many commits to check"));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut list: Vec<CommitInfo> = Vec::new();
+    for chunk in text.split(RECORD) {
+        let chunk = chunk.trim_start_matches('\n');
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut f = chunk.splitn(4, FIELD);
+        if let (Some(id), Some(ae), Some(ce), Some(msg)) = (f.next(), f.next(), f.next(), f.next()) {
+            if CommitId::parse(id).is_ok() {
+                let message = msg.trim_end().to_string();
+                let (subject, body) = match message.split_once('\n') {
+                    Some((s, b)) => (s.to_string(), b.trim().to_string()),
+                    None => (message.clone(), String::new()),
+                };
+                list.push(CommitInfo {
+                    id: id.to_string(),
+                    subject,
+                    body: cap_bytes(&body, BODY_CAP_BYTES),
+                    message,
+                    author_email: ae.to_string(),
+                    committer_email: ce.to_string(),
+                });
+                continue;
+            }
+        }
+        // Not a record of ours: a message that held the separator. It stays with the
+        // commit before it, so the attribution check still reads it.
+        if let Some(last) = list.last_mut() {
+            last.message.push('\n');
+            last.message.push_str(chunk);
+        }
+    }
+    Ok(list)
+}
+
+/// `s` cut to at most `max` bytes on a character boundary.
+fn cap_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// True when a commit carries Claude attribution: a `Co-Authored-By:` line naming Claude or
+/// Anthropic, a `Claude-Session:` line, a "Generated with [Claude Code]" line, a link to a
+/// Claude Code session, or the `noreply@anthropic.com` address as author, committer or in
+/// the message. Case-insensitive. A message that only mentions Claude in prose is clean.
+///
+/// The list is the owner's rule for every repo (commits are the owner's alone), copied
+/// here; nothing reads it from anywhere else.
+pub fn carries_claude_attribution(author_email: &str, committer_email: &str, message: &str) -> bool {
+    const NOREPLY: &str = "noreply@anthropic.com";
+    if author_email.trim().eq_ignore_ascii_case(NOREPLY) || committer_email.trim().eq_ignore_ascii_case(NOREPLY) {
+        return true;
+    }
+    let text = message.to_lowercase();
+    if text.contains(NOREPLY) || text.contains("claude.ai/code") || text.contains("claude.com/claude-code") {
+        return true;
+    }
+    text.lines().any(|line| {
+        let line = line.trim();
+        (key_then_colon(line, "co-authored-by") && (line.contains("claude") || line.contains("anthropic")))
+            || key_then_colon(line, "claude-session")
+            || generated_with_claude(line)
+    })
+}
+
+/// `key` starts `line`, then optional blanks, then a colon.
+fn key_then_colon(line: &str, key: &str) -> bool {
+    line.strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with(':'))
+}
+
+/// "generated with", optional blanks and an optional `[`, then "claude".
+fn generated_with_claude(line: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = line[from..].find("generated with") {
+        let rest = line[from + i + "generated with".len()..].trim_start();
+        let rest = rest.strip_prefix('[').map_or(rest, str::trim_start);
+        if rest.starts_with("claude") {
+            return true;
+        }
+        from += i + 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +795,195 @@ mod tests {
         let err = exec(cmd, SMALL_CAP, Duration::from_millis(300)).err().unwrap();
         assert_eq!(err, GitError::Timeout);
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    fn base_of(repo: &Path) -> CommitId {
+        repo_info(repo).unwrap().head_commit
+    }
+
+    #[test]
+    fn diff_is_capped_and_marks_truncated() {
+        let repo = repo_with_commit("diffcap");
+        let base = base_of(&repo);
+        let lines: String = (0..2000).map(|i| format!("line number {i}\n")).collect();
+        std::fs::write(repo.join("big.txt"), &lines).unwrap();
+        stage_all(&repo).unwrap();
+
+        let capped = diff(&repo, &base, 1000).unwrap();
+        assert!(capped.truncated);
+        assert!(capped.patch.len() <= 1000);
+        assert!(capped.patch.ends_with('\n'), "cut on a line boundary");
+        assert!(capped.patch.starts_with("diff --git"));
+        // The file list is whole even though the patch was cut.
+        assert_eq!(capped.files.len(), 1);
+        assert_eq!((capped.files[0].path.as_str(), capped.files[0].added), ("big.txt", 2000));
+
+        let whole = diff(&repo, &base, DIFF_CAP_BYTES).unwrap();
+        assert!(!whole.truncated);
+        assert!(whole.patch.contains("line number 1999"));
+    }
+
+    #[test]
+    fn diff_lists_binary_and_untracked_files() {
+        let repo = repo_with_commit("diffkinds");
+        let base = base_of(&repo);
+        std::fs::write(repo.join("new.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(repo.join("blob.bin"), [0u8, 1, 2, 0, 255, 0]).unwrap();
+        std::fs::write(repo.join("a.txt"), "a changed").unwrap();
+        std::fs::create_dir_all(repo.join("dir")).unwrap();
+        std::fs::write(repo.join("dir").join("deep file.txt"), "x").unwrap();
+        stage_all(&repo).unwrap();
+
+        let d = diff(&repo, &base, DIFF_CAP_BYTES).unwrap();
+        let find = |p: &str| d.files.iter().find(|f| f.path == p).unwrap_or_else(|| panic!("{p} not listed"));
+        let new = find("new.txt");
+        assert_eq!((new.status, new.added, new.removed, new.binary), ("added", 2, 0, false));
+        let blob = find("blob.bin");
+        assert_eq!((blob.status, blob.binary), ("added", true));
+        assert_eq!(find("a.txt").status, "modified");
+        assert_eq!(find("dir/deep file.txt").status, "added");
+        assert!(!d.patch.contains('\0'));
+        assert!(d.patch.contains("Binary files"));
+
+        // A deletion.
+        git(&repo, &["commit", "-m", "second"]);
+        let mid = base_of(&repo);
+        std::fs::remove_file(repo.join("new.txt")).unwrap();
+        stage_all(&repo).unwrap();
+        let d = diff(&repo, &mid, DIFF_CAP_BYTES).unwrap();
+        assert_eq!(d.files.len(), 1);
+        assert_eq!((d.files[0].status, d.files[0].removed), ("deleted", 2));
+    }
+
+    #[test]
+    fn commit_merge_and_branch_delete_roundtrip() {
+        let repo = repo_with_commit("mergeflow");
+        git(&repo, &["config", "user.name", "owner"]);
+        git(&repo, &["config", "user.email", "owner@example.invalid"]);
+        let info = repo_info(&repo).unwrap();
+        let base = scratch("mergeflow-base");
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(&wt).unwrap();
+        assert!(has_staged(&wt).unwrap());
+        commit(&wt, "t1: add b").unwrap();
+        assert!(!has_staged(&wt).unwrap());
+        assert_eq!(commits_ahead(&repo, &info.head_commit, &branch).unwrap(), 1);
+        let list = commits(&repo, &info.head_commit, &branch).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].subject, "t1: add b");
+        assert_eq!(list[0].author_email, "owner@example.invalid");
+        assert!(!list[0].carries_claude_attribution());
+
+        assert!(is_clean_tracked(&repo).unwrap());
+        assert_eq!(merge(&repo, &branch, "merge orchestra task t1: add b").unwrap(), MergeOutcome::Merged);
+        let parents = git(&repo, &["rev-list", "--parents", "-n", "1", "HEAD"]).text();
+        assert_eq!(parents.split_whitespace().count(), 3, "a merge commit, not a fast-forward");
+
+        worktree_remove(&repo, &base, &wt).unwrap();
+        branch_delete(&repo, &branch, false).unwrap();
+        assert!(!branch_exists(&repo, &branch).unwrap());
+    }
+
+    #[test]
+    fn unmerged_branch_needs_force_to_delete() {
+        let repo = repo_with_commit("forcedel");
+        git(&repo, &["config", "user.name", "owner"]);
+        git(&repo, &["config", "user.email", "owner@example.invalid"]);
+        let info = repo_info(&repo).unwrap();
+        let base = scratch("forcedel-base");
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(&wt).unwrap();
+        commit(&wt, "t1: add b").unwrap();
+        worktree_remove(&repo, &base, &wt).unwrap();
+        assert!(branch_delete(&repo, &branch, false).is_err());
+        branch_delete(&repo, &branch, true).unwrap();
+    }
+
+    #[test]
+    fn remove_empty_dir_is_not_recursive_and_stays_inside_base() {
+        let base = scratch("emptydir");
+        let full = base.join("p").join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("keep.txt"), "k").unwrap();
+        assert!(remove_empty_dir(&base, &full).is_err());
+        assert!(full.join("keep.txt").is_file());
+        std::fs::remove_file(full.join("keep.txt")).unwrap();
+        remove_empty_dir(&base, &full).unwrap();
+        assert!(!full.exists());
+
+        let outside = scratch("emptydir-outside");
+        assert!(remove_empty_dir(&base, &outside).is_err());
+        assert!(outside.is_dir(), "a folder outside the base is left alone");
+        assert!(remove_empty_dir(&base, &base).is_err());
+    }
+
+    #[test]
+    fn attribution_detector_flags_each_pattern() {
+        let cases = [
+            "fix\n\nCo-Authored-By: Claude <x@y.z>",
+            "fix\n\nco-authored-by: Claude Sonnet 5.5 <someone@example.org>",
+            "fix\n\nCO-AUTHORED-BY : someone at Anthropic",
+            "fix\n\nClaude-Session: abc",
+            "fix\n\nclaude-session : abc",
+            "fix\n\nGenerated with [Claude Code]",
+            "fix\n\ngenerated with Claude Code",
+            "fix\n\nGENERATED WITH [ CLAUDE CODE ]",
+            "fix\n\nhttps://claude.ai/code/session_1",
+            "fix\n\nsee HTTPS://CLAUDE.AI/CODE/x",
+            "fix\n\nhttps://claude.com/claude-code",
+            "fix\n\nsent by Noreply@Anthropic.com",
+        ];
+        for msg in cases {
+            assert!(carries_claude_attribution("a@b.c", "a@b.c", msg), "{msg:?}");
+        }
+        assert!(carries_claude_attribution("noreply@anthropic.com", "a@b.c", "plain"));
+        assert!(carries_claude_attribution("a@b.c", "NoReply@Anthropic.com", "plain"));
+    }
+
+    #[test]
+    fn attribution_detector_ignores_prose_and_human_coauthors() {
+        let cases = [
+            "add a claude adapter",
+            "Claude handled the retry; I only reworded it",
+            "document how generated code is reviewed",
+            "Co-Authored-By: Ada Lovelace <ada@example.org>",
+            "fix\n\nthis was generated with a script",
+            "the claude-session file is read by the importer",
+            "mention of anthropic in prose, co-authored discussions aside",
+            "",
+        ];
+        for msg in cases {
+            assert!(!carries_claude_attribution("owner@example.org", "owner@example.org", msg), "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn commits_reads_the_whole_message_for_the_check() {
+        let repo = repo_with_commit("longmsg");
+        git(&repo, &["config", "user.name", "owner"]);
+        git(&repo, &["config", "user.email", "owner@example.invalid"]);
+        let info = repo_info(&repo).unwrap();
+        let base = scratch("longmsg-base");
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(&wt).unwrap();
+        // A body longer than the display cap, with the trailer after the cap.
+        let message = format!("t1: x\n\n{}\n\nClaude-Session: abc", "word ".repeat(2000));
+        commit(&wt, &message).unwrap();
+        let list = commits(&repo, &info.head_commit, &branch).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].body.len() <= BODY_CAP_BYTES);
+        assert!(!list[0].body.contains("Claude-Session"), "cut off for display");
+        assert!(list[0].carries_claude_attribution(), "but still found");
     }
 
     #[test]

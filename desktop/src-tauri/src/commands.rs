@@ -9,7 +9,7 @@ use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::projects::Project;
-use crate::session::SessionSummary;
+use crate::session::{SessionSummary, TaskDiff};
 use crate::session::Sessions;
 use crate::session::settings::{Model, PermissionMode, SessionSettings};
 use crate::session::state::{Decision, InboxItem};
@@ -41,6 +41,12 @@ pub struct CreateTaskArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelTaskArgs {
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIdArgs {
     pub task_id: String,
 }
 
@@ -164,6 +170,41 @@ pub async fn cancel_task(args: CancelTaskArgs, sessions: State<'_, AppSessions>)
         .map_err(|_| "cancel task failed".to_string())?
 }
 
+/// The review of a finished task: files, capped patch and commits. Async because git runs.
+#[tauri::command]
+pub async fn get_task_diff(args: TaskIdArgs, sessions: State<'_, AppSessions>) -> Result<TaskDiff, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.get_task_diff(&args.task_id))
+        .await
+        .map_err(|_| "diff task failed".to_string())?
+}
+
+/// Merge a finished task into its base branch. Rust enforces the checks whatever the UI
+/// confirmed. Async because git runs, and a hook may take a while.
+#[tauri::command]
+pub async fn land_task(args: TaskIdArgs, sessions: State<'_, AppSessions>) -> Result<TaskSummary, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.land_task(&args.task_id))
+        .await
+        .map_err(|_| "land task failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn discard_task(args: TaskIdArgs, sessions: State<'_, AppSessions>) -> Result<TaskSummary, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.discard_task(&args.task_id))
+        .await
+        .map_err(|_| "discard task failed".to_string())?
+}
+
+#[tauri::command]
+pub async fn retry_cleanup(args: TaskIdArgs, sessions: State<'_, AppSessions>) -> Result<TaskSummary, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.retry_cleanup(&args.task_id))
+        .await
+        .map_err(|_| "cleanup task failed".to_string())?
+}
+
 /// Async for the same reason as `start_session`: the kill runs on the blocking pool.
 #[tauri::command]
 pub async fn stop_session(args: StopArgs, sessions: State<'_, AppSessions>) -> Result<(), String> {
@@ -217,6 +258,15 @@ mod tests {
         assert!(serde_json::from_value::<CreateTaskArgs>(json!({"project_id":"p1","prompt":"x","model":"haiku"})).is_err());
         assert!(serde_json::from_value::<CancelTaskArgs>(json!({"task_id":"t1","force":true})).is_err());
         assert!(serde_json::from_value::<CancelTaskArgs>(json!({"task_id":"t1"})).is_ok());
+    }
+
+    #[test]
+    fn review_args_take_a_task_id_and_nothing_else() {
+        assert!(serde_json::from_value::<TaskIdArgs>(json!({"task_id":"t1"})).is_ok());
+        for extra in ["path", "branch", "force", "cwd"] {
+            assert!(serde_json::from_value::<TaskIdArgs>(json!({"task_id":"t1", extra: "x"})).is_err());
+        }
+        assert!(serde_json::from_value::<TaskIdArgs>(json!({})).is_err());
     }
 
     #[test]

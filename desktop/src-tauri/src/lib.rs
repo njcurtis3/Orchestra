@@ -79,6 +79,8 @@ pub fn run() {
             }
             // Restore spawns nothing; queued tasks start now, off the setup thread.
             sessions.pump_in_background();
+            // Cleanups left pending get one more try now that no child can be holding a folder.
+            sessions.retry_pending_in_background();
             app.manage(sessions);
             app.manage(status);
             Ok(())
@@ -94,6 +96,10 @@ pub fn run() {
             commands::create_task,
             commands::list_tasks,
             commands::cancel_task,
+            commands::get_task_diff,
+            commands::land_task,
+            commands::discard_task,
+            commands::retry_cleanup,
             commands::get_transcript,
             commands::storage_status,
         ])

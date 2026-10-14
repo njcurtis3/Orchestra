@@ -25,7 +25,7 @@ use process::{Output, Proc, SpawnArgs};
 use settings::{Model, PermissionMode, SessionSettings};
 use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
 use store::{Snapshot, StoredSession, Writer};
-use task::{MAX_RUNNING_TASKS, Task, TaskStatus, TaskSummary};
+use task::{MAX_RUNNING_TASKS, Outcome, Task, TaskStatus, TaskSummary};
 use transcript::{Entry, Record, TranscriptBatch, TranscriptPage, TranscriptStore};
 
 /// Largest prompt, reply or permission message accepted over IPC, in bytes.
@@ -34,6 +34,12 @@ const MAX_ANSWERS: usize = 32;
 const MAX_ANSWER_BYTES: usize = 4096;
 /// How long a retired child gets to release its folder before the queue moves on anyway.
 const CHILD_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// Pauses between the attempts to finish removing a worktree folder.
+#[cfg(not(test))]
+const CLEANUP_BACKOFF_MS: [u64; 5] = [250, 500, 1000, 2000, 2000];
+#[cfg(test)]
+const CLEANUP_BACKOFF_MS: [u64; 5] = [10; 5];
+const BUSY_TASK: &str = "another action is running on this task";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
@@ -183,6 +189,11 @@ impl Inner {
             .is_some_and(|t| matches!(t.status, TaskStatus::Running | TaskStatus::NeedsInput))
     }
 
+    fn task_of_session(&self, session_id: &str) -> Option<&Task> {
+        let tid = self.sessions.get(session_id)?.task_id.as_ref()?;
+        self.tasks.iter().find(|t| &t.id == tid)
+    }
+
     /// Tasks holding a slot of `MAX_RUNNING_TASKS`.
     fn active_tasks(&self) -> usize {
         self.tasks
@@ -266,6 +277,83 @@ struct TaskClaim {
     settings: SessionSettings,
     base_commit: String,
     repo: PathBuf,
+}
+
+/// A commit of a task branch as the review shows it. The id is the short form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitView {
+    pub id: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// What the review shows for a task: the changed files, the capped patch and the commits.
+/// No path leaves Rust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TaskDiff {
+    pub files: Vec<git::DiffFile>,
+    pub files_truncated: bool,
+    pub patch: String,
+    pub truncated: bool,
+    pub commits: Vec<CommitView>,
+    pub base_branch: String,
+}
+
+/// A task as a land, discard or retry sees it, copied out so no lock is held across git.
+struct TaskCtx {
+    status: TaskStatus,
+    repo: Option<PathBuf>,
+    worktree: Option<PathBuf>,
+    branch: Option<String>,
+    base_branch: String,
+    base_commit: String,
+    session_id: Option<String>,
+    title: String,
+    note: Option<String>,
+}
+
+/// Holds `Task::busy` for as long as it lives.
+struct Busy<'a> {
+    sessions: &'a Sessions,
+    task_id: String,
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.sessions.lock();
+        if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == self.task_id) {
+            t.busy = false;
+        }
+    }
+}
+
+/// A git failure as a fixed string: its own message when it is a validation or a missing
+/// git, otherwise `fallback`. Never git's stderr.
+fn git_msg(e: git::GitError, fallback: &str) -> String {
+    match e {
+        git::GitError::Invalid(_) | git::GitError::NotFound | git::GitError::Timeout => e.message().to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+/// The refusal for the first commit that carries Claude attribution, naming its short id.
+fn attribution_refusal(commits: &[git::CommitInfo]) -> Option<String> {
+    commits
+        .iter()
+        .find(|c| c.carries_claude_attribution())
+        .map(|c| format!("commit {} carries Claude attribution; remove it from the branch before landing", c.short_id()))
+}
+
+/// Delete the task branch: `-d` after a land (it is merged), `-D` after a discard. A branch
+/// that is already gone counts as deleted.
+fn remove_branch(repo: &Path, branch: Option<&str>, outcome: Outcome) -> bool {
+    let Some(name) = branch else { return true };
+    let Ok(branch) = git::TaskBranch::parse(name) else { return false };
+    match git::branch_exists(repo, &branch) {
+        Ok(false) => true,
+        Ok(true) => git::branch_delete(repo, &branch, outcome == Outcome::Discarded).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Why a session has no working folder to spawn in.
@@ -394,8 +482,12 @@ impl Sessions {
             task.status = TaskStatus::NeedsInput;
             task.note = Some(task::PAUSED_NOTE.to_string());
         }
-        let needs_worktree =
-            matches!(task.status, TaskStatus::NeedsInput | TaskStatus::Done | TaskStatus::Landing);
+        // A land cut short by closing the app: nothing says how far it got.
+        if task.status == TaskStatus::Landing {
+            task.status = TaskStatus::Done;
+            task.note = Some("Landing was interrupted; check the project, then land again".to_string());
+        }
+        let needs_worktree = matches!(task.status, TaskStatus::NeedsInput | TaskStatus::Done);
         let Some(path) = task.worktree.clone() else {
             if needs_worktree {
                 task.fail("worktree missing");
@@ -577,6 +669,319 @@ impl Sessions {
         self.publish_task(inner, task_id);
         self.pump_in_background();
         Ok(())
+    }
+
+    /// Take a task for one action: it must be in one of `allowed` and not already busy. The
+    /// guard releases it on return.
+    fn begin_task(
+        &self,
+        task_id: &str,
+        allowed: &[TaskStatus],
+        refuse: &'static str,
+    ) -> Result<(TaskCtx, Busy<'_>), String> {
+        let mut inner = self.lock();
+        let project_id = inner.tasks.iter().find(|t| t.id == task_id).ok_or("unknown task")?.project_id.clone();
+        let repo = inner.projects.get(&project_id).map(|e| e.path.clone());
+        let t = inner.tasks.iter_mut().find(|t| t.id == task_id).ok_or("unknown task")?;
+        if t.busy || t.starting {
+            return Err(BUSY_TASK.into());
+        }
+        if !allowed.contains(&t.status) {
+            return Err(refuse.into());
+        }
+        t.busy = true;
+        let ctx = TaskCtx {
+            status: t.status,
+            repo,
+            worktree: t.worktree.clone(),
+            branch: t.branch.clone(),
+            base_branch: t.base_branch.clone(),
+            base_commit: t.base_commit.clone(),
+            session_id: t.session_id.clone(),
+            title: task::title(&t.prompt),
+            note: t.note.clone(),
+        };
+        Ok((ctx, Busy { sessions: self, task_id: task_id.to_string() }))
+    }
+
+    /// Change a task, save it and announce it.
+    fn update_task(&self, task_id: &str, f: impl FnOnce(&mut Task)) -> Option<TaskSummary> {
+        let mut inner = self.lock();
+        let t = inner.tasks.iter_mut().find(|t| t.id == task_id)?;
+        f(t);
+        let summary = t.summary();
+        self.publish_task(inner, task_id);
+        Some(summary)
+    }
+
+    fn task_summary(&self, task_id: &str) -> Result<TaskSummary, String> {
+        self.lock().tasks.iter().find(|t| t.id == task_id).map(Task::summary).ok_or_else(|| "unknown task".to_string())
+    }
+
+    /// The task's worktree, branch and base commit, each checked: the worktree inside the
+    /// worktree folder and present, the names the shapes Rust makes.
+    fn task_refs(&self, ctx: &TaskCtx) -> Result<(PathBuf, git::TaskBranch, git::CommitId), String> {
+        let worktree = ctx.worktree.clone().ok_or("the task worktree no longer exists")?;
+        if !git::is_within(&self.worktree_base, &worktree) || !worktree.is_dir() {
+            return Err(CwdError::Worktree.message().into());
+        }
+        let branch = ctx.branch.as_deref().ok_or("the task has no branch")?;
+        let branch = git::TaskBranch::parse(branch).map_err(|e| e.message().to_string())?;
+        let base = git::CommitId::parse(&ctx.base_commit).map_err(|e| e.message().to_string())?;
+        Ok((worktree, branch, base))
+    }
+
+    /// What the review shows. Stages the worktree (new files included) so the diff is whole.
+    pub fn get_task_diff(&self, task_id: &str) -> Result<TaskDiff, String> {
+        let (ctx, _busy) = self.begin_task(task_id, &[TaskStatus::Done], "only a finished task can be reviewed")?;
+        let repo = ctx.repo.clone().ok_or(CwdError::Project.message())?;
+        let (worktree, branch, base) = self.task_refs(&ctx)?;
+        const FAILED: &str = "could not read the changes of the task";
+        git::stage_all(&worktree).map_err(|e| git_msg(e, FAILED))?;
+        let diff = git::diff(&worktree, &base, git::DIFF_CAP_BYTES).map_err(|e| git_msg(e, FAILED))?;
+        let commits = git::commits(&repo, &base, &branch).map_err(|e| git_msg(e, FAILED))?;
+        Ok(TaskDiff {
+            files: diff.files,
+            files_truncated: diff.files_truncated,
+            patch: diff.patch,
+            truncated: diff.truncated,
+            commits: commits
+                .iter()
+                .map(|c| CommitView { id: c.short_id().to_string(), subject: c.subject.clone(), body: c.body.clone() })
+                .collect(),
+            base_branch: ctx.base_branch,
+        })
+    }
+
+    /// Merge a finished task into the branch it started from (gates G1, G2, G3, G9). A
+    /// refusal changes nothing in the project and leaves the task done. The checks, in
+    /// order: the project is still on the base branch with no tracked change; no commit of
+    /// the task carries Claude attribution; leftover worktree changes are committed by
+    /// Orchestra under the repository identity with no trailer; there is something to land.
+    pub fn land_task(&self, task_id: &str) -> Result<TaskSummary, String> {
+        let (ctx, _busy) = self.begin_task(task_id, &[TaskStatus::Done], "only a finished task can be landed")?;
+        let repo = ctx.repo.clone().ok_or(CwdError::Project.message())?;
+        let (worktree, branch, base) = self.task_refs(&ctx)?;
+        if let Some(sid) = &ctx.session_id {
+            // Nothing may still be writing to the worktree.
+            if self.stop_and_wait(sid, CHILD_EXIT_WAIT) == Ok(false) {
+                return Err("the task is still running; try again".into());
+            }
+        }
+        self.update_task(task_id, |t| t.status = TaskStatus::Landing);
+        let refuse = |msg: String| -> Result<TaskSummary, String> {
+            self.update_task(task_id, |t| t.status = TaskStatus::Done);
+            Err(msg)
+        };
+        const READ: &str = "could not read the changes of the task";
+
+        if let Err(msg) = self.check_checkout(&repo, &ctx.base_branch) {
+            return refuse(msg);
+        }
+        match git::commits(&repo, &base, &branch) {
+            Ok(list) => {
+                if let Some(msg) = attribution_refusal(&list) {
+                    return refuse(msg);
+                }
+            }
+            Err(e) => return refuse(git_msg(e, READ)),
+        }
+
+        let commit_message = format!("{task_id}: {}", ctx.title);
+        let staged = git::stage_all(&worktree).and_then(|_| git::has_staged(&worktree));
+        match staged {
+            Ok(true) => {
+                if git::carries_claude_attribution("", "", &commit_message) {
+                    return refuse("the task title carries Claude attribution; it cannot go in a commit".into());
+                }
+                if let Err(e) = git::commit(&worktree, &commit_message) {
+                    return refuse(git_msg(e, "the commit in the task worktree failed; a hook may have refused it"));
+                }
+                // The identity configured for the repository is on this commit: read it too.
+                match git::commits(&repo, &base, &branch) {
+                    Ok(list) => {
+                        if let Some(msg) = attribution_refusal(&list) {
+                            return refuse(msg);
+                        }
+                    }
+                    Err(e) => return refuse(git_msg(e, READ)),
+                }
+            }
+            Ok(false) => {}
+            Err(e) => return refuse(git_msg(e, READ)),
+        }
+
+        match git::commits_ahead(&repo, &base, &branch) {
+            Ok(0) => return refuse("nothing to land; discard the task instead".into()),
+            Ok(_) => {}
+            Err(e) => return refuse(git_msg(e, READ)),
+        }
+        // The project may have moved while the commit ran: look again right before merging.
+        if let Err(msg) = self.check_checkout(&repo, &ctx.base_branch) {
+            return refuse(msg);
+        }
+        let merge_message = format!("merge orchestra task {task_id}: {}", ctx.title);
+        if git::carries_claude_attribution("", "", &merge_message) {
+            return refuse("the task title carries Claude attribution; it cannot go in a commit".into());
+        }
+        match git::merge(&repo, &branch, &merge_message) {
+            Ok(git::MergeOutcome::Merged) => {}
+            Ok(git::MergeOutcome::Conflict) => {
+                let note = format!("conflicts, merge {} by hand", branch.as_str());
+                self.update_task(task_id, |t| {
+                    t.status = TaskStatus::Done;
+                    t.note = Some(note);
+                });
+                return Err("the merge has conflicts; the branch and the worktree are kept".into());
+            }
+            Err(e) => return refuse(git_msg(e, "the merge failed; nothing was changed")),
+        }
+        let note = match git::head_commit(&repo) {
+            Ok(head) => format!("{} as {}", task::LANDED, &head.as_str()[..7]),
+            Err(_) => task::LANDED.to_string(),
+        };
+        self.run_cleanup(task_id, Outcome::Landed, &note);
+        self.task_summary(task_id)
+    }
+
+    /// The project is on the branch the task started from, with no tracked file changed.
+    fn check_checkout(&self, repo: &Path, base_branch: &str) -> Result<(), String> {
+        const READ: &str = "could not read the state of the project";
+        match git::current_branch(repo) {
+            Ok(b) if b == base_branch => {}
+            Ok(_) | Err(git::GitError::Failed(_)) => {
+                return Err("the project is no longer on the branch the task started from".into());
+            }
+            Err(e) => return Err(git_msg(e, READ)),
+        }
+        match git::is_clean_tracked(repo) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("the project has uncommitted changes to tracked files".into()),
+            Err(e) => Err(git_msg(e, READ)),
+        }
+    }
+
+    /// Throw a task away: the session is stopped, the worktree and the branch are removed.
+    /// A task that has not started is only cancelled.
+    pub fn discard_task(&self, task_id: &str) -> Result<TaskSummary, String> {
+        let allowed = [TaskStatus::Queued, TaskStatus::Done, TaskStatus::Error, TaskStatus::NeedsInput];
+        let (ctx, _busy) = self.begin_task(task_id, &allowed, "this task cannot be discarded now")?;
+        if ctx.status == TaskStatus::Queued {
+            self.update_task(task_id, |t| {
+                t.status = TaskStatus::Discarded;
+                t.note = Some("Cancelled before it started".to_string());
+            });
+            self.pump_in_background();
+            return self.task_summary(task_id);
+        }
+        self.run_cleanup(task_id, Outcome::Discarded, task::DISCARDED);
+        self.pump_in_background();
+        self.task_summary(task_id)
+    }
+
+    /// Try the cleanup of a task in `cleanup_pending` again.
+    pub fn retry_cleanup(&self, task_id: &str) -> Result<TaskSummary, String> {
+        let (ctx, _busy) =
+            self.begin_task(task_id, &[TaskStatus::CleanupPending], "this task has no cleanup waiting")?;
+        let outcome = Outcome::of_note(ctx.note.as_deref());
+        let note = ctx.note.as_deref().unwrap_or("");
+        let note = note.strip_suffix(task::PENDING_SUFFIX).unwrap_or(note);
+        let note = match outcome {
+            Outcome::Landed if note.starts_with(task::LANDED) => note.to_string(),
+            Outcome::Landed => task::LANDED.to_string(),
+            Outcome::Discarded => task::DISCARDED.to_string(),
+        };
+        self.run_cleanup(task_id, outcome, &note);
+        self.task_summary(task_id)
+    }
+
+    /// One retry of every cleanup left pending, for after a restart, when no child of a
+    /// previous run can be alive.
+    pub fn retry_pending(&self) {
+        let ids: Vec<String> = self
+            .lock()
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::CleanupPending)
+            .map(|t| t.id.clone())
+            .collect();
+        for id in ids {
+            let _ = self.retry_cleanup(&id);
+        }
+    }
+
+    /// `retry_pending` on a thread of its own: git runs there.
+    pub fn retry_pending_in_background(&self) {
+        if let Some(this) = self.me.upgrade() {
+            std::thread::spawn(move || this.retry_pending());
+        }
+    }
+
+    /// Remove a task's worktree and branch, and record how it went. The session is stopped
+    /// and waited for before git is asked to remove anything: a child with its folder as
+    /// cwd makes the first `worktree remove` fail after it already deleted the checkout,
+    /// and only an empty-folder removal finishes the job. `note` is what a finished cleanup
+    /// shows; a cleanup that cannot finish becomes `cleanup_pending` with that note and the
+    /// pending suffix, so a retry knows which way the task was going.
+    fn run_cleanup(&self, task_id: &str, outcome: Outcome, note: &str) {
+        let (repo, worktree, branch, session_id) = {
+            let inner = self.lock();
+            let Some(t) = inner.tasks.iter().find(|t| t.id == task_id) else { return };
+            let repo = inner.projects.get(&t.project_id).map(|e| e.path.clone());
+            (repo, t.worktree.clone(), t.branch.clone(), t.session_id.clone())
+        };
+        let exited = match &session_id {
+            Some(sid) => self.stop_and_wait(sid, CHILD_EXIT_WAIT) != Ok(false),
+            None => true,
+        };
+        let done = match (exited, repo) {
+            (true, Some(repo)) => {
+                self.remove_worktree(&repo, worktree.as_deref()) && remove_branch(&repo, branch.as_deref(), outcome)
+            }
+            _ => false,
+        };
+        let (status, note) = if done {
+            let status = match outcome {
+                Outcome::Landed => TaskStatus::Landed,
+                Outcome::Discarded => TaskStatus::Discarded,
+            };
+            (status, note.to_string())
+        } else {
+            (TaskStatus::CleanupPending, format!("{note}{}", task::PENDING_SUFFIX))
+        };
+        self.update_task(task_id, |t| {
+            t.status = status;
+            t.note = Some(note);
+            if done {
+                t.worktree = None;
+            }
+        });
+    }
+
+    /// `git worktree remove --force`, and when that leaves the folder behind (it fails after
+    /// the checkout is gone, or because a process still holds the folder) a prune and a
+    /// non-recursive removal of the empty folder, retried with backoff. Only a path inside
+    /// the worktree folder is ever touched, and never with `remove_dir_all`.
+    fn remove_worktree(&self, repo: &Path, worktree: Option<&Path>) -> bool {
+        let Some(path) = worktree else { return true };
+        if !path.exists() {
+            let _ = git::worktree_prune(repo);
+            return true;
+        }
+        if !git::is_within(&self.worktree_base, path) {
+            return false;
+        }
+        if git::worktree_remove(repo, &self.worktree_base, path).is_ok() && !path.exists() {
+            return true;
+        }
+        let _ = git::worktree_prune(repo);
+        for ms in CLEANUP_BACKOFF_MS {
+            if !path.exists() || git::remove_empty_dir(&self.worktree_base, path).is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+        !path.exists()
     }
 
     /// Start the oldest queued tasks while fewer than `MAX_RUNNING_TASKS` hold a slot. Safe
@@ -936,6 +1341,9 @@ impl Sessions {
             // may continue, and it is never resumed anywhere else.
             Err(CwdError::Worktree) => return Err(CwdError::Worktree.message().into()),
         };
+        if is_task && inner.task_of_session(session_id).is_some_and(|t| t.busy) {
+            return Err(BUSY_TASK.into());
+        }
         if is_task && inner.active_tasks() >= MAX_RUNNING_TASKS {
             return Err("task limit reached".into());
         }
@@ -1246,6 +1654,10 @@ mod tests {
     fn git_repo(name: &str) -> PathBuf {
         let d = scratch(name);
         git_in(&d, &["init", "-b", "main"]);
+        // The commits Orchestra makes use the identity configured for the repository.
+        git_in(&d, &["config", "user.name", "owner"]);
+        git_in(&d, &["config", "user.email", "owner@example.invalid"]);
+        git_in(&d, &["config", "commit.gpgsign", "false"]);
         std::fs::write(d.join("a.txt"), "a").unwrap();
         git_in(&d, &["add", "."]);
         git_in(&d, &["commit", "-m", "first"]);
@@ -1403,6 +1815,412 @@ mod tests {
         let task = r.sessions.list_tasks().remove(0);
         assert!(!task.session_over && !task.last_turn_error);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // --- review, land, discard ---
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git").args(args).current_dir(dir).output().unwrap().status.success()
+    }
+
+    fn branch_present(repo: &Path, name: &str) -> bool {
+        !git_out(repo, &["branch", "--list", name]).is_empty()
+    }
+
+    fn tidy(r: &Rig, repo: &Path) {
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(&r.base);
+    }
+
+    /// Write a file in the task worktree and commit it there, as a task would.
+    fn worktree_commit(wt: &Path, file: &str, message: &str) {
+        std::fs::write(wt.join(file), "from the task").unwrap();
+        git_in(wt, &["add", "."]);
+        git_in(wt, &["commit", "-m", message]);
+    }
+
+    fn task_note(r: &Rig, id: &str) -> Option<String> {
+        r.sessions.list_tasks().into_iter().find(|t| t.id == id).unwrap().note
+    }
+
+    #[test]
+    fn land_merges_into_base_with_no_ff_and_cleans_up() {
+        let (r, p, repo) = rig_repo("landok");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add b");
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+        let tip = git_out(&repo, &["rev-parse", "orchestra/t1"]);
+
+        let summary = r.sessions.land_task("t1").unwrap();
+        assert_eq!(summary.status, TaskStatus::Landed);
+        assert!(summary.note.unwrap().starts_with("Landed as "));
+        assert!(repo.join("b.txt").is_file());
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD^1"]), before);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD^2"]), tip, "no fast-forward: a merge commit");
+        assert!(git_out(&repo, &["log", "-1", "--format=%s"]).starts_with("merge orchestra task t1: work"));
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"));
+        assert!(!git_out(&repo, &["worktree", "list"]).contains("t1"));
+        assert_eq!(git_out(&repo, &["branch", "--show-current"]), "main");
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_commits_uncommitted_worktree_changes_without_trailers() {
+        let (r, p, repo) = rig_repo("landleft");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        std::fs::write(wt.join("tracked-new.txt"), "left over").unwrap();
+        std::fs::write(wt.join("a.txt"), "edited").unwrap();
+
+        assert_eq!(r.sessions.land_task("t1").unwrap().status, TaskStatus::Landed);
+        assert_eq!(std::fs::read_to_string(repo.join("tracked-new.txt")).unwrap(), "left over");
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "edited");
+        let subjects = git_out(&repo, &["log", "--format=%s"]);
+        assert!(subjects.lines().any(|l| l == "t1: work"), "{subjects}");
+        let everything = git_out(&repo, &["log", "--format=%an%n%ae%n%cn%n%ce%n%B"]).to_lowercase();
+        for banned in ["co-authored-by", "claude", "anthropic", "generated with"] {
+            assert!(!everything.contains(banned), "{banned} in the history");
+        }
+        assert!(everything.contains("owner@example.invalid"), "the configured identity");
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_dirty_checkout_and_changes_nothing() {
+        let (r, p, repo) = rig_repo("landdirty");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        std::fs::write(wt.join("b.txt"), "uncommitted").unwrap();
+        std::fs::write(repo.join("a.txt"), "owner edit").unwrap();
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("uncommitted changes"), "{err}");
+        assert!(!err.contains('/') && !err.contains('\\'));
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "owner edit");
+        assert!(wt.is_dir() && branch_present(&repo, "orchestra/t1"));
+        assert_eq!(git_out(&repo, &["rev-list", "--count", &format!("{}..orchestra/t1", before)]), "0");
+        assert!(wt.join("b.txt").is_file(), "the worktree was not committed or cleaned either");
+        // Put the owner edit back and the same task lands.
+        git_in(&repo, &["checkout", "--", "a.txt"]);
+        assert_eq!(r.sessions.land_task("t1").unwrap().status, TaskStatus::Landed);
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_when_checkout_moved_to_other_branch() {
+        let (r, p, repo) = rig_repo("landmoved");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add b");
+        git_in(&repo, &["checkout", "-b", "other"]);
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("no longer on the branch"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git_out(&repo, &["branch", "--show-current"]), "other");
+        assert!(!repo.join("b.txt").exists());
+        assert!(wt.is_dir() && branch_present(&repo, "orchestra/t1"));
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_conflict_aborts_and_keeps_branch_and_worktree() {
+        let (r, p, repo) = rig_repo("landconflict");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        std::fs::write(wt.join("a.txt"), "task version").unwrap();
+        git_in(&wt, &["commit", "-am", "t1: change a"]);
+        std::fs::write(repo.join("a.txt"), "owner version").unwrap();
+        git_in(&repo, &["commit", "-am", "owner change a"]);
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("conflicts"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(task_note(&r, "t1").as_deref(), Some("conflicts, merge orchestra/t1 by hand"));
+        assert!(!git_ok(&repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]), "no merge in progress");
+        assert_eq!(git_out(&repo, &["status", "--porcelain"]), "");
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "owner version");
+        assert!(wt.is_dir() && branch_present(&repo, "orchestra/t1"));
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_when_nothing_changed() {
+        let (r, p, repo) = rig_repo("landnothing");
+        done_task(&r, &p);
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("nothing to land"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert!(branch_present(&repo, "orchestra/t1"));
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_requires_a_done_task() {
+        let (r, p, repo) = rig_repo("landstate");
+        r.sessions.create_task(&p.id, "work", SessionSettings::default()).unwrap();
+        assert!(r.sessions.land_task("t1").unwrap_err().contains("finished"));
+        assert!(r.sessions.land_task("nope").is_err());
+        assert!(r.sessions.get_task_diff("t1").is_err());
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Running);
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_commits_carrying_claude_attribution() {
+        let (r, p, repo) = rig_repo("landtrailer");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        worktree_commit(&wt, "b.txt", &format!("t1: add b\n\n{trailer}"));
+        std::fs::write(wt.join("c.txt"), "left over").unwrap();
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+        let tip = git_out(&repo, &["rev-parse", "orchestra/t1"]);
+        let short = git_out(&repo, &["rev-parse", "--short=7", "orchestra/t1"]);
+
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains(&short), "{err} should name {short}");
+        assert!(err.contains("Claude attribution"));
+        assert!(!err.contains('/') && !err.contains('\\') && !err.contains("noreply"));
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git_out(&repo, &["rev-parse", "orchestra/t1"]), tip, "the branch was not touched, not even by a commit");
+        assert!(wt.join("c.txt").is_file() && wt.is_dir());
+        assert!(!repo.join("b.txt").exists());
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn land_refuses_a_noreply_author_and_accepts_prose_about_claude() {
+        let (r, p, repo) = rig_repo("landauthor");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        git_in(&wt, &["add", "."]);
+        git_in(&wt, &["-c", "user.email=noreply@anthropic.com", "commit", "-m", "t1: plain message"]);
+        let err = r.sessions.land_task("t1").unwrap_err();
+        assert!(err.contains("Claude attribution"), "{err}");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        tidy(&r, &repo);
+
+        let (r, p, repo) = rig_repo("landprose");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add a claude adapter\n\nClaude handles the retries now.");
+        assert_eq!(r.sessions.land_task("t1").unwrap().status, TaskStatus::Landed);
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn task_diff_lists_commits_and_uncommitted_files() {
+        let (r, p, repo) = rig_repo("taskdiff");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add b\n\nwith a body");
+        std::fs::write(wt.join("c.txt"), "untracked").unwrap();
+        let d = r.sessions.get_task_diff("t1").unwrap();
+        let paths: Vec<&str> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt", "c.txt"]);
+        assert_eq!(d.commits.len(), 1);
+        assert_eq!((d.commits[0].subject.as_str(), d.commits[0].body.as_str()), ("t1: add b", "with a body"));
+        assert_eq!(d.commits[0].id.len(), 7);
+        assert!(!d.truncated && d.patch.contains("untracked"));
+        assert_eq!(d.base_branch, "main");
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains(&*r.base.to_string_lossy().replace('\\', "\\\\")), "no path in the review");
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn discard_removes_worktree_and_branch() {
+        let (r, p, repo) = rig_repo("discard");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add b");
+        let before = git_out(&repo, &["rev-parse", "HEAD"]);
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::Discarded);
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"), "an unmerged branch goes with -D");
+        assert!(!git_out(&repo, &["worktree", "list"]).contains("t1"));
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
+        assert!(!repo.join("b.txt").exists());
+        assert!(r.sessions.discard_task("t1").is_err(), "already discarded");
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn discard_of_a_queued_task_is_a_cancel() {
+        let (r, p, repo) = rig_repo("discardqueued");
+        for _ in 0..3 {
+            r.sessions.create_task(&p.id, "work", SessionSettings::default()).unwrap();
+        }
+        assert_eq!(task_status(&r, "t3"), TaskStatus::Queued);
+        let s = r.sessions.discard_task("t3").unwrap();
+        assert_eq!(s.status, TaskStatus::Discarded);
+        assert_eq!(s.note.as_deref(), Some("Cancelled before it started"));
+        assert!(r.sessions.discard_task("t1").is_err(), "a running task cannot be discarded");
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn cleanup_waits_for_the_child_before_the_first_remove() {
+        let (r, p, repo) = rig_repo("cleanupwait");
+        r.sessions.create_task(&p.id, "work", SessionSettings::default()).unwrap();
+        r.feed_nth(0, INIT_UUID);
+        r.feed_nth(0, PERM);
+        assert_eq!(task_status(&r, "t1"), TaskStatus::NeedsInput);
+        let wt = r.base.join(&p.id).join("t1");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (s2, wt2) = (seen.clone(), wt.clone());
+        *r.fake.on_wait.lock().unwrap() = Some(Box::new(move || s2.lock().unwrap().push(wt2.is_dir())));
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::Discarded);
+        assert_eq!(*seen.lock().unwrap(), [true], "waited once, with the worktree still intact");
+        assert!(r.fake.killed.load(Ordering::SeqCst));
+        assert!(!wt.exists());
+        tidy(&r, &repo);
+    }
+
+    /// Windows: a live child with its cwd in the worktree. Measured in s2: the first remove
+    /// fails after already unregistering the worktree, so only the retry's prune and
+    /// empty-folder removal can finish.
+    #[test]
+    #[cfg(windows)]
+    fn cleanup_pending_when_removal_fails_then_retry_succeeds() {
+        use std::os::windows::process::CommandExt;
+        let (r, p, repo) = rig_repo("cleanuppending");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .current_dir(&wt)
+            .creation_flags(0x0800_0000)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::CleanupPending, "the folder is held by a live process");
+        assert_eq!(s.note.as_deref(), Some("Discarded; cleanup pending"));
+        assert!(wt.exists());
+        assert!(branch_present(&repo, "orchestra/t1"), "the branch stays until the worktree is gone");
+        assert!(r.sessions.discard_task("t1").is_err(), "only a retry applies to a pending task");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut last = TaskStatus::CleanupPending;
+        for _ in 0..40 {
+            last = r.sessions.retry_cleanup("t1").unwrap().status;
+            if last == TaskStatus::Discarded {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(last, TaskStatus::Discarded);
+        assert_eq!(task_note(&r, "t1").as_deref(), Some("Discarded"));
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"));
+        assert!(!git_out(&repo, &["worktree", "list"]).contains("t1"));
+        assert!(r.sessions.retry_cleanup("t1").is_err());
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn cleanup_finishes_a_half_removed_worktree() {
+        let (r, p, repo) = rig_repo("cleanuphalf");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        // What a failed `worktree remove` leaves on Windows: the checkout and its .git file
+        // are gone, the folder is empty, and git no longer knows it as a working tree.
+        for entry in std::fs::read_dir(&wt).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        assert!(wt.is_dir());
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::Discarded);
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"));
+        assert!(!git_out(&repo, &["worktree", "list"]).contains("t1"));
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn cleanup_never_touches_path_outside_base() {
+        let (r, p, repo) = rig_repo("cleanupoutside");
+        done_task(&r, &p);
+        let outside = scratch("cleanup-outside");
+        std::fs::write(outside.join("keep.txt"), "mine").unwrap();
+        r.sessions.lock().tasks[0].worktree = Some(outside.clone());
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::CleanupPending, "a path outside the base is never removed");
+        assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "mine");
+        let s = r.sessions.retry_cleanup("t1").unwrap();
+        assert_eq!(s.status, TaskStatus::CleanupPending);
+        assert!(outside.join("keep.txt").is_file());
+        // The same for a path that climbs out with `..`.
+        let sneaky = r.base.join(&p.id).join("..").join("..").join(outside.file_name().unwrap());
+        r.sessions.lock().tasks[0].worktree = Some(sneaky);
+        assert_eq!(r.sessions.retry_cleanup("t1").unwrap().status, TaskStatus::CleanupPending);
+        assert!(outside.join("keep.txt").is_file());
+        let _ = std::fs::remove_dir_all(&outside);
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn pending_cleanup_is_retried_once_after_restore() {
+        let (r, _) = rig();
+        let repo = git_repo("retryrestore");
+        let wt = r.base.join("p1").join("t1");
+        std::fs::create_dir_all(&wt).unwrap();
+        git_in(&repo, &["branch", "orchestra/t1"]);
+        let mut stored = stored_task("t1", "cleanup_pending", Some(wt.clone()), None);
+        stored.note = Some("Discarded; cleanup pending".into());
+        restore_tasks(&r, &repo, vec![], vec![stored]);
+        assert_eq!(task_status(&r, "t1"), TaskStatus::CleanupPending);
+
+        r.sessions.retry_pending();
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Discarded);
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"));
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn restore_turns_an_interrupted_landing_into_done() {
+        let (r, _) = rig();
+        let repo = git_repo("landinginterrupted");
+        let wt = r.base.join("p1").join("t1");
+        std::fs::create_dir_all(&wt).unwrap();
+        restore_tasks(&r, &repo, vec![], vec![stored_task("t1", "landing", Some(wt), None)]);
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert!(task_note(&r, "t1").unwrap().contains("interrupted"));
+        tidy(&r, &repo);
     }
 
     #[test]

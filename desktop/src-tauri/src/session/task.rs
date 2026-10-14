@@ -19,6 +19,29 @@ use super::store::StoredTask;
 pub const MAX_RUNNING_TASKS: usize = 2;
 const MAX_TITLE_CHARS: usize = 120;
 pub const PAUSED_NOTE: &str = "Paused when Orchestra closed; reply to continue";
+/// Notes that tell a cleanup retry what the task was heading for, since the status alone
+/// (`cleanup_pending`) does not. A landed task's note starts with `LANDED`.
+pub const LANDED: &str = "Landed";
+pub const DISCARDED: &str = "Discarded";
+pub const PENDING_SUFFIX: &str = "; cleanup pending";
+
+/// Which way a task in `cleanup_pending` was going, read back from its note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Landed,
+    Discarded,
+}
+
+impl Outcome {
+    /// An unrecognised note reads as discarded's opposite on purpose: the safe default is
+    /// the branch delete that refuses unmerged work.
+    pub fn of_note(note: Option<&str>) -> Self {
+        match note {
+            Some(n) if n.starts_with(DISCARDED) => Outcome::Discarded,
+            _ => Outcome::Landed,
+        }
+    }
+}
 
 /// Closed set, deliberately not `SessionStatus`: queued, landed and discarded have no
 /// session, and idle (a turn is over) is not done (the task has been handed back).
@@ -90,6 +113,8 @@ pub struct Task {
     pub session_over: bool,
     /// Claimed by the queue pump and not yet linked to a session. Not persisted.
     pub starting: bool,
+    /// A land, discard, diff or cleanup retry is running on this task. Not persisted.
+    pub busy: bool,
 }
 
 /// What the frontend may know about a task: no path, ever.
@@ -143,6 +168,7 @@ impl Task {
             last_turn_error: false,
             session_over: false,
             starting: false,
+            busy: false,
         }
     }
 
@@ -222,6 +248,7 @@ impl StoredTask {
             last_turn_error: self.last_turn_error,
             session_over: self.session_over,
             starting: false,
+            busy: false,
         };
         if parsed.is_none() {
             task.note = Some("unknown status".to_string());
@@ -383,5 +410,12 @@ mod tests {
         t.status = TaskStatus::Queued;
         t.starting = true;
         assert!(t.is_active(false));
+    }
+
+    #[test]
+    fn outcome_is_read_from_the_note() {
+        assert_eq!(Outcome::of_note(Some("Discarded; cleanup pending")), Outcome::Discarded);
+        assert_eq!(Outcome::of_note(Some("Landed as abc1234; cleanup pending")), Outcome::Landed);
+        assert_eq!(Outcome::of_note(None), Outcome::Landed);
     }
 }
