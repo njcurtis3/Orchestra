@@ -314,7 +314,17 @@ mod tests {
         let (proc, rx) = spawn_ping(&dir);
         proc.kill();
         assert!(proc.wait_exit(Duration::from_secs(10)));
-        assert!(matches!(rx.try_iter().last(), Some(Output::Exit(_))), "Exit was sent before wait_exit returned");
+        // The latch is set before the reader sends Exit, so wait for it rather than poll.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exit = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Output::Exit(c)) => break Some(c),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        };
+        assert!(exit.is_some(), "Exit never arrived after wait_exit returned");
         assert!(proc.wait_exit(Duration::from_millis(1)), "the latch stays set");
         let _ = std::fs::remove_dir_all(&dir);
     }
