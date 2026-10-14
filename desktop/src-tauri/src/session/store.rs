@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use super::state::PersistedSession;
 use crate::projects::StoredProject;
 
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
+/// Oldest schema `load` still reads. A schema-1 file has no tasks and is written back as 2.
+const OLDEST_SCHEMA: u64 = 1;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,7 +32,41 @@ pub struct StoredSession {
     pub model: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// The task this session belongs to; absent for a plain session and in schema 1.
+    #[serde(default)]
+    pub task_id: Option<String>,
     pub state: PersistedSession,
+}
+
+/// A task as written to the state file. The status is a string that `TaskStatus::parse`
+/// reads back, so an unknown one loads as `error` and does not make the file unreadable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredTask {
+    pub id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    pub created_at: u64,
+    pub status: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// A Rust-derived path under the worktree folder. Re-checked on load; never sent over IPC.
+    #[serde(default)]
+    pub worktree: Option<PathBuf>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub base_branch: String,
+    pub base_commit: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub last_turn_error: bool,
+    #[serde(default)]
+    pub session_over: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +77,11 @@ pub struct Snapshot {
     pub next_project: u64,
     pub projects: Vec<StoredProject>,
     pub sessions: Vec<StoredSession>,
+    /// Absent in schema 1.
+    #[serde(default)]
+    pub next_task: u64,
+    #[serde(default)]
+    pub tasks: Vec<StoredTask>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,10 +128,13 @@ pub fn load(path: &Path) -> Result<Option<Snapshot>, LoadError> {
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| LoadError::Unreadable)?;
     let found = value.get("schema").and_then(serde_json::Value::as_u64).ok_or(LoadError::Unreadable)?;
-    if found != u64::from(SCHEMA) {
+    if !(OLDEST_SCHEMA..=u64::from(SCHEMA)).contains(&found) {
         return Err(LoadError::UnknownSchema { found });
     }
-    serde_json::from_value(value).map(Some).map_err(|_| LoadError::Unreadable)
+    let mut snapshot: Snapshot = serde_json::from_value(value).map_err(|_| LoadError::Unreadable)?;
+    // Migrated in memory; the next save writes the current schema.
+    snapshot.schema = SCHEMA;
+    Ok(Some(snapshot))
 }
 
 /// Write a sibling temp file, flush it to disk, then rename over the target. The rename
@@ -188,19 +232,28 @@ mod tests {
     }
 
     fn snap(revision: u64) -> Snapshot {
-        Snapshot { schema: SCHEMA, revision, next_session: 0, next_project: 0, projects: vec![], sessions: vec![] }
+        Snapshot {
+            schema: SCHEMA,
+            revision,
+            next_session: 0,
+            next_project: 0,
+            projects: vec![],
+            sessions: vec![],
+            next_task: 0,
+            tasks: vec![],
+        }
     }
 
     #[test]
     fn refuses_unknown_schema_version() {
         let d = dir("schema");
         let f = d.join("state.json");
-        let future = br#"{"schema":2,"revision":9,"anything":["kept"]}"#;
+        let future = br#"{"schema":3,"revision":9,"anything":["kept"]}"#;
         fs::write(&f, future).unwrap();
-        assert_eq!(load(&f), Err(LoadError::UnknownSchema { found: 2 }));
+        assert_eq!(load(&f), Err(LoadError::UnknownSchema { found: 3 }));
         let (snapshot, status, writer) = open(&f);
         assert!(snapshot.is_none() && writer.is_none(), "saving is off for the run");
-        assert_eq!(status, StorageStatus { ok: false, reason: Some("unknown_schema_version"), found_version: Some(2) });
+        assert_eq!(status, StorageStatus { ok: false, reason: Some("unknown_schema_version"), found_version: Some(3) });
         assert_eq!(fs::read(&f).unwrap(), future, "bytes unchanged after load");
         // Nothing can be saved without a writer, and the temp file is never created.
         assert!(writer.is_none());
@@ -212,6 +265,48 @@ mod tests {
         assert!(writer.is_none());
         assert_eq!(status, StorageStatus::unreadable());
         assert_eq!(fs::read(&f).unwrap(), b"not json");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn schema3_is_refused() {
+        let d = dir("schema3");
+        let f = d.join("state.json");
+        let future = br#"{"schema":3,"revision":1,"next_session":0,"next_project":0,"projects":[],"sessions":[]}"#;
+        fs::write(&f, future).unwrap();
+        assert_eq!(load(&f), Err(LoadError::UnknownSchema { found: 3 }));
+        fs::write(&f, br#"{"schema":0}"#).unwrap();
+        assert_eq!(load(&f), Err(LoadError::UnknownSchema { found: 0 }));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn schema1_file_loads_as_schema2_with_no_tasks() {
+        let d = dir("migrate");
+        let f = d.join("state.json");
+        // Shaped like a D3 file: settings present, no task fields anywhere.
+        let old = br#"{"schema":1,"revision":7,"next_session":2,"next_project":1,
+            "projects":[{"id":"p1","name":"proj","path":"C:/proj"}],
+            "sessions":[
+              {"id":"s1","project_id":"p1","project_name":"proj","started_at":1,"model":"opus","permission_mode":"plan",
+               "state":{"status":"idle","last_activity_at":2,"last_message":"hi","claude_session_id":null,
+                        "inbox":[],"next_item":0,"unknown_count":0}},
+              {"id":"s2","project_id":"p1","project_name":"proj","started_at":3,
+               "state":{"status":"ended","last_activity_at":4,"last_message":null,"claude_session_id":null,
+                        "inbox":[],"next_item":0,"unknown_count":0}}]}"#;
+        fs::write(&f, old).unwrap();
+        let snap = load(&f).unwrap().unwrap();
+        assert_eq!(snap.schema, 2);
+        assert!(snap.tasks.is_empty() && snap.next_task == 0);
+        assert!(snap.sessions.iter().all(|s| s.task_id.is_none()));
+        save(&f, &snap).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&fs::read(&f).unwrap()).unwrap();
+        assert_eq!(written["schema"], 2);
+        assert_eq!(written["tasks"], serde_json::json!([]));
+        let again = load(&f).unwrap().unwrap();
+        assert_eq!(again, snap);
+        assert_eq!(again.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2"]);
+        assert_eq!(again.sessions[0].model.as_deref(), Some("opus"));
         let _ = fs::remove_dir_all(&d);
     }
 

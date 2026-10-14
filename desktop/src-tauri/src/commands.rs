@@ -13,6 +13,7 @@ use crate::session::SessionSummary;
 use crate::session::Sessions;
 use crate::session::settings::{Model, PermissionMode, SessionSettings};
 use crate::session::state::{Decision, InboxItem};
+use crate::session::task::TaskSummary;
 use crate::session::store::StorageStatus;
 use crate::session::transcript::TranscriptPage;
 
@@ -26,6 +27,21 @@ pub struct StartArgs {
     /// Absent means no flag. Anything off the allowlists fails to deserialize.
     pub model: Option<Model>,
     pub permission_mode: Option<PermissionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTaskArgs {
+    pub project_id: String,
+    pub prompt: String,
+    pub model: Option<Model>,
+    pub permission_mode: Option<PermissionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelTaskArgs {
+    pub task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +138,32 @@ pub fn storage_status(status: State<'_, StorageStatus>) -> StorageStatus {
     status.inner().clone()
 }
 
+/// Async because git runs, and so does a session's first write when a slot is free.
+#[tauri::command]
+pub async fn create_task(args: CreateTaskArgs, sessions: State<'_, AppSessions>) -> Result<TaskSummary, String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = SessionSettings { model: args.model, permission_mode: args.permission_mode };
+        sessions.create_task(&args.project_id, &args.prompt, settings)
+    })
+    .await
+    .map_err(|_| "task creation failed".to_string())?
+}
+
+#[tauri::command]
+pub fn list_tasks(sessions: State<'_, AppSessions>) -> Vec<TaskSummary> {
+    sessions.list_tasks()
+}
+
+/// Async so the queue it re-runs never works on the main thread.
+#[tauri::command]
+pub async fn cancel_task(args: CancelTaskArgs, sessions: State<'_, AppSessions>) -> Result<(), String> {
+    let sessions = Arc::clone(sessions.inner());
+    tauri::async_runtime::spawn_blocking(move || sessions.cancel_task(&args.task_id))
+        .await
+        .map_err(|_| "cancel task failed".to_string())?
+}
+
 /// Async for the same reason as `start_session`: the kill runs on the blocking pool.
 #[tauri::command]
 pub async fn stop_session(args: StopArgs, sessions: State<'_, AppSessions>) -> Result<(), String> {
@@ -163,6 +205,18 @@ mod tests {
         assert!(serde_json::from_value::<StopArgs>(json!({"session_id":"s1","force":true})).is_err());
         assert!(serde_json::from_value::<TranscriptArgs>(json!({"session_id":"s1","path":"C:/x"})).is_err());
         assert!(serde_json::from_value::<TranscriptArgs>(json!({"session_id":"s1"})).is_ok());
+    }
+
+    #[test]
+    fn task_args_reject_extra_fields_and_unlisted_values() {
+        let ok = json!({"project_id":"p1","prompt":"x","model":"opus","permission_mode":"plan"});
+        assert!(serde_json::from_value::<CreateTaskArgs>(ok).is_ok());
+        for extra in ["cwd", "worktree", "branch", "path"] {
+            assert!(serde_json::from_value::<CreateTaskArgs>(json!({"project_id":"p1","prompt":"x", extra: "C:/"})).is_err());
+        }
+        assert!(serde_json::from_value::<CreateTaskArgs>(json!({"project_id":"p1","prompt":"x","model":"haiku"})).is_err());
+        assert!(serde_json::from_value::<CancelTaskArgs>(json!({"task_id":"t1","force":true})).is_err());
+        assert!(serde_json::from_value::<CancelTaskArgs>(json!({"task_id":"t1"})).is_ok());
     }
 
     #[test]
