@@ -84,6 +84,27 @@ pub fn run(repo: &Path, args: &[&str], cap: usize, timeout: Duration) -> Result<
     exec(cmd, cap, timeout)
 }
 
+/// Variables that make git ignore `-C` and act on another repo, index or object store.
+const SCRUBBED_ENV: [&str; 10] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_PREFIX",
+];
+
+/// Drop the inherited repo-selecting variables so `-C` is the only thing that picks the repo.
+fn scrub_env(cmd: &mut Command) {
+    for name in SCRUBBED_ENV {
+        cmd.env_remove(name);
+    }
+}
+
 /// `run`, with a non-zero exit as `GitError::Failed`.
 pub fn run_ok(
     repo: &Path,
@@ -99,6 +120,7 @@ pub fn run_ok(
 /// pipe), and kill the child when `timeout` passes. The reader is not joined after a kill:
 /// a grandchild holding the pipe would keep it open.
 fn exec(mut cmd: Command, cap: usize, timeout: Duration) -> Result<Output, GitError> {
+    scrub_env(&mut cmd);
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -311,11 +333,112 @@ pub fn worktree_add(
     .map(|_| ())
 }
 
-/// One `worktree remove --force` attempt, then `prune`. Retrying while a process still
-/// holds the folder is the caller's job. `path` must pass `is_within`.
+/// Most entries and deepest nesting the link walk will visit; past either, removal is
+/// refused rather than handed to git unchecked.
+const MAX_WALK_ENTRIES: usize = 500_000;
+const MAX_WALK_DEPTH: usize = 128;
+
+/// True for a symlink, and on Windows for any reparse point (junction, mount point).
+fn is_link(md: &std::fs::Metadata) -> bool {
+    if md.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a link is a directory link, which is removed with `remove_dir`.
+fn is_dir_link(md: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+    }
+    #[cfg(not(windows))]
+    {
+        md.is_dir()
+    }
+}
+
+/// Removes the link at a path, never its target: `bool` is true for a directory link.
+type Unlink<'a> = &'a dyn Fn(&Path, bool) -> std::io::Result<()>;
+
+fn unlink_real(path: &Path, dir: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if dir { std::fs::remove_dir(path) } else { std::fs::remove_file(path) }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        std::fs::remove_file(path)
+    }
+}
+
+/// Walk `root` without following links and remove every link it holds (the link itself,
+/// never its target), so a later recursive delete cannot reach outside. Anything
+/// unexpected (a link that will not go, a walk past the bounds) is an error.
+fn unlink_links(root: &Path, unlink: Unlink) -> Result<(), GitError> {
+    const FAIL: GitError = GitError::Invalid("the worktree holds a link that could not be removed");
+    let root_md = std::fs::symlink_metadata(root).map_err(|_| GitError::Io)?;
+    if is_link(&root_md) || !root_md.is_dir() {
+        return Err(FAIL);
+    }
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > MAX_WALK_DEPTH {
+            return Err(FAIL);
+        }
+        for entry in std::fs::read_dir(&dir).map_err(|_| GitError::Io)? {
+            let path = entry.map_err(|_| GitError::Io)?.path();
+            seen += 1;
+            if seen > MAX_WALK_ENTRIES || !path.starts_with(root) {
+                return Err(FAIL);
+            }
+            let md = std::fs::symlink_metadata(&path).map_err(|_| GitError::Io)?;
+            if is_link(&md) {
+                unlink(&path, is_dir_link(&md)).map_err(|_| FAIL)?;
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    return Err(FAIL);
+                }
+            } else if md.is_dir() {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unlink every link in the worktree, then one `worktree remove --force` attempt, then
+/// `prune`. `git worktree remove` follows junctions and deletes their targets, so git is
+/// never called while a link remains: if one cannot be removed this errors first and the
+/// caller keeps the task in cleanup. Retrying while a process still holds the folder is the
+/// caller's job. `path` must pass `is_within`.
 pub fn worktree_remove(repo: &Path, base: &Path, path: &Path) -> Result<(), GitError> {
+    worktree_remove_with(repo, base, path, &unlink_real)
+}
+
+fn worktree_remove_with(
+    repo: &Path,
+    base: &Path,
+    path: &Path,
+    unlink: Unlink,
+) -> Result<(), GitError> {
     if !is_within(base, path) {
         return Err(GitError::Invalid("the worktree path is outside the worktree folder"));
+    }
+    // A folder already gone has no links; git still unregisters it below.
+    if path.exists() {
+        unlink_links(path, unlink)?;
     }
     let path = path.to_str().ok_or(GitError::Invalid("bad worktree path"))?;
     let removed = run_ok(repo, &["worktree", "remove", "--force", path], SMALL_CAP, LONG_TIMEOUT);
@@ -330,7 +453,8 @@ pub fn worktree_prune(repo: &Path) -> Result<(), GitError> {
 
 /// Remove an empty folder under `base`, never recursively. This finishes a removal that
 /// git left half done (the checkout deleted and unregistered, the empty folder still there).
-/// `path` must pass `is_within`; a folder with anything in it is left alone.
+/// `path` must pass `is_within`; a folder with anything in it is left alone. `remove_dir`
+/// never recurses and on a junction removes only the link, so no link walk is needed.
 pub fn remove_empty_dir(base: &Path, path: &Path) -> Result<(), GitError> {
     if !is_within(base, path) {
         return Err(GitError::Invalid("the worktree path is outside the worktree folder"));
@@ -922,6 +1046,118 @@ mod tests {
         assert!(remove_empty_dir(&base, &outside).is_err());
         assert!(outside.is_dir(), "a folder outside the base is left alone");
         assert!(remove_empty_dir(&base, &base).is_err());
+    }
+
+    /// `mklink /J`: a directory junction needs no privilege. Test code only.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let st = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "mklink failed");
+    }
+
+    /// Remove a junction itself; `remove_dir` on a link never touches the target.
+    #[cfg(windows)]
+    fn drop_junction(link: &Path) {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_dir(link).unwrap();
+        }
+    }
+
+    /// A repo, a task worktree under a base, and a victim dir outside with `keep.txt`.
+    #[cfg(windows)]
+    fn worktree_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let repo = repo_with_commit(name);
+        let base = scratch(&format!("{name}-base"));
+        let victim = scratch(&format!("{name}-victim"));
+        std::fs::write(victim.join("keep.txt"), "keep").unwrap();
+        let info = repo_info(&repo).unwrap();
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let path = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &path, &branch, &info.head_commit).unwrap();
+        (repo, base, path, victim)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_remove_unlinks_a_junction_and_spares_its_target() {
+        let (repo, base, path, victim) = worktree_fixture("jn");
+        junction(&path.join("nm"), &victim);
+        let res = worktree_remove(&repo, &base, &path);
+        if res.is_err() {
+            drop_junction(&path.join("nm"));
+        }
+        res.unwrap();
+        assert!(victim.join("keep.txt").is_file(), "the junction target was deleted");
+        assert!(!path.exists());
+        assert!(!git(&repo, &["worktree", "list", "--porcelain"]).text().contains("t1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_remove_unlinks_a_nested_junction() {
+        let (repo, base, path, victim) = worktree_fixture("jn-deep");
+        let deep = path.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        junction(&deep.join("nm"), &victim);
+        let res = worktree_remove(&repo, &base, &path);
+        if res.is_err() {
+            drop_junction(&deep.join("nm"));
+        }
+        res.unwrap();
+        assert!(victim.join("keep.txt").is_file(), "the junction target was deleted");
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worktree_remove_with_a_stuck_link_errors_before_git() {
+        let (repo, base, path, victim) = worktree_fixture("jn-stuck");
+        junction(&path.join("nm"), &victim);
+        let calls = std::cell::Cell::new(0);
+        let stuck = |_: &Path, _: bool| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("stuck"))
+        };
+        let res = worktree_remove_with(&repo, &base, &path, &stuck);
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1);
+        assert!(victim.join("keep.txt").is_file());
+        assert!(path.join("a.txt").is_file(), "git ran although a link remained");
+        assert!(git(&repo, &["worktree", "list", "--porcelain"]).text().contains("t1"));
+        // Now the real thing works.
+        worktree_remove(&repo, &base, &path).unwrap();
+        assert!(victim.join("keep.txt").is_file());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scrub_env_removes_every_repo_selecting_variable() {
+        let mut cmd = Command::new(GIT);
+        scrub_env(&mut cmd);
+        for name in SCRUBBED_ENV {
+            let hit = cmd.get_envs().find(|(k, _)| *k == std::ffi::OsStr::new(name));
+            assert!(matches!(hit, Some((_, None))), "{name} is not removed");
+        }
+        for must in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            assert!(SCRUBBED_ENV.contains(&must));
+        }
+    }
+
+    #[test]
+    fn inherited_git_dir_does_not_redirect_git() {
+        let repo = repo_with_commit("envdir");
+        let other = scratch("envdir-other");
+        // Every git call in this module scrubs it, so setting it cannot disturb other tests.
+        unsafe { std::env::set_var("GIT_DIR", &other) };
+        let info = repo_info(&repo);
+        unsafe { std::env::remove_var("GIT_DIR") };
+        assert_eq!(info.unwrap().head_branch.as_str(), "main");
     }
 
     #[test]
