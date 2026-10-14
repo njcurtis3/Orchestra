@@ -523,15 +523,27 @@ pub enum MergeOutcome {
 /// `merge --no-ff --no-edit -m <message> <branch>` in `repo` (gate G3). A failed merge is
 /// aborted, so no merge is ever left in progress. Hooks run.
 pub fn merge(repo: &Path, branch: &TaskBranch, message: &str) -> Result<MergeOutcome, GitError> {
-    let args = ["merge", "--no-ff", "--no-edit", "-m", message, branch.as_str()];
+    // The full ref: a tag of the same name must not be merged in its place.
+    let full = format!("refs/heads/{}", branch.as_str());
+    let args = ["merge", "--no-ff", "--no-edit", "-m", message, &full];
     let result = run(repo, &args, SMALL_CAP, LONG_TIMEOUT);
     if matches!(&result, Ok(out) if out.success()) {
         return Ok(MergeOutcome::Merged);
     }
-    let in_progress = run(repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], SMALL_CAP, TIMEOUT)
-        .map(|o| o.success())
-        .unwrap_or(false);
-    let _ = run(repo, &["merge", "--abort"], SMALL_CAP, TIMEOUT);
+    let merge_head = || {
+        run(repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], SMALL_CAP, TIMEOUT)
+            .map(|o| o.success())
+            .unwrap_or(true)
+    };
+    let in_progress = merge_head();
+    if in_progress {
+        let _ = run(repo, &["merge", "--abort"], SMALL_CAP, TIMEOUT);
+        // An abort that did not take leaves the checkout mid-merge: say so, do not claim
+        // that nothing changed.
+        if merge_head() {
+            return Err(GitError::Invalid("the merge could not be aborted; the project checkout may need attention"));
+        }
+    }
     match result {
         Ok(_) if in_progress => Ok(MergeOutcome::Conflict),
         Ok(out) => Err(GitError::Failed(out.code)),
@@ -540,6 +552,7 @@ pub fn merge(repo: &Path, branch: &TaskBranch, message: &str) -> Result<MergeOut
 }
 
 /// `branch -d` (merged only) or `-D`. `branch` is a task branch, so it cannot be an option.
+/// `git branch` only ever names `refs/heads`, so a tag of the same name is not in play.
 pub fn branch_delete(repo: &Path, branch: &TaskBranch, force: bool) -> Result<(), GitError> {
     let flag = if force { "-D" } else { "-d" };
     run_ok(repo, &["branch", flag, branch.as_str()], SMALL_CAP, TIMEOUT).map(|_| ())
@@ -660,7 +673,21 @@ impl CommitInfo {
 /// `LIST_CAP` is an error: a commit that was not read cannot be cleared.
 pub fn commits(repo: &Path, base: &CommitId, branch: &TaskBranch) -> Result<Vec<CommitInfo>, GitError> {
     let range = format!("{}..refs/heads/{}", base.as_str(), branch.as_str());
-    let out = run_ok(repo, &["log", "--no-color", "--format=%H%x1f%ae%x1f%ce%x1f%B%x1e", &range], LIST_CAP, TIMEOUT)?;
+    // Flags that make the format the same whatever the user's git config says: signature
+    // text, colour, notes and decorations would otherwise land in front of the records.
+    let args = [
+        "-c",
+        "log.showSignature=false",
+        "log",
+        "--no-show-signature",
+        "--no-color",
+        "--no-notes",
+        "--no-decorate",
+        "--encoding=UTF-8",
+        "--format=%H%x1f%ae%x1f%ce%x1f%B%x1e",
+        &range,
+    ];
+    let out = run_ok(repo, &args, LIST_CAP, TIMEOUT)?;
     if out.truncated {
         return Err(GitError::Invalid("too many commits to check"));
     }
@@ -1198,6 +1225,61 @@ mod tests {
         for msg in cases {
             assert!(!carries_claude_attribution("owner@example.org", "owner@example.org", msg), "{msg:?}");
         }
+    }
+
+    #[test]
+    fn commits_survive_a_signature_showing_config() {
+        let repo = repo_with_commit("sig");
+        git(&repo, &["config", "user.name", "owner"]);
+        git(&repo, &["config", "user.email", "owner@example.invalid"]);
+        let info = repo_info(&repo).unwrap();
+        let key = scratch("sig-key").join("k");
+        let st = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).status().unwrap();
+        assert!(st.success());
+        let pubkey = format!("{}.pub", key.display());
+        for (k, v) in [
+            ("gpg.format", "ssh"),
+            ("user.signingkey", pubkey.as_str()),
+            ("commit.gpgsign", "true"),
+            ("log.showSignature", "true"),
+        ] {
+            git(&repo, &["config", k, v]);
+        }
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let base = scratch("sig-base");
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(&wt).unwrap();
+        commit(&wt, "t1: x\n\nClaude-Session: abc").unwrap();
+        // The plain log of this config puts signature text in front of the record.
+        let range = format!("{}..refs/heads/orchestra/t1", info.head_commit.as_str());
+        let plain = git(&repo, &["log", "--format=%H", &range]).text();
+        assert!(plain.len() > 40, "the config shows signatures: {plain}");
+        let list = commits(&repo, &info.head_commit, &branch).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].carries_claude_attribution());
+    }
+
+    #[test]
+    fn merge_takes_the_branch_not_a_tag_of_the_same_name() {
+        let repo = repo_with_commit("tagmerge");
+        git(&repo, &["config", "user.name", "owner"]);
+        git(&repo, &["config", "user.email", "owner@example.invalid"]);
+        let info = repo_info(&repo).unwrap();
+        let branch = TaskBranch::parse("orchestra/t1").unwrap();
+        let base = scratch("tagmerge-base");
+        let wt = base.join("p1").join("t1");
+        worktree_add(&repo, &base, &wt, &branch, &info.head_commit).unwrap();
+        std::fs::write(wt.join("b.txt"), "b").unwrap();
+        stage_all(&wt).unwrap();
+        commit(&wt, "t1: x").unwrap();
+        std::fs::write(repo.join("c.txt"), "c").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "other"]);
+        git(&repo, &["tag", "orchestra/t1", "HEAD"]);
+        assert_eq!(merge(&repo, &branch, "m").unwrap(), MergeOutcome::Merged);
+        assert!(repo.join("b.txt").is_file(), "the branch was merged, not the tag");
     }
 
     #[test]

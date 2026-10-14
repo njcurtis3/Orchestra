@@ -762,9 +762,18 @@ impl Sessions {
         let (ctx, _busy) = self.begin_task(task_id, &[TaskStatus::Done], "only a finished task can be landed")?;
         let repo = ctx.repo.clone().ok_or(CwdError::Project.message())?;
         let (worktree, branch, base) = self.task_refs(&ctx)?;
+        // Every refusal that needs no change comes first: a refused land must leave the
+        // conversation as it was.
+        self.check_checkout(&repo, &ctx.base_branch)?;
+        const READ: &str = "could not read the changes of the task";
+        let list = git::commits(&repo, &base, &branch).map_err(|e| git_msg(e, READ))?;
+        if let Some(msg) = attribution_refusal(&list) {
+            return Err(msg);
+        }
         if let Some(sid) = &ctx.session_id {
-            // Nothing may still be writing to the worktree.
-            if self.stop_and_wait(sid, CHILD_EXIT_WAIT) == Ok(false) {
+            // Nothing may still be writing to the worktree. The session is paused, never
+            // ended: a refusal after this point still leaves it replyable.
+            if self.pause_and_wait(sid, CHILD_EXIT_WAIT) == Ok(false) {
                 return Err("the task is still running; try again".into());
             }
         }
@@ -773,19 +782,6 @@ impl Sessions {
             self.update_task(task_id, |t| t.status = TaskStatus::Done);
             Err(msg)
         };
-        const READ: &str = "could not read the changes of the task";
-
-        if let Err(msg) = self.check_checkout(&repo, &ctx.base_branch) {
-            return refuse(msg);
-        }
-        match git::commits(&repo, &base, &branch) {
-            Ok(list) => {
-                if let Some(msg) = attribution_refusal(&list) {
-                    return refuse(msg);
-                }
-            }
-            Err(e) => return refuse(git_msg(e, READ)),
-        }
 
         let commit_message = format!("{task_id}: {}", ctx.title);
         let staged = git::stage_all(&worktree).and_then(|_| git::has_staged(&worktree));
@@ -1007,7 +1003,7 @@ impl Sessions {
             if inner.shutting_down || inner.active_tasks() >= MAX_RUNNING_TASKS {
                 return None;
             }
-            let idx = inner.tasks.iter().position(|t| t.status == TaskStatus::Queued && !t.starting)?;
+            let idx = inner.tasks.iter().position(|t| t.status == TaskStatus::Queued && !t.starting && !t.busy)?;
             let project_id = inner.tasks[idx].project_id.clone();
             let Some(repo) = inner.projects.get(&project_id).map(|e| e.path.clone()) else {
                 let t = &mut inner.tasks[idx];
@@ -1469,6 +1465,40 @@ impl Sessions {
         Ok(proc.is_none_or(|p| p.wait_exit(timeout)))
     }
 
+    /// Take the child of a session away without ending the conversation: a live session is
+    /// suspended (a reply resumes it), one already paused or over is left as it is. Then
+    /// wait for the process to be gone. `Ok(false)` on timeout. The wait takes no lock.
+    pub fn pause_and_wait(&self, session_id: &str, timeout: Duration) -> Result<bool, String> {
+        let mut inner = self.lock();
+        let in_flight = inner.task_in_flight(session_id);
+        let s = inner.sessions.get_mut(session_id).ok_or("unknown session")?;
+        let mut paused = false;
+        if !matches!(s.state.status, SessionStatus::Suspended | SessionStatus::Ended | SessionStatus::Failed) {
+            let at = s.state.last_activity_at;
+            s.state.suspend(at);
+            paused = true;
+        }
+        if s.proc.is_some() {
+            // The exit of this child is not news to the state machine.
+            s.spawn_gen += 1;
+        }
+        let proc = s.proc.clone();
+        inner.sync_task(session_id);
+        let freed = in_flight && !inner.task_in_flight(session_id);
+        if paused {
+            self.publish(inner, session_id);
+        } else {
+            drop(inner);
+        }
+        if let Some(p) = &proc {
+            p.kill();
+        }
+        if freed {
+            self.free_slot(None);
+        }
+        Ok(proc.is_none_or(|p| p.wait_exit(timeout)))
+    }
+
     /// App exit: suspend every live session, write the final state and wait for it, and only
     /// then kill the children, so no child outlives the app. Once this starts the readers
     /// are ignored, so the exit that follows the kill cannot turn a session into a failure.
@@ -1910,6 +1940,7 @@ mod tests {
         assert!(wt.is_dir() && branch_present(&repo, "orchestra/t1"));
         assert_eq!(git_out(&repo, &["rev-list", "--count", &format!("{}..orchestra/t1", before)]), "0");
         assert!(wt.join("b.txt").is_file(), "the worktree was not committed or cleaned either");
+        assert!(!r.sessions.list_tasks()[0].session_over, "a refusal does not end the conversation");
         // Put the owner edit back and the same task lands.
         git_in(&repo, &["checkout", "--", "a.txt"]);
         assert_eq!(r.sessions.land_task("t1").unwrap().status, TaskStatus::Landed);
@@ -2063,6 +2094,177 @@ mod tests {
         assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), before);
         assert!(!repo.join("b.txt").exists());
         assert!(r.sessions.discard_task("t1").is_err(), "already discarded");
+        tidy(&r, &repo);
+    }
+
+    /// The task's conversation is still there: not over, and a reply resumes it in the worktree.
+    fn assert_replyable(r: &Rig, sid: &str) {
+        assert!(!r.sessions.list_tasks()[0].session_over, "the conversation was ended");
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended);
+        let before = r.spawns.lock().unwrap().len();
+        r.sessions.reply(sid, "please fix that").expect("reply after a refused land");
+        assert_eq!(r.spawns.lock().unwrap().len(), before + 1);
+        assert_eq!(task_status(r, "t1"), TaskStatus::Running);
+    }
+
+    #[test]
+    fn land_refusals_leave_the_session_replyable() {
+        // Dirty checkout.
+        let (r, p, repo) = rig_repo("replydirty");
+        let sid = done_task(&r, &p);
+        worktree_commit(&r.base.join(&p.id).join("t1"), "b.txt", "t1: add b");
+        std::fs::write(repo.join("a.txt"), "owner edit").unwrap();
+        assert!(r.sessions.land_task("t1").unwrap_err().contains("uncommitted changes"));
+        assert_replyable(&r, &sid);
+        tidy(&r, &repo);
+
+        // Claude attribution in a commit.
+        let (r, p, repo) = rig_repo("replytrailer");
+        let sid = done_task(&r, &p);
+        let trailer = ["Co-Authored-By: Claude ", "<noreply@anthropic.com>"].concat();
+        worktree_commit(&r.base.join(&p.id).join("t1"), "b.txt", &format!("t1: add b\n\n{trailer}"));
+        assert!(r.sessions.land_task("t1").unwrap_err().contains("Claude attribution"));
+        assert_replyable(&r, &sid);
+        tidy(&r, &repo);
+
+        // A hook refusing the leftover commit.
+        let (r, p, repo) = rig_repo("replyhook");
+        let sid = done_task(&r, &p);
+        std::fs::write(r.base.join(&p.id).join("t1").join("b.txt"), "left over").unwrap();
+        let hook = repo.join(".git").join("hooks").join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(r.sessions.land_task("t1").unwrap_err().contains("hook"));
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_replyable(&r, &sid);
+        tidy(&r, &repo);
+
+        // A conflict.
+        let (r, p, repo) = rig_repo("replyconflict");
+        let sid = done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        std::fs::write(wt.join("a.txt"), "task version").unwrap();
+        git_in(&wt, &["commit", "-am", "t1: change a"]);
+        std::fs::write(repo.join("a.txt"), "owner version").unwrap();
+        git_in(&repo, &["commit", "-am", "owner change a"]);
+        assert!(r.sessions.land_task("t1").unwrap_err().contains("conflicts"));
+        assert_replyable(&r, &sid);
+        tidy(&r, &repo);
+    }
+
+    /// Make `link` a junction to `target`, test code only.
+    #[cfg(windows)]
+    fn mk_junction(link: &Path, target: &Path) {
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "mklink failed");
+    }
+
+    /// Remove a junction as a link, so that no recursive delete can follow it.
+    #[cfg(windows)]
+    fn rm_junction(link: &Path) {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_dir(link).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    fn canary(name: &str) -> PathBuf {
+        let c = scratch(name);
+        std::fs::create_dir_all(c.join("sub")).unwrap();
+        std::fs::write(c.join("keep.txt"), "keep").unwrap();
+        std::fs::write(c.join("sub").join("deep.txt"), "deep").unwrap();
+        c
+    }
+
+    #[cfg(windows)]
+    fn canary_intact(c: &Path) -> bool {
+        c.join("keep.txt").is_file() && c.join("sub").join("deep.txt").is_file()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discard_spares_the_target_of_a_junction_in_the_worktree() {
+        let (r, p, repo) = rig_repo("discardjunction");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let outside = canary("discardjunction-canary");
+        mk_junction(&wt.join("node_modules"), &outside);
+
+        let s = r.sessions.discard_task("t1").unwrap();
+        rm_junction(&wt.join("node_modules"));
+        assert!(canary_intact(&outside), "the canary was emptied");
+        assert_eq!(s.status, TaskStatus::Discarded);
+        assert!(!wt.exists());
+        assert!(!branch_present(&repo, "orchestra/t1"));
+        let _ = std::fs::remove_dir_all(&outside);
+        tidy(&r, &repo);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn land_spares_the_target_of_a_junction_in_the_worktree() {
+        let (r, p, repo) = rig_repo("landjunction");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        worktree_commit(&wt, "b.txt", "t1: add b");
+        let outside = canary("landjunction-canary");
+        // Ignored, so that `add -A` does not read the canary into the branch.
+        std::fs::write(repo.join(".git").join("info").join("exclude"), "node_modules\n").unwrap();
+        mk_junction(&wt.join("node_modules"), &outside);
+
+        let s = r.sessions.land_task("t1").unwrap();
+        rm_junction(&wt.join("node_modules"));
+        assert!(canary_intact(&outside), "the canary was emptied");
+        assert_eq!(s.status, TaskStatus::Landed);
+        assert!(!wt.exists());
+        let _ = std::fs::remove_dir_all(&outside);
+        tidy(&r, &repo);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_cleanup_spares_the_target_of_a_junction() {
+        let (r, p, repo) = rig_repo("retryjunction");
+        done_task(&r, &p);
+        let wt = r.base.join(&p.id).join("t1");
+        let outside = canary("retryjunction-canary");
+        mk_junction(&wt.join("node_modules"), &outside);
+        {
+            let mut inner = r.sessions.lock();
+            let t = &mut inner.tasks[0];
+            t.status = TaskStatus::CleanupPending;
+            t.note = Some(format!("{}{}", task::DISCARDED, task::PENDING_SUFFIX));
+        }
+        let s = r.sessions.retry_cleanup("t1").unwrap();
+        rm_junction(&wt.join("node_modules"));
+        assert!(canary_intact(&outside), "the canary was emptied");
+        assert_eq!(s.status, TaskStatus::Discarded);
+        let _ = std::fs::remove_dir_all(&outside);
+        tidy(&r, &repo);
+    }
+
+    #[test]
+    fn discarded_queued_task_never_starts() {
+        let (r, p, repo) = rig_repo("discardrace");
+        for _ in 0..3 {
+            r.sessions.create_task(&p.id, "work", SessionSettings::default()).unwrap();
+        }
+        assert_eq!(task_status(&r, "t3"), TaskStatus::Queued);
+        // The discard has taken the task; a pump now must leave it alone.
+        let (_ctx, busy) = r.sessions.begin_task("t3", &[TaskStatus::Queued], "x").unwrap();
+        r.feed_nth(0, INIT_UUID);
+        r.feed_nth(0, DONE);
+        r.sessions.pump();
+        assert_eq!(task_status(&r, "t3"), TaskStatus::Queued, "claimed while a discard held it");
+        drop(busy);
+        assert_eq!(r.sessions.discard_task("t3").unwrap().status, TaskStatus::Discarded);
+        r.sessions.pump();
+        assert_eq!(task_status(&r, "t3"), TaskStatus::Discarded);
         tidy(&r, &repo);
     }
 
