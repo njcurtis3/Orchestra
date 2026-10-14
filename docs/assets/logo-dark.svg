@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 330 72" width="330" height="72" shape-rendering="crispEdges">
+  <title>Orchestra</title>
+  <rect x="0" y="40" width="10" height="24" fill="#ececf0"/>
+  <rect x="16" y="28" width="10" height="36" fill="#ececf0"/>
+  <rect x="32" y="16" width="10" height="48" fill="#ececf0"/>
+  <rect x="48" y="4" width="10" height="60" fill="#7c5cff"/>
+  <rect x="48" y="4" width="10" height="10" fill="#b38a00"/>
+  <text x="76" y="58" font-family="Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="54" font-weight="600" letter-spacing="-1" fill="#c8c8cf" shape-rendering="geometricPrecision">orchestra</text>
+</svg>
