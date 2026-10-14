@@ -90,3 +90,52 @@ export type Answer =
   | { kind: "reply"; session_id: string; text: string };
 
 export const MAX_TEXT_BYTES = 32768;
+
+// Tasks: a prompt run in its own git worktree. Mirrors session/task.rs. The worktree path
+// never crosses IPC, so nothing here is a path.
+export const TASK_STATUSES = [
+  "queued",
+  "running",
+  "needs_input",
+  "done",
+  "landing",
+  "landed",
+  "discarded",
+  "cleanup_pending",
+  "error",
+] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export type TaskSummary = {
+  id: string;
+  project_id: string;
+  project_name: string;
+  status: TaskStatus;
+  title: string; // first line of the prompt, capped at 120 chars
+  created_at: number; // ms epoch
+  session_id: string | null; // none while queued
+  branch: string | null;
+  base_branch: string;
+  note: string | null;
+  last_turn_error: boolean;
+  session_over: boolean;
+};
+
+export const DIFF_FILE_STATUSES = ["added", "modified", "deleted"] as const;
+export type DiffFileStatus = (typeof DIFF_FILE_STATUSES)[number];
+export type DiffFile = { path: string; status: DiffFileStatus; added: number; removed: number; binary: boolean };
+
+// A commit of the task branch; the body is capped at 4 KiB in Rust.
+export type CommitView = { id: string; subject: string; body: string };
+
+// The review of a done task. The patch is capped (1 MiB) in Rust; `truncated` says it was.
+export type TaskDiff = {
+  files: DiffFile[];
+  files_truncated: boolean;
+  patch: string;
+  truncated: boolean;
+  commits: CommitView[];
+  base_branch: string;
+};
+
+export const DIFF_CAP_KIB = 1024;

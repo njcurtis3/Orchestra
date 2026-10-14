@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { decodeInboxItem, decodeSession } from "./ipc";
 import { initialState, reducer } from "./state";
-import type { InboxItem, SessionSummary } from "./types";
+import type { InboxItem, SessionSummary, TaskStatus, TaskSummary } from "./types";
 
 const session = (id: string, at: number, over: Partial<SessionSummary> = {}): SessionSummary => ({
   id,
@@ -126,5 +126,48 @@ describe("decoders", () => {
     let s = reducer(initialState, { type: "inbox-updated", items: [item("i2", 5)] });
     s = reducer(s, { type: "inbox-loaded", items: [item("i1", 1), item("i3", 9)] });
     expect(s.inbox.map((x) => x.id)).toEqual(["i3", "i2", "i1"]);
+  });
+});
+
+const task = (id: string, at: number, status: TaskStatus = "queued"): TaskSummary => ({
+  id,
+  project_id: "p1",
+  project_name: "proj",
+  status,
+  title: "t",
+  created_at: at,
+  session_id: null,
+  branch: null,
+  base_branch: "main",
+  note: null,
+  last_turn_error: false,
+  session_over: false,
+});
+
+describe("reducer tasks", () => {
+  it("inserts on task-updated and replaces by id, oldest first", () => {
+    let s = reducer(initialState, { type: "task-updated", task: task("b", 2) });
+    s = reducer(s, { type: "task-updated", task: task("a", 1) });
+    expect(s.tasks.map((t) => t.id)).toEqual(["a", "b"]);
+    s = reducer(s, { type: "task-updated", task: task("a", 1, "running") });
+    expect(s.tasks).toHaveLength(2);
+    expect(s.tasks[0].status).toBe("running");
+  });
+
+  it("merges a snapshot under what events already delivered", () => {
+    let s = reducer(initialState, { type: "task-updated", task: task("a", 1, "done") });
+    s = reducer(s, { type: "tasks-loaded", tasks: [task("a", 1, "running"), task("b", 2)] });
+    expect(s.tasks.map((t) => [t.id, t.status])).toEqual([
+      ["a", "done"],
+      ["b", "queued"],
+    ]);
+  });
+
+  it("selecting a task clears the selected session and the reverse", () => {
+    let s = reducer(initialState, { type: "select-session", id: "s1" });
+    s = reducer(s, { type: "select-task", id: "t1" });
+    expect([s.selected, s.selectedTask]).toEqual([null, "t1"]);
+    s = reducer(s, { type: "select-session", id: "s2" });
+    expect([s.selected, s.selectedTask]).toEqual(["s2", null]);
   });
 });

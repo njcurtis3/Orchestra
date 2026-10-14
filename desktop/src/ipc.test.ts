@@ -3,6 +3,9 @@ import {
   decodeInboxItem,
   decodeSession,
   decodeStorageStatus,
+  decodeTask,
+  decodeTaskDiff,
+  decodeTasks,
   decodeTranscript,
   decodeTranscriptBatch,
   decodeTranscriptRecord,
@@ -155,5 +158,69 @@ describe("decodeTranscript", () => {
 
   it("throws on a single bad record", () => {
     expect(() => decodeTranscriptRecord(rec({ kind: "tool_use", id: "t" }))).toThrow();
+  });
+});
+
+const taskWire = (status: unknown, extra: Record<string, unknown> = {}) => ({
+  id: "t1",
+  project_id: "p1",
+  project_name: "proj",
+  status,
+  title: "do it",
+  created_at: 1,
+  session_id: null,
+  branch: "orchestra/t1",
+  base_branch: "main",
+  note: null,
+  last_turn_error: false,
+  session_over: false,
+  ...extra,
+});
+
+describe("decodeTask", () => {
+  it("decodes every status Rust can send", () => {
+    for (const s of ["queued", "running", "needs_input", "done", "landing", "landed", "discarded", "cleanup_pending", "error"]) {
+      expect(decodeTask(taskWire(s)).status).toBe(s);
+    }
+  });
+
+  it("drops an unknown status through onDrop and keeps the rest of the list", () => {
+    expect(() => decodeTask(taskWire("paused"))).toThrow("unknown status");
+    const dropped: unknown[] = [];
+    const list = decodeTasks([taskWire("done"), taskWire("paused", { id: "t2" })], (e) => dropped.push(e));
+    expect(list.map((t) => t.id)).toEqual(["t1"]);
+    expect(dropped).toHaveLength(1);
+  });
+
+  it("ignores an extra path-like field", () => {
+    const t = decodeTask(taskWire("done", { worktree: "C:/data/worktrees/p1/t1", path: "/tmp/zzz" }));
+    expect(Object.keys(t)).not.toContain("worktree");
+    expect(Object.keys(t)).not.toContain("path");
+    expect(JSON.stringify(t)).not.toContain("zzz");
+    expect(JSON.stringify(t)).not.toContain("worktrees");
+  });
+
+  it("rejects a missing required field", () => {
+    expect(() => decodeTask({ ...taskWire("done"), base_branch: undefined })).toThrow("bad field base_branch");
+  });
+});
+
+describe("decodeTaskDiff", () => {
+  const wireDiff = {
+    files: [{ path: "a.txt", status: "added", added: 2, removed: 0, binary: false }],
+    files_truncated: false,
+    patch: "+x\n",
+    truncated: true,
+    commits: [{ id: "abc1234", subject: "s", body: "b\n\nCo-Authored-By: x" }],
+    base_branch: "main",
+  };
+  it("decodes files, commits with their full body, and the truncation flags", () => {
+    const d = decodeTaskDiff(wireDiff);
+    expect(d.commits[0].body).toContain("Co-Authored-By");
+    expect(d.truncated).toBe(true);
+    expect(d.files[0].added).toBe(2);
+  });
+  it("rejects an unknown file status", () => {
+    expect(() => decodeTaskDiff({ ...wireDiff, files: [{ ...wireDiff.files[0], status: "renamed" }] })).toThrow();
   });
 });
