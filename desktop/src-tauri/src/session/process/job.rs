@@ -24,7 +24,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JobObjectBasicAccountingInformation, QueryInformationJobObject,
 };
 
 pub struct Job(HANDLE);
@@ -76,6 +77,26 @@ impl Job {
     }
 }
 
+impl Job {
+    /// How many processes are still in the job. Zero if the query fails, which only
+    /// ever ends a wait early.
+    pub fn active(&self) -> u32 {
+        // SAFETY: all-zero is a valid value for this plain struct.
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is live and of the size passed; the handle is open.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JobObjectBasicAccountingInformation,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { 0 } else { info.ActiveProcesses }
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         // SAFETY: the handle is owned by this value and closed exactly once.
@@ -90,25 +111,9 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
-    use windows_sys::Win32::System::JobObjects::{
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-        QueryInformationJobObject,
-    };
 
     fn active(job: &Job) -> u32 {
-        // SAFETY: all-zero is a valid value for this plain struct.
-        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is live and of the size passed; the handle is open.
-        unsafe {
-            QueryInformationJobObject(
-                job.0,
-                JobObjectBasicAccountingInformation,
-                std::ptr::addr_of_mut!(info).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            );
-        }
-        info.ActiveProcesses
+        job.active()
     }
 
     fn wait_until(what: &str, mut f: impl FnMut() -> bool) {

@@ -12,7 +12,7 @@ pub mod transcript;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -652,6 +652,14 @@ impl Sessions {
         Ok(())
     }
 
+    /// `stop`, then wait for the process (and its job) to be gone. `Ok(false)` on timeout.
+    /// The wait takes no lock, so readers and other commands keep running meanwhile.
+    pub fn stop_and_wait(&self, session_id: &str, timeout: Duration) -> Result<bool, String> {
+        self.stop(session_id)?;
+        let proc = self.lock().sessions.get(session_id).and_then(|s| s.proc.clone());
+        Ok(proc.is_none_or(|p| p.wait_exit(timeout)))
+    }
+
     /// App exit: suspend every live session, write the final state and wait for it, and only
     /// then kill the children, so no child outlives the app. Once this starts the readers
     /// are ignored, so the exit that follows the kill cannot turn a session into a failure.
@@ -705,6 +713,8 @@ mod tests {
         killed: AtomicBool,
         fail: AtomicBool,
         on_write: Mutex<Option<OnWrite>>,
+        /// Run inside `wait_exit`, to observe what is held while waiting.
+        on_wait: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl Proc for Fake {
@@ -724,6 +734,12 @@ mod tests {
         }
         fn kill(&self) {
             self.killed.store(true, Ordering::SeqCst);
+        }
+        fn wait_exit(&self, _timeout: Duration) -> bool {
+            if let Some(f) = self.on_wait.lock().unwrap().as_ref() {
+                f();
+            }
+            self.killed.load(Ordering::SeqCst)
         }
     }
 
@@ -750,6 +766,7 @@ mod tests {
             killed: AtomicBool::new(false),
             fail: AtomicBool::new(false),
             on_write: Mutex::new(None),
+            on_wait: Mutex::new(None),
         });
         let sink: Arc<Mutex<Option<Sink>>> = Arc::new(Mutex::new(None));
         let events = Arc::new(Mutex::new(vec![]));
@@ -892,6 +909,20 @@ mod tests {
         r2.sessions.start(&p2.id, "go", SessionSettings::default()).unwrap();
         r2.sessions.shutdown();
         assert!(r2.fake.killed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stop_and_wait_holds_no_lock_while_waiting() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        let free = Arc::new(AtomicBool::new(false));
+        let (sessions, f2) = (r.sessions.clone(), free.clone());
+        *r.fake.on_wait.lock().unwrap() = Some(Box::new(move || {
+            f2.store(sessions.inner.try_lock().is_ok(), Ordering::SeqCst);
+        }));
+        assert_eq!(r.sessions.stop_and_wait(&s.id, Duration::from_secs(1)), Ok(true));
+        assert!(free.load(Ordering::SeqCst), "Inner was held during wait_exit");
+        assert!(r.sessions.stop_and_wait("nope", Duration::from_secs(1)).is_err());
     }
 
     #[test]
