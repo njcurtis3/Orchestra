@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -215,6 +215,27 @@ fn parse_lines<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Record> {
     lines.filter_map(|l| serde_json::from_str::<Record>(l).ok()).collect()
 }
 
+/// A session file as found on disk. Read as bytes: a torn tail can cut a multi-byte
+/// character, and a file that is not valid UTF-8 must not read as missing.
+struct RawFile {
+    /// Lossy decode; the cut character becomes U+FFFD and its line fails to parse.
+    text: String,
+    /// Length of the raw file.
+    bytes: u64,
+    /// The raw file is non-empty and its last byte is not a newline.
+    torn: bool,
+}
+
+/// `None` when the file cannot be read, which is how a missing file reads.
+fn read_raw(path: &Path) -> Option<RawFile> {
+    let raw = fs::read(path).ok()?;
+    Some(RawFile {
+        text: String::from_utf8_lossy(&raw).into_owned(),
+        bytes: raw.len() as u64,
+        torn: raw.last().is_some_and(|b| *b != b'\n'),
+    })
+}
+
 impl TranscriptStore {
     pub fn disk(dir: PathBuf) -> Self {
         Self::with(Backend::Disk(dir), MAX_FILE_BYTES)
@@ -249,11 +270,11 @@ impl TranscriptStore {
         }
         st.loaded = true;
         st.next_seq = 1;
-        if let Some(text) = self.path(id).and_then(|p| fs::read_to_string(p).ok()) {
-            st.bytes = text.len() as u64;
-            st.needs_newline = !text.is_empty() && !text.ends_with('\n');
+        if let Some(file) = self.path(id).and_then(|p| read_raw(&p)) {
+            st.bytes = file.bytes;
+            st.needs_newline = file.torn;
             // Every parseable line counts: a torn tail or a garbage line must not reset the numbering.
-            let records = parse_lines(text.lines());
+            let records = parse_lines(file.text.lines());
             if let Some(max) = records.iter().map(|r| r.seq).max() {
                 st.next_seq = max + 1;
             }
@@ -279,7 +300,9 @@ impl TranscriptStore {
             }
             let mut rec = Record { seq: st.next_seq, at, entry };
             let mut line = serde_json::to_string(&rec).unwrap_or_default();
-            if st.bytes + (text.len() + line.len() + 1) as u64 > self.max_file_bytes {
+            // The newline that separates a torn tail from the first new line counts too.
+            let lead = usize::from(st.needs_newline);
+            if st.bytes + (lead + text.len() + line.len() + 1) as u64 > self.max_file_bytes {
                 rec = Record { seq: st.next_seq, at, entry: Entry::Truncated };
                 line = serde_json::to_string(&rec).unwrap_or_default();
                 st.full = true;
@@ -293,10 +316,12 @@ impl TranscriptStore {
             (Backend::Disk(dir), Some(path)) => {
                 if st.needs_newline && !text.is_empty() {
                     text.insert(0, '\n');
-                    st.needs_newline = false;
                 }
                 let _ = fs::create_dir_all(dir);
-                let _ = OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(text.as_bytes()));
+                let wrote = OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(text.as_bytes()));
+                if wrote.is_ok() {
+                    st.needs_newline = false;
+                }
             }
             _ => st.mem.extend(text.lines().map(str::to_string)),
         }
@@ -312,8 +337,8 @@ impl TranscriptStore {
         let file = self.file(id);
         let mut st = file.lock().unwrap_or_else(|e| e.into_inner());
         self.load(id, &mut st);
-        let mut all = match self.path(id).and_then(|p| fs::read_to_string(p).ok()) {
-            Some(text) => parse_lines(text.lines()),
+        let mut all = match self.path(id).and_then(|p| read_raw(&p)) {
+            Some(file) => parse_lines(file.text.lines()),
             None => parse_lines(st.mem.iter().map(String::as_str)),
         };
         let from = all.len().saturating_sub(PAGE_ENTRIES);
@@ -471,6 +496,52 @@ mod tests {
         assert_eq!(parse_lines(text.lines()).len(), 8, "the 7 complete lines and the new one parse");
         assert_eq!(text.lines().count(), 9, "the fragment keeps its own line");
         assert_eq!(store.read("s5").next_seq, 9);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tear_inside_a_multibyte_char_keeps_history_and_numbering() {
+        let mut raw = complete_lines(7).into_bytes();
+        raw.extend_from_slice(b"{\"seq\":8,\"at\":1,\"kind\":\"user_prompt\",\"text\":\"caf");
+        raw.push("\u{e9}".as_bytes()[0]); // first byte of a 2-byte char, then the file ends
+        assert!(std::str::from_utf8(&raw).is_err());
+        let d = scratch("utf8");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("s9.jsonl"), &raw).unwrap();
+        let store = TranscriptStore::disk(d.clone());
+
+        let mut st = FileState::default();
+        store.load("s9", &mut st);
+        assert_eq!(st.bytes, raw.len() as u64, "byte count is the raw length");
+        assert!(st.needs_newline);
+        assert_eq!(st.next_seq, 8);
+
+        let r = store.append("s9", vec![user_prompt("after")], 2);
+        assert_eq!(r[0].seq, 8);
+        let bytes = fs::read(d.join("s9.jsonl")).unwrap();
+        assert_eq!(bytes.len(), raw.len() + 1 + serde_json::to_string(&r[0]).unwrap().len() + 1);
+        let text = String::from_utf8_lossy(&bytes);
+        let last = text.lines().last().unwrap();
+        assert_eq!(serde_json::from_str::<Record>(last).unwrap().seq, 8, "new record is on its own line");
+        let page = store.read("s9");
+        assert_eq!(page.entries.len(), 8, "7 good entries and the new one");
+        assert_eq!(page.entries[0].seq, 1);
+        assert_eq!(page.next_seq, 9);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn newline_before_a_torn_tail_counts_toward_the_cap() {
+        let body = complete_lines(2) + "{\"seq\":3";
+        let d = scratch("capnl");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("s2.jsonl"), &body).unwrap();
+        let line_len = serde_json::to_string(&Record { seq: 3, at: 1, entry: user_prompt("x") }).unwrap().len() as u64;
+        // Room for the line and its own newline, but not for the separator too.
+        let cap = body.len() as u64 + line_len + 1;
+        let store = TranscriptStore::with(Backend::Disk(d.clone()), cap);
+        let r = store.append("s2", vec![user_prompt("x")], 1);
+        assert_eq!(r[0].entry, Entry::Truncated);
         let _ = fs::remove_dir_all(&d);
     }
 
