@@ -2358,6 +2358,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "orchestra"
 version = "0.1.0"
 dependencies = [
+ "orchestra-core",
  "serde",
  "serde_json",
  "tauri",
@@ -2365,6 +2366,14 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-window-state",
+]
+
+[[package]]
+name = "orchestra-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "windows-sys 0.60.2",
 ]
 

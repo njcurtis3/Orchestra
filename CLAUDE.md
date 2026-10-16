@@ -15,14 +15,15 @@ Standalone app under the repos/ umbrella. Never import from a sibling app; see .
 
 | Path | What | Stack |
 |---|---|---|
-| `desktop/` | Desktop app; Rust core in `desktop/src-tauri`, UI in `desktop/src` | Tauri 2, React, TypeScript, Vite |
+| `core/` | `orchestra-core`: the host engine (sessions, tasks, projects, notifications); no tauri dependency | Rust 2024 |
+| `desktop/` | Tauri shell over `core/` (`desktop/src-tauri`), UI in `desktop/src` | Tauri 2, React, TypeScript, Vite |
 | `mobile/` | Android remote | Expo (React Native, TypeScript), expo-router |
-| `protocol/` | Desktop <-> phone message format | TypeScript (source of truth), Rust copy in desktop |
+| `protocol/` | Client <-> host message format | TypeScript (source of truth), Rust copy in desktop |
 | `fleet/` | Vendored orchestration model | synced from upstream, **never hand-edited** |
 | `.github/workflows/` | Release matrix (desktop) | GitHub Actions, tauri-action |
 
-There is no root `package.json` or workspace. `desktop/` and `mobile/` each install on
-their own.
+There is no root `package.json`. The root `Cargo.toml` is a Rust workspace (`core/`,
+`desktop/src-tauri`); `desktop/` and `mobile/` each install on their own.
 
 ## Commands
 
@@ -36,13 +37,14 @@ cd desktop && npm install
 npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest)
-cd src-tauri && cargo test # Rust tests
+cd .. && cargo test --workspace  # Rust tests from the repo root (181 core + 10 shell)
 
 # mobile
 cd mobile && npm install
 npx expo start             # dev server; also generates expo-env.d.ts (gitignored)
 npx tsc --noEmit           # typecheck; run `npx expo start` once first
 npx expo-doctor            # dependency/config check
+npm test                   # unit tests (jest-expo)
 npx expo install <pkg>     # always, instead of npm install <pkg>
 ```
 
@@ -53,10 +55,11 @@ key and store listings are created behind the ops gate, never at scaffold time.
 
 ## Architecture
 
-- **Desktop is the host.** It runs agents locally, tracks their state through the agents'
-  own hooks, and holds the inbox. State lives on the desktop machine.
-- **Mobile is a client** of the desktop over the protocol in `protocol/`. It holds no agent
-  state of its own beyond a cache.
+- **A host is the desktop app or `orchestrad`** (headless, H2). It runs agents locally,
+  tracks their state through the agents' own hooks, and holds the inbox. State lives on the
+  host machine.
+- **Clients are the phone and the desktop app attached to a remote host,** over the protocol
+  in `protocol/`. A client holds no agent state of its own beyond a cache.
 - **`fleet/` is the orchestration model** the desktop executes: agent definitions, skills,
   run-state schema, verify/brief scripts.
 
