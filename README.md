@@ -154,7 +154,7 @@ folder (`%APPDATA%\com.telosrg.orchestra` on Windows).
 
 | Part | What |
 |---|---|
-| [`desktop/`](desktop) | The Tauri 2 app: Rust core in `desktop/src-tauri`, React and TypeScript UI in `desktop/src`. Runs and tracks agents and hosts the inbox. |
+| [`desktop/`](desktop) | The Tauri 2 app: a thin shell in `desktop/src-tauri` over the Rust host engine in [`core/`](core), React and TypeScript UI in `desktop/src`. Runs and tracks agents and hosts the inbox. |
 | [`mobile/`](mobile) | The Expo app for Android: the remote. Notifications, status and answers. Not functional yet. |
 | [`protocol/`](protocol/README.md) | The message format between desktop and phone. Empty until the link is designed. |
 | [`fleet/`](fleet/README.md) | The vendored orchestration model. Synced from upstream and never edited by hand. |
@@ -166,7 +166,8 @@ folder (`%APPDATA%\com.telosrg.orchestra` on Windows).
 cd desktop
 npm run build              # typecheck and build the frontend (no Rust needed)
 npm test                   # frontend tests (vitest)
-cd src-tauri && cargo test # Rust tests
+cd ..
+cargo test --workspace  # Rust tests (core and shell)
 
 cd mobile
 npx expo start             # dev server

@@ -1,12 +1,10 @@
 mod commands;
-mod git;
-mod notify;
-mod projects;
-mod session;
 mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_notification::NotificationExt;
+
+use orchestra_core::{notify, projects, session};
 
 use commands::AppSessions;
 use session::{Event, Sessions, process, store, transcript};
