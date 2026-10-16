@@ -8,7 +8,6 @@
     "scheme": "orchestra",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon",
       "bundleIdentifier": "com.telosrg.orchestra"
     },
     "android": {
