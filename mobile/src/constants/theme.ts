@@ -61,5 +61,6 @@ export const Spacing = {
   six: 64,
 } as const;
 
-export const BottomTabInset = Platform.select({ ios: 50, android: 80 }) ?? 0;
+export const MinTouchTarget = 48;
+export const MinTouchSpacing = 8;
 export const MaxContentWidth = 800;
