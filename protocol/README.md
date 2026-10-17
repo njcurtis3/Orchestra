@@ -201,6 +201,25 @@ Reserved now so a later milestone does not need a v2:
 
 **Reopened if:** no reversal condition was recorded at the gate.
 
+## Using it
+
+No package, no workspace, no copy step: a consumer imports the files by relative path.
+`protocol/` is erasable TypeScript with relative, extensionless imports and no construct that
+Babel compiles to a `@babel/runtime` helper (no `class`, no iterable destructuring), because
+it has no `node_modules` of its own.
+
+- **Mobile** adds `../protocol` to `watchFolders` in `metro.config.js` (Expo watches only its
+  own folder outside a workspace, and Metro will not resolve a file it does not watch). Its
+  jest suite runs the same fixtures.
+- **Desktop** does not import it at runtime yet; `src/protocol.test.ts` is the canonical
+  fixture run and asserts that `src/types.ts` stays assignable to the wire types.
+- **Rust** is `orchestra_core::wire`, tested against `fixtures/` by `core/tests/wire_fixtures.rs`.
+- A **fixture case** is one file: `{name, dir, wire | raw, expect, client_only?, decoded_wire?}`.
+  `dir` is `c2h`, `h2c` or the plaintext `hs_c2h`, `hs_h2c`. `expect` is `"ok"` (decode, then
+  encode, gives back `wire`) or `{error: code}`. A `client_only` case holds a tolerance the
+  Rust copy does not model (an unknown enum value, an extra field); Rust only checks that it is
+  JSON. `decoded_wire` is what a lossy decode re-encodes to.
+
 ## What P2 decided
 
 Wire types in code (`types.ts`, `codec.ts`), the Rust copy (`orchestra_core::wire`) and the

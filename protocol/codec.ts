@@ -36,14 +36,27 @@ import type {
   TranscriptRecord,
 } from "./types";
 
-export class ProtocolError extends Error {
+export interface ProtocolError extends Error {
   readonly code: ErrorCode;
-  constructor(code: ErrorCode, message: string) {
-    super(message);
-    this.name = "ProtocolError";
-    this.code = code;
-  }
 }
+
+// Not a `class`: Babel compiles a class that extends Error into five @babel/runtime helpers,
+// and this folder has no node_modules to resolve them from when mobile (Metro, jest) imports
+// it by relative path. Keep this file free of constructs that need a helper (classes,
+// destructuring of iterables, default imports of JSON); the mobile jest run catches one.
+export const ProtocolError = function ProtocolError(
+  this: { name: string; message: string; code: ErrorCode; stack?: string },
+  code: ErrorCode,
+  message: string,
+): void {
+  this.name = "ProtocolError";
+  this.message = message;
+  this.code = code;
+  this.stack = new Error(message).stack;
+} as unknown as { new (code: ErrorCode, message: string): ProtocolError; prototype: ProtocolError };
+(ProtocolError as { prototype: unknown }).prototype = Object.create(Error.prototype, {
+  constructor: { value: ProtocolError, writable: true, configurable: true },
+});
 
 type Obj = Record<string, unknown>;
 
@@ -166,9 +179,9 @@ function capStrings(v: unknown): void {
   } else if (Array.isArray(v)) {
     v.forEach(capStrings);
   } else if (typeof v === "object" && v !== null) {
-    for (const [k, x] of Object.entries(v)) {
+    for (const k of Object.keys(v)) {
       capStrings(k);
-      capStrings(x);
+      capStrings((v as Obj)[k]);
     }
   }
 }
