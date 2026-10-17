@@ -1,0 +1,9 @@
+{
+  "name": "h2c.pong",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "pong"
+  },
+  "expect": "ok"
+}

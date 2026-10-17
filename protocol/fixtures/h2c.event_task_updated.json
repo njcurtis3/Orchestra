@@ -1,0 +1,25 @@
+{
+  "name": "h2c.event_task_updated",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 5,
+    "name": "task-updated",
+    "payload": {
+      "id": "t1",
+      "project_id": "p1",
+      "project_name": "orchestra",
+      "status": "done",
+      "title": "Add the codec",
+      "created_at": 1760000000500,
+      "session_id": "s1",
+      "branch": "orchestra/t1",
+      "base_branch": "main",
+      "note": null,
+      "last_turn_error": false,
+      "session_over": false
+    }
+  },
+  "expect": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "c2h.err_unknown_type",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "subscribe"
+  },
+  "expect": {
+    "error": "unknown_type"
+  }
+}

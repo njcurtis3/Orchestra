@@ -1,0 +1,55 @@
+{
+  "name": "h2c.event_inbox_updated",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 3,
+    "name": "inbox-updated",
+    "payload": [
+      {
+        "id": "i1",
+        "session_id": "s1",
+        "kind": "permission",
+        "created_at": 1760000002000,
+        "resolved": false,
+        "expired": false,
+        "summary": "Run cargo test",
+        "tool_name": "Bash",
+        "tool_input_preview": "{\"command\": \"cargo test\"}",
+        "questions": null,
+        "result_text": null
+      },
+      {
+        "id": "i2",
+        "session_id": "s1",
+        "kind": "question",
+        "created_at": 1760000003000,
+        "resolved": false,
+        "expired": false,
+        "summary": "Which database?",
+        "tool_name": null,
+        "tool_input_preview": null,
+        "questions": [
+          {
+            "question": "Which database?",
+            "header": "DB",
+            "multi_select": false,
+            "options": [
+              {
+                "label": "sqlite",
+                "description": "Embedded"
+              },
+              {
+                "label": "postgres",
+                "description": null
+              }
+            ]
+          }
+        ],
+        "result_text": null
+      }
+    ]
+  },
+  "expect": "ok"
+}

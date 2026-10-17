@@ -2,16 +2,18 @@
 
 The contract between a **host**, which runs the agents, and the **clients** that watch and
 steer them. Both sides are built from this definition. This file is a decision record in
-prose: each section says what was chosen and what would reopen it. It holds no code and no
-schema files; wire types are written in P2 and P3.
+prose: each section says what was chosen and what would reopen it. The wire types are code
+beside it: `types.ts`, `constants.ts` and `codec.ts` define protocol v1, and `fixtures/` holds
+the JSON cases both copies are tested against.
 
 - **One protocol, versioned here.** Every message carries the protocol version.
 - **A protocol change ships in both clients together.** A change that one client cannot
   speak is not merged until the other can. Desktop and mobile release on separate channels
   (installers vs. the Play Store), so the older client must fail loudly on a version it
   does not understand, never guess.
-- **The TypeScript definitions here are the source of truth.** The Rust copy will live in
-  `orchestra-core` (`core/`, created by H0) and is checked against them by tests.
+- **The TypeScript definitions here are the source of truth.** The Rust copy is
+  `orchestra_core::wire` (`core/src/wire/`) and is checked against them by tests that run the
+  same `fixtures/*.json`.
 
 ## Scope
 
@@ -27,7 +29,7 @@ home means the overlay. The host binds only the interfaces named in its config o
 `0.0.0.0` by default. A rented bare-metal box is reached over the user's tailnet. There is
 no open public port and no server of ours.
 
-Rejected: B, a public TLS endpoint with pinned keys, because it needs an open port. C, an
+Rejected for v1: B, a public TLS endpoint with pinned keys, because it needs an open port. C, an
 SSH tunnel, because the phone has no maintained SSH client on Expo.
 
 **Reopened if** the owner will not require an overlay for away-from-home use. Then a relay
@@ -166,12 +168,12 @@ not remote until this directory lists it with a scope.
 an `answer` resent after a dropped link (the A2 offline queue) applies once. An already
 resolved inbox item returns `error{code: already_answered}`.
 
-**Limits.** The maximum frame size is fixed in P2 (text fields keep `MAX_TEXT_BYTES` =
-32768). Handshake attempts are rate-limited per source. Frames are never logged. Absolute
+**Limits.** One decoded message is at most `MAX_MESSAGE_BYTES` = 4194304 (4 MiB) of UTF-8;
+text fields keep `MAX_TEXT_BYTES` = 32768. Handshake attempts are rate-limited per source. Frames are never logged. Absolute
 paths never cross the link (the existing IPC rule).
 
 **Reopened if:** no reversal condition was recorded at the gate. Any change to the message
-set, the handshake or the mirror rule reopens this section; the frame-size number is P2's.
+set, the handshake or the mirror rule reopens this section; the numbers are in `constants.ts`.
 
 ## Versioning
 
@@ -190,16 +192,59 @@ compatibility rules reopens this section.
 Reserved now so a later milestone does not need a v2:
 
 - **D7:** sessions and tasks carry `agent` (a string; `claude` today).
-- **D8:** `welcome` carries `host_id`, and every snapshot and event is scoped to the host of
-  that connection. Items gain an optional `host` only if D8 (SSH sub-hosts) survives.
+- **Host id:** `welcome` carries `host_id`, whatever D8 decides.
+- **D8:** every snapshot and event is scoped to the host of that connection. Items gain an
+  optional `host` only if D8 (SSH sub-hosts) survives.
 - **D6:** tasks carry `pr: null | {state, url, checks}`.
 - **H2:** the `notice` event, and a read path with no desktop-only call.
 - **H3:** host key pinning, Unreachable-not-Failed, and one connection per host.
 
-**Reopened if:** no reversal condition was recorded at the gate. D6, D7 or D8 changing shape
-reopens the matching item.
+**Reopened if:** no reversal condition was recorded at the gate.
 
-## What P2 and P3 decide
+## Using it
 
-Not decided here: wire types in code, the choice between the two JS crypto options, the
-frame-size number, and the scope UI. P2 and P3 decide them.
+No package, no workspace, no copy step: a consumer imports the files by relative path.
+`protocol/` is erasable TypeScript with relative, extensionless imports and no construct that
+Babel compiles to a `@babel/runtime` helper (no `class`, no iterable destructuring), because
+it has no `node_modules` of its own.
+
+- **Mobile** adds `../protocol` to `watchFolders` in `metro.config.js` (Expo watches only its
+  own folder outside a workspace, and Metro will not resolve a file it does not watch). Its
+  jest suite runs the same fixtures.
+- **Desktop** does not import it at runtime yet; `src/protocol.test.ts` is the canonical
+  fixture run and asserts that `src/types.ts` stays assignable to the wire types.
+- **Rust** is `orchestra_core::wire`, tested against `fixtures/` by `core/tests/wire_fixtures.rs`.
+- A **fixture case** is one file: `{name, dir, wire | raw, expect, client_only?, decoded_wire?}`.
+  `dir` is `c2h`, `h2c` or the plaintext `hs_c2h`, `hs_h2c`. `expect` is `"ok"` (decode, then
+  encode, gives back `wire`) or `{error: code}`. A `client_only` case holds a tolerance the
+  Rust copy does not model (an unknown enum value, an extra field); Rust only checks that it is
+  JSON. `decoded_wire` is what a lossy decode re-encodes to.
+
+## What P2 decided
+
+Wire types in code (`types.ts`, `codec.ts`), the Rust copy (`orchestra_core::wire`) and the
+shared fixtures. Where the sections above left a gap:
+
+- **Size.** `MAX_MESSAGE_BYTES` = 4194304 (4 MiB) for one decoded JSON message, checked
+  first, before parsing. One snapshot carries every inbox item, and an item can hold several
+  32 KiB text fields. Splitting a message across Noise frames (65535 bytes each) is P3's.
+- **Field types.** `v` is the integer 1. `call.id` is a non-empty string of at most 128
+  bytes. `seq` is a non-negative integer; the codec does not check its order (P3). Every
+  string a client sends is at most `MAX_TEXT_BYTES`. `result` has exactly one of `ok`
+  (any JSON, `null` for unit commands) and `error{code, message}`. The handshake frames are
+  `{proto: "orchestra", v}` and `{proto, v, supported: [1]}`, with no `type`. The 15 methods
+  above are the whole method set; `pick_project` is not one.
+- **Error codes.** A closed set on the host: `unsupported_version`, `unknown_type`,
+  `bad_request`, `forbidden`, `revoked`, `already_answered`, `failed`. `bad_request` covers
+  malformed JSON, a missing or non-integer `v`, a wrong field type, an unknown field, an
+  unknown method, an oversize message and an over-long string. `failed` is a command's
+  error string, mapped in P3. A client keeps a code it does not know as plain text.
+- **Tolerance.** Host input is strict: an unknown field is `bad_request`. Client input
+  ignores unknown fields, keeps unknown enum values (status, kind, model, scope, feature,
+  error code) as the strings they arrived as, and reads an unknown event name as an unknown
+  event rather than an error. An unknown `v` is `unsupported_version` in both directions.
+- **Not typed yet.** The `notice` payload (H2), `pr` (D6) and `register_push`. `agent` and
+  `host` are declared optional on the payloads; the core does not emit them today.
+- **No `ack`.** `result{id}` acknowledges a call.
+
+Still for P3: the choice between the two JS crypto options and the scope UI.

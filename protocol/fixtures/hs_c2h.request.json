@@ -1,0 +1,9 @@
+{
+  "name": "hs_c2h.request",
+  "dir": "hs_c2h",
+  "wire": {
+    "proto": "orchestra",
+    "v": 1
+  },
+  "expect": "ok"
+}

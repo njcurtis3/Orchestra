@@ -18,7 +18,7 @@ Standalone app under the repos/ umbrella. Never import from a sibling app; see .
 | `core/` | `orchestra-core`: the host engine (sessions, tasks, projects, notifications); no tauri dependency | Rust 2024 |
 | `desktop/` | Tauri shell over `core/` (`desktop/src-tauri`), UI in `desktop/src` | Tauri 2, React, TypeScript, Vite |
 | `mobile/` | Android remote | Expo (React Native, TypeScript), expo-router |
-| `protocol/` | Client <-> host message format | TypeScript (source of truth), Rust copy in desktop |
+| `protocol/` | Client <-> host message format, with shared JSON fixtures | TypeScript (source of truth), Rust copy in `core/src/wire` (`orchestra_core::wire`) |
 | `fleet/` | Vendored orchestration model | synced from upstream, **never hand-edited** |
 | `.github/workflows/` | Release matrix (desktop) | GitHub Actions, tauri-action |
 
@@ -36,15 +36,17 @@ run in git worktrees, plain sessions do not need it).
 cd desktop && npm install
 npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
-npm test                   # frontend tests (vitest)
-cd .. && cargo test --workspace  # Rust tests from the repo root (181 core + 10 shell)
+npm test                   # frontend tests (vitest), including the protocol fixtures
+npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
+cd .. && cargo test --workspace  # Rust tests from the repo root (181 core + 4 wire fixtures + 10 shell)
+cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 
 # mobile
 cd mobile && npm install
 npx expo start             # dev server; also generates expo-env.d.ts (gitignored)
 npx tsc --noEmit           # typecheck; run `npx expo start` once first
 npx expo-doctor            # dependency/config check
-npm test                   # unit tests (jest-expo)
+npm test                   # unit tests (jest-expo), including the protocol fixtures
 npx expo install <pkg>     # always, instead of npm install <pkg>
 ```
 

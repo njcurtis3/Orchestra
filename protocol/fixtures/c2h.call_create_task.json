@@ -1,0 +1,17 @@
+{
+  "name": "c2h.call_create_task",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "create_task",
+    "args": {
+      "project_id": "p1",
+      "prompt": "Add tests",
+      "model": "fable",
+      "permission_mode": "manual"
+    }
+  },
+  "expect": "ok"
+}

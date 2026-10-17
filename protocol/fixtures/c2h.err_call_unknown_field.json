@@ -1,0 +1,15 @@
+{
+  "name": "c2h.err_call_unknown_field",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "list_projects",
+    "args": {},
+    "extra": 1
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

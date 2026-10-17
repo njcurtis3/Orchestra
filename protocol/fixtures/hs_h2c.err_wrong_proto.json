@@ -1,0 +1,14 @@
+{
+  "name": "hs_h2c.err_wrong_proto",
+  "dir": "hs_h2c",
+  "wire": {
+    "proto": "other",
+    "v": 1,
+    "supported": [
+      1
+    ]
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "c2h.call_get_task_diff",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "get_task_diff",
+    "args": {
+      "task_id": "t1"
+    }
+  },
+  "expect": "ok"
+}

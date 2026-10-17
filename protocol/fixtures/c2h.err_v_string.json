@@ -1,0 +1,11 @@
+{
+  "name": "c2h.err_v_string",
+  "dir": "c2h",
+  "wire": {
+    "v": "1",
+    "type": "ping"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

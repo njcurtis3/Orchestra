@@ -1,0 +1,14 @@
+{
+  "name": "h2c.error_supported",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "error",
+    "code": "unsupported_version",
+    "message": "unsupported version",
+    "supported": [
+      1
+    ]
+  },
+  "expect": "ok"
+}

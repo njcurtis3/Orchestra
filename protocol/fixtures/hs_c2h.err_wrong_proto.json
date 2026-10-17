@@ -1,0 +1,11 @@
+{
+  "name": "hs_c2h.err_wrong_proto",
+  "dir": "hs_c2h",
+  "wire": {
+    "proto": "other",
+    "v": 1
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

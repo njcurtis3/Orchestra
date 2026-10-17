@@ -1,0 +1,14 @@
+{
+  "name": "hs_h2c.err_unsupported_version",
+  "dir": "hs_h2c",
+  "wire": {
+    "proto": "orchestra",
+    "v": 2,
+    "supported": [
+      2
+    ]
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

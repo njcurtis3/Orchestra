@@ -1,0 +1,11 @@
+{
+  "name": "h2c.err_unsupported_version",
+  "dir": "h2c",
+  "wire": {
+    "v": 2,
+    "type": "pong"
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

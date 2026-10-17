@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::git;
@@ -41,7 +41,7 @@ const CLEANUP_BACKOFF_MS: [u64; 5] = [250, 500, 1000, 2000, 2000];
 const CLEANUP_BACKOFF_MS: [u64; 5] = [10; 5];
 const BUSY_TASK: &str = "another action is running on this task";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
     pub project_id: String,

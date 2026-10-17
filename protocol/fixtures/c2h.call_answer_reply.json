@@ -1,0 +1,16 @@
+{
+  "name": "c2h.call_answer_reply",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "answer",
+    "args": {
+      "kind": "reply",
+      "session_id": "s1",
+      "text": "Go on"
+    }
+  },
+  "expect": "ok"
+}

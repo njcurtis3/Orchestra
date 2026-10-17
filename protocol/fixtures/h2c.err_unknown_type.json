@@ -1,0 +1,11 @@
+{
+  "name": "h2c.err_unknown_type",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "telepathy"
+  },
+  "expect": {
+    "error": "unknown_type"
+  }
+}

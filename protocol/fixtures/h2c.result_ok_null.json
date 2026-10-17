@@ -1,0 +1,11 @@
+{
+  "name": "h2c.result_ok_null",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c2",
+    "ok": null
+  },
+  "expect": "ok"
+}

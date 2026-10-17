@@ -1,0 +1,17 @@
+{
+  "name": "h2c.tolerant_unknown_event_other",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 10,
+    "name": "from-the-future",
+    "payload": [
+      1,
+      2,
+      3
+    ]
+  },
+  "expect": "ok",
+  "client_only": true
+}

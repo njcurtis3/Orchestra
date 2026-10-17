@@ -1,0 +1,14 @@
+{
+  "name": "c2h.call_stop_session",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "stop_session",
+    "args": {
+      "session_id": "s1"
+    }
+  },
+  "expect": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "h2c.error",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "error",
+    "code": "forbidden",
+    "message": "not allowed"
+  },
+  "expect": "ok"
+}

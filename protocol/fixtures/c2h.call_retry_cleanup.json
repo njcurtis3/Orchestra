@@ -1,0 +1,14 @@
+{
+  "name": "c2h.call_retry_cleanup",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "retry_cleanup",
+    "args": {
+      "task_id": "t1"
+    }
+  },
+  "expect": "ok"
+}

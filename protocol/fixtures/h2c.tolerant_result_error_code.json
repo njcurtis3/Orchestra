@@ -1,0 +1,15 @@
+{
+  "name": "h2c.tolerant_result_error_code",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c9",
+    "error": {
+      "code": "teapot",
+      "message": "short and stout"
+    }
+  },
+  "expect": "ok",
+  "client_only": true
+}

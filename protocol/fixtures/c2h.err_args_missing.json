@@ -1,0 +1,13 @@
+{
+  "name": "c2h.err_args_missing",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "list_projects"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

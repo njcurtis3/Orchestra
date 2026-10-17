@@ -1,0 +1,15 @@
+{
+  "name": "c2h.call_start_session",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "start_session",
+    "args": {
+      "project_id": "p1",
+      "prompt": "Fix the bug"
+    }
+  },
+  "expect": "ok"
+}

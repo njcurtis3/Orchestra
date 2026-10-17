@@ -1,0 +1,52 @@
+{
+  "v": 1,
+  "supported": [1],
+  "max_text_bytes": 32768,
+  "max_message_bytes": 4194304,
+  "max_id_bytes": 128,
+  "methods": [
+    "list_projects",
+    "list_sessions",
+    "list_inbox",
+    "get_transcript",
+    "list_tasks",
+    "get_task_diff",
+    "storage_status",
+    "start_session",
+    "stop_session",
+    "answer",
+    "create_task",
+    "cancel_task",
+    "land_task",
+    "discard_task",
+    "retry_cleanup"
+  ],
+  "method_scope": {
+    "list_projects": "read",
+    "list_sessions": "read",
+    "list_inbox": "read",
+    "get_transcript": "read",
+    "list_tasks": "read",
+    "get_task_diff": "read",
+    "storage_status": "read",
+    "answer": "answer",
+    "start_session": "control",
+    "stop_session": "control",
+    "create_task": "control",
+    "cancel_task": "control",
+    "retry_cleanup": "control",
+    "land_task": "land",
+    "discard_task": "land"
+  },
+  "event_names": ["session-updated", "inbox-updated", "transcript-appended", "task-updated", "notice"],
+  "scopes": ["read", "answer", "control", "land"],
+  "error_codes": [
+    "unsupported_version",
+    "unknown_type",
+    "bad_request",
+    "forbidden",
+    "revoked",
+    "already_answered",
+    "failed"
+  ]
+}

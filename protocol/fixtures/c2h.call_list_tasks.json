@@ -1,0 +1,12 @@
+{
+  "name": "c2h.call_list_tasks",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "list_tasks",
+    "args": {}
+  },
+  "expect": "ok"
+}

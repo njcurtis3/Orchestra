@@ -1,0 +1,80 @@
+{
+  "name": "h2c.event_transcript_appended",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 4,
+    "name": "transcript-appended",
+    "payload": {
+      "session_id": "s1",
+      "entries": [
+        {
+          "kind": "user_prompt",
+          "text": "Hello",
+          "truncated": false,
+          "seq": 0,
+          "at": 1760000000100
+        },
+        {
+          "kind": "assistant_text",
+          "text": "Hi",
+          "truncated": false,
+          "seq": 1,
+          "at": 1760000000200
+        },
+        {
+          "kind": "tool_use",
+          "id": "tu1",
+          "name": "Bash",
+          "input_preview": "{\"command\": \"ls\"}",
+          "truncated": false,
+          "seq": 2,
+          "at": 1760000000300
+        },
+        {
+          "kind": "tool_result",
+          "tool_use_id": "tu1",
+          "is_error": false,
+          "content": "a.txt",
+          "truncated": false,
+          "seq": 3,
+          "at": 1760000000400
+        },
+        {
+          "kind": "turn_result",
+          "is_error": false,
+          "subtype": "success",
+          "total_cost_usd": 0.0421,
+          "duration_ms": 1234,
+          "num_turns": 2,
+          "usage": {
+            "input": 10,
+            "output": 20,
+            "cache_read": 30,
+            "cache_creation": 40
+          },
+          "seq": 4,
+          "at": 1760000000500
+        },
+        {
+          "kind": "turn_result",
+          "is_error": true,
+          "subtype": null,
+          "total_cost_usd": null,
+          "duration_ms": null,
+          "num_turns": null,
+          "usage": null,
+          "seq": 5,
+          "at": 1760000000600
+        },
+        {
+          "kind": "truncated",
+          "seq": 6,
+          "at": 1760000000700
+        }
+      ]
+    }
+  },
+  "expect": "ok"
+}

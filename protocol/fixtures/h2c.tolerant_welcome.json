@@ -1,0 +1,35 @@
+{
+  "name": "h2c.tolerant_welcome",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "welcome",
+    "host_id": "h-1",
+    "host_name": "Desk",
+    "scopes": [
+      "read",
+      "teleport"
+    ],
+    "features": [
+      "push",
+      "future"
+    ],
+    "extra": 1
+  },
+  "expect": "ok",
+  "client_only": true,
+  "decoded_wire": {
+    "v": 1,
+    "type": "welcome",
+    "host_id": "h-1",
+    "host_name": "Desk",
+    "scopes": [
+      "read",
+      "teleport"
+    ],
+    "features": [
+      "push",
+      "future"
+    ]
+  }
+}

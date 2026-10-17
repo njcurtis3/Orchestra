@@ -68,7 +68,7 @@ pub struct Record {
 }
 
 /// What the frontend gets live.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptBatch {
     pub session_id: String,
     pub entries: Vec<Record>,

@@ -1,0 +1,17 @@
+{
+  "name": "c2h.err_bad_answer_kind",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "answer",
+    "args": {
+      "kind": "shout",
+      "item_id": "i1"
+    }
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

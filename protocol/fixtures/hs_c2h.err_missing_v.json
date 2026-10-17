@@ -1,0 +1,10 @@
+{
+  "name": "hs_c2h.err_missing_v",
+  "dir": "hs_c2h",
+  "wire": {
+    "proto": "orchestra"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}
