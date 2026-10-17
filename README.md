@@ -156,7 +156,7 @@ folder (`%APPDATA%\com.telosrg.orchestra` on Windows).
 |---|---|
 | [`desktop/`](desktop) | The Tauri 2 app: a thin shell in `desktop/src-tauri` over the Rust host engine in [`core/`](core), React and TypeScript UI in `desktop/src`. Runs and tracks agents and hosts the inbox. |
 | [`mobile/`](mobile) | The Expo app for Android: the remote. Notifications, status and answers. Not functional yet. |
-| [`protocol/`](protocol/README.md) | The message format between desktop and phone. Empty until the link is designed. |
+| [`protocol/`](protocol/README.md) | The message format between desktop and phone: TypeScript types and codec, shared JSON fixtures, and the decisions behind them. |
 | [`fleet/`](fleet/README.md) | The vendored orchestration model. Synced from upstream and never edited by hand. |
 | [`CLAUDE.md`](CLAUDE.md) | Architecture, constraints, and the security rules the app is built to |
 
