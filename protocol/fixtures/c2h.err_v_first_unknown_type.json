@@ -1,0 +1,11 @@
+{
+  "name": "c2h.err_v_first_unknown_type",
+  "dir": "c2h",
+  "wire": {
+    "v": 2,
+    "type": "subscribe"
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

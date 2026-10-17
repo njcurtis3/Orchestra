@@ -108,7 +108,9 @@ export type TranscriptEntry =
       num_turns: number | null;
       usage: Usage | null;
     }
-  | { kind: "truncated" };
+  | { kind: "truncated" }
+  // A kind this build does not know; "unknown" is reserved and the host never emits it.
+  | { kind: "unknown"; raw_kind: string; text: string | null };
 export type TranscriptRecord = TranscriptEntry & { seq: number; at: number };
 export type TranscriptBatch = { session_id: string; entries: TranscriptRecord[] };
 

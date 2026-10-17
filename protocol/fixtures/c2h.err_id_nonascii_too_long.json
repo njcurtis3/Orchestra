@@ -1,0 +1,14 @@
+{
+  "name": "c2h.err_id_nonascii_too_long",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "method": "list_projects",
+    "args": {}
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

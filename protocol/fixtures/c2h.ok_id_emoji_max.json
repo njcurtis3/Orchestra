@@ -1,0 +1,12 @@
+{
+  "name": "c2h.ok_id_emoji_max",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+    "method": "list_projects",
+    "args": {}
+  },
+  "expect": "ok"
+}

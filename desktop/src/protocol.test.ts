@@ -162,4 +162,27 @@ describe("limits", () => {
       expect(utf8Length(s)).toBe(new TextEncoder().encode(s).length);
     }
   });
+
+  it("utf8Length counts a lone surrogate as 3 bytes, as TextEncoder does", () => {
+    const hi = "\ud83d";
+    const lo = "\ude00";
+    for (const s of [hi, lo, hi + "é", hi + hi, hi + "a", "a" + lo + "a" + hi + lo]) {
+      expect(utf8Length(s)).toBe(new TextEncoder().encode(s).length);
+    }
+  });
+
+  it("a name of lone high surrogates each followed by a char is measured, not undercounted", () => {
+    const hello = (name: string) => JSON.stringify({ v: 1, type: "hello", client_name: name, app_version: "1" });
+    const err = errorOf(() => decodeClientMessage(hello("\ud83d一".repeat(MAX_TEXT_BYTES / 6 + 1))));
+    expect((err as ProtocolError).message).toMatch(/too long/);
+  });
+
+  it("a __proto__ answer key survives decode and re-encode, as in the Rust BTreeMap", () => {
+    const text =
+      '{"v":1,"type":"call","id":"c1","method":"answer","args":{"kind":"question","item_id":"i2","answers":{"__proto__":"x","q":"y"}}}';
+    const m = decodeClientMessage(text);
+    const answers = (m as unknown as { args: { answers: Record<string, string> } }).args.answers;
+    expect(Object.keys(answers)).toEqual(["__proto__", "q"]);
+    expect(encodeClientMessage(m)).toContain('"__proto__"');
+  });
 });

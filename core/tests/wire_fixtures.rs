@@ -53,36 +53,53 @@ fn round_trip(dir: &str, text: &str) -> Result<Value, WireError> {
 #[test]
 fn every_fixture_case_agrees_with_the_typescript_copy() {
     let files = case_files();
-    let mut ran = 0;
-    for file in &files {
-        let case = read_json(file);
+    let cases: Vec<Value> = files.iter().map(|f| read_json(f)).collect();
+    // An ok case marked client_only parses only in the TypeScript copy, so it is skipped here.
+    let is_skipped = |c: &Value| c["expect"] == json!("ok") && c.get("client_only") == Some(&json!(true));
+    let expected_skipped = cases.iter().filter(|c| is_skipped(c)).count();
+    let mut checked = 0;
+    let mut skipped = 0;
+    // Per dir: (checked ok cases, checked error cases).
+    let mut seen: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for (file, case) in files.iter().zip(&cases) {
         let name = case["name"].as_str().expect("case has a name");
         assert_eq!(format!("{name}.json"), *file, "file name is the case name");
         let dir = case["dir"].as_str().expect("case has a dir");
+        assert_eq!(name.split('.').next(), Some(dir), "{name}: the name prefix is the dir");
         let text = match case.get("raw") {
             Some(raw) => raw.as_str().expect("raw is a string").to_string(),
             None => serde_json::to_string(&case["wire"]).unwrap(),
         };
-        let client_only = case.get("client_only") == Some(&json!(true));
+        if case.get("client_only") == Some(&json!(true)) {
+            assert_eq!(case["expect"], json!("ok"), "{name}: client_only is only for ok cases");
+        }
         match &case["expect"] {
             Value::String(ok) if ok == "ok" => {
-                // Unknown enum values and the like only parse in the TypeScript copy.
-                if !client_only {
-                    let again = round_trip(dir, &text).unwrap_or_else(|e| panic!("{name}: {e}"));
-                    assert_eq!(again, case["wire"], "{name}: encode(decode(wire)) == wire");
+                if is_skipped(case) {
+                    skipped += 1;
+                    continue;
                 }
+                let again = round_trip(dir, &text).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(again, case["wire"], "{name}: encode(decode(wire)) == wire");
+                seen.entry(dir.to_string()).or_default().0 += 1;
             }
             Value::Object(e) => {
                 let want = e["error"].as_str().expect("error code");
                 let err = round_trip(dir, &text).expect_err(name);
                 assert_eq!(err.code.as_str(), want, "{name}: {err}");
+                seen.entry(dir.to_string()).or_default().1 += 1;
             }
             other => panic!("{name}: bad expect {other}"),
         }
-        ran += 1;
+        checked += 1;
     }
-    assert_eq!(ran, files.len());
-    assert!(ran >= 80, "expected the full fixture set, ran {ran}");
+    assert_eq!(skipped, expected_skipped, "every client_only case was skipped");
+    assert_eq!(checked, files.len() - expected_skipped, "every other case was decoded");
+    assert!(checked >= 85, "expected the full fixture set, decoded {checked}");
+    for dir in ["c2h", "h2c", "hs_c2h", "hs_h2c"] {
+        let (ok, err) = seen.get(dir).copied().unwrap_or_default();
+        assert!(ok >= 1 && err >= 1, "{dir}: needs a decoded ok and error case, has {ok} and {err}");
+    }
 }
 
 #[test]

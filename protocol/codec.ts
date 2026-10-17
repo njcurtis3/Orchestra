@@ -70,10 +70,10 @@ export function utf8Length(s: string): number {
     const c = s.charCodeAt(i);
     if (c < 0x80) n += 1;
     else if (c < 0x800) n += 2;
-    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
-      n += 4; // a surrogate pair is one 4-byte code point
+    else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      n += 4; // a high surrogate followed by a low one is one 4-byte code point
       i++;
-    } else n += 3;
+    } else n += 3; // a lone surrogate is 3 bytes, as TextEncoder writes U+FFFD
   }
   return n;
 }
@@ -213,7 +213,10 @@ function answerArgs(a: Obj): Answer {
       exact(a, ["kind", "item_id", "answers"], "args");
       const answers = obj(a.answers, "answers");
       const out: Record<string, string> = {};
-      for (const k of Object.keys(answers)) out[k] = str(answers, k);
+      // defineProperty, not out[k] =: assigning "__proto__" on a plain object is a silent no-op.
+      for (const k of Object.keys(answers)) {
+        Object.defineProperty(out, k, { value: str(answers, k), enumerable: true, writable: true, configurable: true });
+      }
       return { kind: "question", item_id: str(a, "item_id"), answers: out };
     }
     case "reply":
@@ -427,7 +430,9 @@ function record(v: unknown): TranscriptRecord {
     case "truncated":
       return { kind: "truncated", ...at };
     default:
-      return bad("bad entry kind");
+      // An unknown kind is a string this build does not know: render its text, if any.
+      if (typeof o.kind !== "string") return bad("bad entry kind");
+      return { kind: "unknown", raw_kind: o.kind, text: typeof o.text === "string" ? o.text : null, ...at };
   }
 }
 
@@ -504,9 +509,18 @@ export function decodeHostMessage(text: string): HostMessage {
   }
 }
 
+// The wire form of an unknown-kind fallback entry: its own kind back, text only when it had one.
+function unknownEntryWire(x: unknown): unknown {
+  const e = x as { kind?: unknown; raw_kind?: unknown; text?: unknown; seq?: unknown; at?: unknown };
+  if (e === null || typeof e !== "object" || e.kind !== "unknown" || typeof e.raw_kind !== "string") return x;
+  const out: Obj = { kind: e.raw_kind, seq: e.seq, at: e.at };
+  if (typeof e.text === "string") out.text = e.text;
+  return out;
+}
+
 export function encodeHostMessage(m: HostMessage): string {
   const wire = m.type === "unknown_event" ? { ...m, type: "event" } : m;
-  return checked(JSON.stringify(wire));
+  return checked(JSON.stringify(wire, (_k, x) => unknownEntryWire(x)));
 }
 
 // ---- Handshake: plaintext frames with no `type` ----

@@ -1,0 +1,23 @@
+{
+  "name": "h2c.err_transcript_kind_not_string",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 5,
+    "name": "transcript-appended",
+    "payload": {
+      "session_id": "s1",
+      "entries": [
+        {
+          "kind": 7,
+          "seq": 0,
+          "at": 1760000000100
+        }
+      ]
+    }
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

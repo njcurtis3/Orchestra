@@ -1,0 +1,14 @@
+{
+  "name": "hs_h2c.err_v_first_wrong_proto",
+  "dir": "hs_h2c",
+  "wire": {
+    "proto": "nope",
+    "v": 2,
+    "supported": [
+      2
+    ]
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}
