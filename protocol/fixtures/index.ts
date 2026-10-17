@@ -88,6 +88,18 @@ import c83 from "./hs_h2c.err_missing_supported.json";
 import c84 from "./hs_h2c.err_unsupported_version.json";
 import c85 from "./hs_h2c.err_wrong_proto.json";
 import c86 from "./hs_h2c.error_unsupported_version.json";
+import c87 from "./h2c.tolerant_transcript_unknown_kind.json";
+import c88 from "./h2c.err_transcript_kind_not_string.json";
+import c89 from "./c2h.err_v_first_unknown_type.json";
+import c90 from "./c2h.err_v_first_unknown_field.json";
+import c91 from "./h2c.err_v_first_unknown_type.json";
+import c92 from "./hs_c2h.err_v_first_wrong_proto.json";
+import c93 from "./hs_h2c.err_v_first_wrong_proto.json";
+import c94 from "./c2h.err_id_nonascii_too_long.json";
+import c95 from "./c2h.ok_id_nonascii_max.json";
+import c96 from "./c2h.ok_id_emoji_max.json";
+import c97 from "./c2h.err_id_emoji_too_long.json";
+import c98 from "./c2h.call_answer_question_proto_key.json";
 
 export type FixtureCase = {
   name: string;
@@ -189,4 +201,16 @@ export const FIXTURES = [
   c84,
   c85,
   c86,
+  c87,
+  c88,
+  c89,
+  c90,
+  c91,
+  c92,
+  c93,
+  c94,
+  c95,
+  c96,
+  c97,
+  c98,
 ] as unknown as FixtureCase[];

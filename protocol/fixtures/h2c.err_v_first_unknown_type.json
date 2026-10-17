@@ -1,0 +1,11 @@
+{
+  "name": "h2c.err_v_first_unknown_type",
+  "dir": "h2c",
+  "wire": {
+    "v": 2,
+    "type": "bogus"
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

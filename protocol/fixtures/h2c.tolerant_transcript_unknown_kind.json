@@ -1,0 +1,65 @@
+{
+  "name": "h2c.tolerant_transcript_unknown_kind",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 5,
+    "name": "transcript-appended",
+    "payload": {
+      "session_id": "s1",
+      "entries": [
+        {
+          "kind": "user_prompt",
+          "text": "Hi",
+          "truncated": false,
+          "seq": 0,
+          "at": 1760000000100
+        },
+        {
+          "kind": "thinking",
+          "text": "hmm",
+          "extra": 1,
+          "seq": 1,
+          "at": 1760000000200
+        },
+        {
+          "kind": "future_kind",
+          "seq": 2,
+          "at": 1760000000300
+        }
+      ]
+    }
+  },
+  "expect": "ok",
+  "client_only": true,
+  "decoded_wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 5,
+    "name": "transcript-appended",
+    "payload": {
+      "session_id": "s1",
+      "entries": [
+        {
+          "kind": "user_prompt",
+          "text": "Hi",
+          "truncated": false,
+          "seq": 0,
+          "at": 1760000000100
+        },
+        {
+          "kind": "thinking",
+          "seq": 1,
+          "at": 1760000000200,
+          "text": "hmm"
+        },
+        {
+          "kind": "future_kind",
+          "seq": 2,
+          "at": 1760000000300
+        }
+      ]
+    }
+  }
+}

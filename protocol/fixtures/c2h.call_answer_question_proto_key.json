@@ -1,0 +1,19 @@
+{
+  "name": "c2h.call_answer_question_proto_key",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "answer",
+    "args": {
+      "kind": "question",
+      "item_id": "i2",
+      "answers": {
+        "__proto__": "x",
+        "q": "y"
+      }
+    }
+  },
+  "expect": "ok"
+}

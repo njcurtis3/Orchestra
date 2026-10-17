@@ -179,7 +179,10 @@ set, the handshake or the mirror rule reopens this section; the numbers are in `
 
 - An **optional field** in host output, or a **new event or feature flag**, does not bump `v`.
 - **Clients ignore unknown fields** and render unknown enum values (agent kind, host, status,
-  PR state) as plain text.
+  PR state, transcript entry kind) as plain text. A transcript entry whose `kind` is a string
+  this build does not know decodes to `{kind: "unknown", raw_kind, text, seq, at}` (`text` is
+  the string `text` of the entry, else `null`; other fields are dropped), so a new entry kind
+  does not bump `v`. `unknown` is reserved and is never a host entry kind.
 - **Host input stays strict** (`deny_unknown_fields`), so a new call argument is gated on a
   `welcome.features` flag.
 - **Removing or changing the meaning of anything bumps `v`.**
@@ -241,8 +244,10 @@ shared fixtures. Where the sections above left a gap:
   error string, mapped in P3. A client keeps a code it does not know as plain text.
 - **Tolerance.** Host input is strict: an unknown field is `bad_request`. Client input
   ignores unknown fields, keeps unknown enum values (status, kind, model, scope, feature,
-  error code) as the strings they arrived as, and reads an unknown event name as an unknown
-  event rather than an error. An unknown `v` is `unsupported_version` in both directions.
+  error code, transcript entry kind) as the strings they arrived as, reads an unknown event
+  name as an unknown event rather than an error, and reads an unknown transcript entry kind as
+  the `unknown` fallback rather than failing the event. An unknown `v` is
+  `unsupported_version` in both directions, checked before `type`, `proto` and every field.
 - **Not typed yet.** The `notice` payload (H2), `pr` (D6) and `register_push`. `agent` and
   `host` are declared optional on the payloads; the core does not emit them today.
 - **No `ack`.** `result{id}` acknowledges a call.

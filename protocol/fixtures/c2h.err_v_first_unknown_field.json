@@ -1,0 +1,14 @@
+{
+  "name": "c2h.err_v_first_unknown_field",
+  "dir": "c2h",
+  "wire": {
+    "v": 2,
+    "type": "call",
+    "id": "a",
+    "method": "list_projects",
+    "new_field": 1
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

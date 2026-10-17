@@ -1,0 +1,11 @@
+{
+  "name": "hs_c2h.err_v_first_wrong_proto",
+  "dir": "hs_c2h",
+  "wire": {
+    "proto": "nope",
+    "v": 2
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}
