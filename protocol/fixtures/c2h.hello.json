@@ -1,0 +1,11 @@
+{
+  "name": "c2h.hello",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "hello",
+    "client_name": "Pixel 8",
+    "app_version": "0.1.0"
+  },
+  "expect": "ok"
+}

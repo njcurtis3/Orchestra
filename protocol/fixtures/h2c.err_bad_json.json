@@ -1,0 +1,8 @@
+{
+  "name": "h2c.err_bad_json",
+  "dir": "h2c",
+  "raw": "{",
+  "expect": {
+    "error": "bad_request"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "hs_c2h.err_unknown_field",
+  "dir": "hs_c2h",
+  "wire": {
+    "proto": "orchestra",
+    "v": 1,
+    "type": "hello"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "h2c.event_session_updated",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 2,
+    "name": "session-updated",
+    "payload": {
+      "id": "s1",
+      "project_id": "p1",
+      "project_name": "orchestra",
+      "status": "working",
+      "started_at": 1760000000000,
+      "last_activity_at": 1760000005000,
+      "last_message": "Reading files",
+      "claude_session_id": "c-123",
+      "model": "sonnet",
+      "permission_mode": "acceptEdits"
+    }
+  },
+  "expect": "ok"
+}

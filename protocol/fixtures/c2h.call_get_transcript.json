@@ -1,0 +1,14 @@
+{
+  "name": "c2h.call_get_transcript",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "get_transcript",
+    "args": {
+      "session_id": "s1"
+    }
+  },
+  "expect": "ok"
+}

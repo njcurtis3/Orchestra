@@ -1,0 +1,10 @@
+{
+  "name": "c2h.err_missing_type",
+  "dir": "c2h",
+  "wire": {
+    "v": 1
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

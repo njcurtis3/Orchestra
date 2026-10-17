@@ -1,0 +1,8 @@
+{
+  "name": "c2h.err_bad_json",
+  "dir": "c2h",
+  "raw": "{\"v\":1,\"type\":",
+  "expect": {
+    "error": "bad_request"
+  }
+}

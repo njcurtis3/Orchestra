@@ -1,0 +1,14 @@
+{
+  "name": "c2h.call_cancel_task",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "cancel_task",
+    "args": {
+      "task_id": "t1"
+    }
+  },
+  "expect": "ok"
+}

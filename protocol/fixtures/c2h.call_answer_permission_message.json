@@ -1,0 +1,17 @@
+{
+  "name": "c2h.call_answer_permission_message",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "answer",
+    "args": {
+      "kind": "permission",
+      "item_id": "i1",
+      "decision": "deny",
+      "message": "Not that one"
+    }
+  },
+  "expect": "ok"
+}

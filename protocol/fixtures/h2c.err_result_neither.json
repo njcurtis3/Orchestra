@@ -1,0 +1,12 @@
+{
+  "name": "h2c.err_result_neither",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c1"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

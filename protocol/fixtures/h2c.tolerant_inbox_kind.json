@@ -1,0 +1,28 @@
+{
+  "name": "h2c.tolerant_inbox_kind",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 8,
+    "name": "inbox-updated",
+    "payload": [
+      {
+        "id": "i1",
+        "session_id": "s1",
+        "kind": "warning",
+        "created_at": 1760000002000,
+        "resolved": false,
+        "expired": false,
+        "summary": "Run cargo test",
+        "tool_name": "Bash",
+        "tool_input_preview": "{\"command\": \"cargo test\"}",
+        "questions": null,
+        "result_text": null,
+        "host": "box-2"
+      }
+    ]
+  },
+  "expect": "ok",
+  "client_only": true
+}

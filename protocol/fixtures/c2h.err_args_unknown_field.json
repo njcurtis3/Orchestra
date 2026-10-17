@@ -1,0 +1,17 @@
+{
+  "name": "c2h.err_args_unknown_field",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "stop_session",
+    "args": {
+      "session_id": "s1",
+      "extra": 1
+    }
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

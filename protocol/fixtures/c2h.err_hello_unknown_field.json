@@ -1,0 +1,14 @@
+{
+  "name": "c2h.err_hello_unknown_field",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "hello",
+    "client_name": "x",
+    "app_version": "1",
+    "extra": 1
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

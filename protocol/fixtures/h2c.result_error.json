@@ -1,0 +1,14 @@
+{
+  "name": "h2c.result_error",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c3",
+    "error": {
+      "code": "already_answered",
+      "message": "already answered"
+    }
+  },
+  "expect": "ok"
+}

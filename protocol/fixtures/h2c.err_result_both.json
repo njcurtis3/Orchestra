@@ -1,0 +1,17 @@
+{
+  "name": "h2c.err_result_both",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c1",
+    "ok": 1,
+    "error": {
+      "code": "failed",
+      "message": "x"
+    }
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

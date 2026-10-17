@@ -1,0 +1,11 @@
+{
+  "name": "hs_h2c.err_missing_supported",
+  "dir": "hs_h2c",
+  "wire": {
+    "proto": "orchestra",
+    "v": 1
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

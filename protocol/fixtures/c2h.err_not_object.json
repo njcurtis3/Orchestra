@@ -1,0 +1,8 @@
+{
+  "name": "c2h.err_not_object",
+  "dir": "c2h",
+  "raw": "[1]",
+  "expect": {
+    "error": "bad_request"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "h2c.snapshot_empty",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "snapshot",
+    "seq": 0,
+    "projects": [],
+    "sessions": [],
+    "inbox": [],
+    "tasks": [],
+    "storage": {
+      "ok": false,
+      "reason": "newer_version",
+      "found_version": 9
+    }
+  },
+  "expect": "ok"
+}

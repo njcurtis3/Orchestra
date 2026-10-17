@@ -1,0 +1,16 @@
+{
+  "name": "h2c.welcome",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "welcome",
+    "host_id": "h-1",
+    "host_name": "Desk",
+    "scopes": [
+      "read",
+      "answer"
+    ],
+    "features": []
+  },
+  "expect": "ok"
+}

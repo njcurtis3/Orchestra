@@ -1,0 +1,12 @@
+{
+  "name": "c2h.err_ping_unknown_field",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "ping",
+    "extra": true
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

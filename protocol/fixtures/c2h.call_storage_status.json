@@ -1,0 +1,12 @@
+{
+  "name": "c2h.call_storage_status",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "storage_status",
+    "args": {}
+  },
+  "expect": "ok"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "h2c.err_missing_v",
+  "dir": "h2c",
+  "wire": {
+    "type": "pong"
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

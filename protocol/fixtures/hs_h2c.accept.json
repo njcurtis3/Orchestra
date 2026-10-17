@@ -1,0 +1,12 @@
+{
+  "name": "hs_h2c.accept",
+  "dir": "hs_h2c",
+  "wire": {
+    "proto": "orchestra",
+    "v": 1,
+    "supported": [
+      1
+    ]
+  },
+  "expect": "ok"
+}

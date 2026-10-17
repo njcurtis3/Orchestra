@@ -1,0 +1,16 @@
+{
+  "name": "h2c.result_ok",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "result",
+    "id": "c1",
+    "ok": [
+      {
+        "id": "p1",
+        "name": "orchestra"
+      }
+    ]
+  },
+  "expect": "ok"
+}

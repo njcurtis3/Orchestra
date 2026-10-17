@@ -1,0 +1,16 @@
+{
+  "name": "h2c.err_snapshot_missing_field",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "snapshot",
+    "seq": 1,
+    "projects": [],
+    "sessions": [],
+    "inbox": [],
+    "tasks": []
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

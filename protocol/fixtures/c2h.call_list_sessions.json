@@ -1,0 +1,12 @@
+{
+  "name": "c2h.call_list_sessions",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "list_sessions",
+    "args": {}
+  },
+  "expect": "ok"
+}

@@ -1,0 +1,11 @@
+{
+  "name": "c2h.err_unsupported_version_v0",
+  "dir": "c2h",
+  "wire": {
+    "v": 0,
+    "type": "ping"
+  },
+  "expect": {
+    "error": "unsupported_version"
+  }
+}

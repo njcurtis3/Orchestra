@@ -1,0 +1,15 @@
+{
+  "name": "h2c.tolerant_pong_extra",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "pong",
+    "extra": 1
+  },
+  "expect": "ok",
+  "client_only": true,
+  "decoded_wire": {
+    "v": 1,
+    "type": "pong"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "h2c.err_event_bad_payload",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "event",
+    "seq": 1,
+    "name": "session-updated",
+    "payload": {
+      "id": "s1"
+    }
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

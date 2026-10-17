@@ -1,0 +1,14 @@
+{
+  "name": "c2h.err_unknown_method",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "call",
+    "id": "c1",
+    "method": "delete_everything",
+    "args": {}
+  },
+  "expect": {
+    "error": "bad_request"
+  }
+}

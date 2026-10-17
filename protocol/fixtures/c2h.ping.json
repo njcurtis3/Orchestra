@@ -1,0 +1,9 @@
+{
+  "name": "c2h.ping",
+  "dir": "c2h",
+  "wire": {
+    "v": 1,
+    "type": "ping"
+  },
+  "expect": "ok"
+}

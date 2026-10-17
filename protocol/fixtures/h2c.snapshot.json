@@ -1,0 +1,132 @@
+{
+  "name": "h2c.snapshot",
+  "dir": "h2c",
+  "wire": {
+    "v": 1,
+    "type": "snapshot",
+    "seq": 1,
+    "projects": [
+      {
+        "id": "p1",
+        "name": "orchestra"
+      }
+    ],
+    "sessions": [
+      {
+        "id": "s1",
+        "project_id": "p1",
+        "project_name": "orchestra",
+        "status": "working",
+        "started_at": 1760000000000,
+        "last_activity_at": 1760000005000,
+        "last_message": "Reading files",
+        "claude_session_id": "c-123",
+        "model": "sonnet",
+        "permission_mode": "acceptEdits"
+      },
+      {
+        "id": "s2",
+        "project_id": "p1",
+        "project_name": "orchestra",
+        "status": "starting",
+        "started_at": 1760000001000,
+        "last_activity_at": 1760000001000,
+        "last_message": null,
+        "claude_session_id": null,
+        "model": null,
+        "permission_mode": null
+      }
+    ],
+    "inbox": [
+      {
+        "id": "i1",
+        "session_id": "s1",
+        "kind": "permission",
+        "created_at": 1760000002000,
+        "resolved": false,
+        "expired": false,
+        "summary": "Run cargo test",
+        "tool_name": "Bash",
+        "tool_input_preview": "{\"command\": \"cargo test\"}",
+        "questions": null,
+        "result_text": null
+      },
+      {
+        "id": "i2",
+        "session_id": "s1",
+        "kind": "question",
+        "created_at": 1760000003000,
+        "resolved": false,
+        "expired": false,
+        "summary": "Which database?",
+        "tool_name": null,
+        "tool_input_preview": null,
+        "questions": [
+          {
+            "question": "Which database?",
+            "header": "DB",
+            "multi_select": false,
+            "options": [
+              {
+                "label": "sqlite",
+                "description": "Embedded"
+              },
+              {
+                "label": "postgres",
+                "description": null
+              }
+            ]
+          }
+        ],
+        "result_text": null
+      },
+      {
+        "id": "i3",
+        "session_id": "s1",
+        "kind": "finished",
+        "created_at": 1760000004000,
+        "resolved": true,
+        "expired": false,
+        "summary": "Done",
+        "tool_name": null,
+        "tool_input_preview": null,
+        "questions": null,
+        "result_text": "All tests pass."
+      }
+    ],
+    "tasks": [
+      {
+        "id": "t1",
+        "project_id": "p1",
+        "project_name": "orchestra",
+        "status": "done",
+        "title": "Add the codec",
+        "created_at": 1760000000500,
+        "session_id": "s1",
+        "branch": "orchestra/t1",
+        "base_branch": "main",
+        "note": null,
+        "last_turn_error": false,
+        "session_over": false
+      },
+      {
+        "id": "t2",
+        "project_id": "p1",
+        "project_name": "orchestra",
+        "status": "queued",
+        "title": "Queued one",
+        "created_at": 1760000000600,
+        "session_id": null,
+        "branch": null,
+        "base_branch": "main",
+        "note": "Waiting",
+        "last_turn_error": false,
+        "session_over": false
+      }
+    ],
+    "storage": {
+      "ok": true
+    }
+  },
+  "expect": "ok"
+}
