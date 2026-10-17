@@ -1,74 +1,24 @@
 //! IPC surface. Argument types are strict serde structs; everything else is validated in
 //! `session`. Errors are short strings with no paths.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use orchestra_core::wire::args::{
+    Answer, CancelTaskArgs, CreateTaskArgs, StartArgs, StopArgs, TaskIdArgs, TranscriptArgs,
+};
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::projects::Project;
 use crate::session::{SessionSummary, TaskDiff};
 use crate::session::Sessions;
-use crate::session::settings::{Model, PermissionMode, SessionSettings};
-use crate::session::state::{Decision, InboxItem};
+use crate::session::settings::SessionSettings;
+use crate::session::state::InboxItem;
 use crate::session::task::TaskSummary;
 use crate::session::store::StorageStatus;
 use crate::session::transcript::TranscriptPage;
 
 pub type AppSessions = Arc<Sessions>;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartArgs {
-    pub project_id: String,
-    pub prompt: String,
-    /// Absent means no flag. Anything off the allowlists fails to deserialize.
-    pub model: Option<Model>,
-    pub permission_mode: Option<PermissionMode>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateTaskArgs {
-    pub project_id: String,
-    pub prompt: String,
-    pub model: Option<Model>,
-    pub permission_mode: Option<PermissionMode>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CancelTaskArgs {
-    pub task_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskIdArgs {
-    pub task_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StopArgs {
-    pub session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TranscriptArgs {
-    pub session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Answer {
-    Permission { item_id: String, decision: Decision, message: Option<String> },
-    Question { item_id: String, answers: BTreeMap<String, String> },
-    Reply { session_id: String, text: String },
-}
 
 /// Async so the blocking folder dialog runs off the main thread.
 #[tauri::command]
@@ -217,6 +167,8 @@ pub async fn stop_session(args: StopArgs, sessions: State<'_, AppSessions>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::settings::{Model, PermissionMode};
+    use crate::session::state::Decision;
     use serde_json::json;
 
     #[test]

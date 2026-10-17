@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::settings::SessionSettings;
 use super::state::{InboxItem, InboxKind, SessionStatus, truncate};
@@ -45,7 +45,7 @@ impl Outcome {
 
 /// Closed set, deliberately not `SessionStatus`: queued, landed and discarded have no
 /// session, and idle (a turn is over) is not done (the task has been handed back).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Queued,
@@ -118,7 +118,7 @@ pub struct Task {
 }
 
 /// What the frontend may know about a task: no path, ever.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: String,
     pub project_id: String,
