@@ -2219,7 +2219,8 @@ mod tests {
         tidy(&r, &repo);
     }
 
-    /// Make `link` a junction to `target`, test code only.
+    /// Make `link` a junction (Windows) or a symlink (Unix) to `target`, test code only.
+    /// Asserts it is a link, so no test can pass against an ordinary folder.
     #[cfg(windows)]
     fn mk_junction(link: &Path, target: &Path) {
         let st = std::process::Command::new("cmd")
@@ -2232,7 +2233,13 @@ mod tests {
         assert!(st.success(), "mklink failed");
     }
 
-    /// Remove a junction as a link, so that no recursive delete can follow it.
+    #[cfg(unix)]
+    fn mk_junction(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink(), "not a symlink");
+    }
+
+    /// Remove a link as a link, so that no recursive delete can follow it.
     #[cfg(windows)]
     fn rm_junction(link: &Path) {
         if std::fs::symlink_metadata(link).is_ok() {
@@ -2240,7 +2247,14 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(unix)]
+    fn rm_junction(link: &Path) {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_file(link).unwrap();
+        }
+    }
+
+    #[cfg(any(windows, unix))]
     fn canary(name: &str) -> PathBuf {
         let c = scratch(name);
         std::fs::create_dir_all(c.join("sub")).unwrap();
@@ -2249,12 +2263,12 @@ mod tests {
         c
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn canary_intact(c: &Path) -> bool {
         c.join("keep.txt").is_file() && c.join("sub").join("deep.txt").is_file()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn discard_spares_the_target_of_a_junction_in_the_worktree() {
         let (r, p, repo) = rig_repo("discardjunction");
@@ -2273,7 +2287,7 @@ mod tests {
         tidy(&r, &repo);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn land_spares_the_target_of_a_junction_in_the_worktree() {
         let (r, p, repo) = rig_repo("landjunction");
@@ -2294,7 +2308,7 @@ mod tests {
         tidy(&r, &repo);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn retry_cleanup_spares_the_target_of_a_junction() {
         let (r, p, repo) = rig_repo("retryjunction");

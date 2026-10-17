@@ -1094,7 +1094,8 @@ mod tests {
         assert!(remove_empty_dir(&base, &base).is_err());
     }
 
-    /// `mklink /J`: a directory junction needs no privilege. Test code only.
+    /// A directory link that needs no privilege: `mklink /J` on Windows, a symlink on Unix.
+    /// Asserts it is a link, so no test can pass against an ordinary folder. Test code only.
     #[cfg(windows)]
     fn junction(link: &Path, target: &Path) {
         let st = Command::new("cmd")
@@ -1107,7 +1108,13 @@ mod tests {
         assert!(st.success(), "mklink failed");
     }
 
-    /// Remove a junction itself; `remove_dir` on a link never touches the target.
+    #[cfg(unix)]
+    fn junction(link: &Path, target: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        assert!(std::fs::symlink_metadata(link).unwrap().file_type().is_symlink(), "not a symlink");
+    }
+
+    /// Remove a link itself; removing a link never touches the target.
     #[cfg(windows)]
     fn drop_junction(link: &Path) {
         if std::fs::symlink_metadata(link).is_ok() {
@@ -1115,8 +1122,15 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn drop_junction(link: &Path) {
+        if std::fs::symlink_metadata(link).is_ok() {
+            std::fs::remove_file(link).unwrap();
+        }
+    }
+
     /// A repo, a task worktree under a base, and a victim dir outside with `keep.txt`.
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn worktree_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         let repo = repo_with_commit(name);
         let base = scratch(&format!("{name}-base"));
@@ -1129,7 +1143,7 @@ mod tests {
         (repo, base, path, victim)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn worktree_remove_unlinks_a_junction_and_spares_its_target() {
         let (repo, base, path, victim) = worktree_fixture("jn");
@@ -1144,7 +1158,7 @@ mod tests {
         assert!(!git(&repo, &["worktree", "list", "--porcelain"]).text().contains("t1"));
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn worktree_remove_unlinks_a_nested_junction() {
         let (repo, base, path, victim) = worktree_fixture("jn-deep");
@@ -1160,7 +1174,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     #[test]
     fn worktree_remove_with_a_stuck_link_errors_before_git() {
         let (repo, base, path, victim) = worktree_fixture("jn-stuck");
@@ -1180,6 +1194,18 @@ mod tests {
         worktree_remove(&repo, &base, &path).unwrap();
         assert!(victim.join("keep.txt").is_file());
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_within_rejects_a_symlink_ancestor_that_leads_out() {
+        let base = scratch("within-link-base");
+        let outside = scratch("within-link-outside");
+        std::fs::create_dir_all(outside.join("child")).unwrap();
+        junction(&base.join("link"), &outside);
+        assert!(!is_within(&base, &base.join("link").join("child")));
+        assert!(!is_within(&base, &base.join("link").join("not-yet-there")));
+        assert!(is_within(&base, &base.join("plain").join("child")));
     }
 
     #[test]
