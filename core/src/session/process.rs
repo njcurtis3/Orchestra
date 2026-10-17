@@ -547,6 +547,7 @@ mod tests {
         assert!(proc.wait_exit(Duration::from_secs(5)));
     }
 
+    #[cfg(target_os = "linux")]
     const PDEATH_ENV: &str = "ORCHESTRA_PDEATHSIG_HELPER";
 
     /// Run only by `linux_pdeathsig_kills_the_child_when_the_host_dies`, in a child copy of
