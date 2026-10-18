@@ -1,0 +1,5 @@
+{
+  "about": "The pairing QR payload for the keys in ikpsk2.json: json is the exact text a QR carries.",
+  "fingerprint_of_client_key": "84fd-b870-4ba8-f792",
+  "json": "{\"v\":1,\"host_id\":\"3647f90223194f534b044728d70ee8b9\",\"host_name\":\"Vector desktop\",\"addrs\":[\"127.0.0.1:47800\",\"192.168.1.20:47800\"],\"host_key\":\"b529537b8d647f03c36c6d4816352662f1e20371c0ac5ba96a8e8b0140679a2f\",\"secret\":\"9a4993a879ffd50477d24aa4f76822570dedfc1f3b6d6ded55bce9dd2e5f6fd0\",\"expires_at\":1800000000000}"
+}
