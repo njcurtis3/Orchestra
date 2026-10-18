@@ -279,4 +279,30 @@ describe("linkReducer", () => {
     expect(s.requests).toHaveLength(16);
     expect(s.requests[15].id).toBe("p19");
   });
+
+  it("a status event that arrived first beats the startup snapshot", () => {
+    let s = linkReducer(initialLinkUi, { type: "status", status: status({ running: true }) });
+    s = linkReducer(s, { type: "requests-loaded", requests: [request("p1")] });
+    s = linkReducer(s, { type: "snapshot", status: status({ running: false }) });
+    expect(s.status?.running).toBe(true);
+    expect(s.requests).toHaveLength(1);
+  });
+
+  it("the startup snapshot applies when no event came first", () => {
+    const first = status({ running: true });
+    let s = linkReducer(initialLinkUi, { type: "snapshot", status: first });
+    expect(s.status).toEqual(first);
+    expect(s.statusSeen).toBe(false);
+    const later = status({ running: false });
+    s = linkReducer(s, { type: "status", status: later });
+    expect(s.status).toEqual(later);
+    expect(s.statusSeen).toBe(true);
+  });
+
+  it("a set_config result counts as seen", () => {
+    const saved = status({ enabled: true });
+    let s = linkReducer(initialLinkUi, { type: "status", status: saved });
+    s = linkReducer(s, { type: "snapshot", status: status({ enabled: false }) });
+    expect(s.status).toEqual(saved);
+  });
 });

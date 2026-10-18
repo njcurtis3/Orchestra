@@ -72,7 +72,7 @@ function App() {
           linkPending(),
         ]);
         if (cancelled) return;
-        linkDispatch({ type: "status", status: linkNow });
+        linkDispatch({ type: "snapshot", status: linkNow });
         linkDispatch({ type: "requests-loaded", requests: waiting });
         dispatch({ type: "sessions-loaded", sessions });
         dispatch({ type: "inbox-loaded", items });

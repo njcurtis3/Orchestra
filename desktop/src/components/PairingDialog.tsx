@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useModalFocus } from "../focus";
 import { linkClosePairing, linkOpenPairing } from "../ipc";
 import { formatCountdown, isExpired, loopbackOnly, makeSerial, qrDataUrl, secondsLeft } from "../link";
 import type { PairingView } from "../types";
@@ -43,8 +44,8 @@ export function PairingDialog({ onClose, onError }: Props) {
     return () => clearInterval(t);
   }, []);
 
+  useModalFocus(dialog);
   useEffect(() => {
-    dialog.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
