@@ -1,7 +1,9 @@
 //! `<app data>/link/config.json`: whether the link is on, which addresses it listens on and
 //! on which port. Missing means off. A file with a schema this build does not know, or one
 //! that does not parse, turns the link off, is left exactly as it is and makes the settings
-//! read-only, the rule `clients.json` follows. No secret lives here.
+//! read-only, the rule `clients.json` follows. A port outside 1024-65535 is a fully understood
+//! file with one bad value: it loads as saved, stays editable and is a start error (see
+//! `port_error`), not read-only. No secret lives here.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -181,6 +183,16 @@ pub fn socket_addrs(ips: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
 
 // ---- a change asked for by the UI ----
 
+/// Why `port` may not be used, or `None` when it is in 1024..=65535. The one place the range
+/// lives: `validate` refuses a save with it and the link refuses to start on a saved port it fails.
+pub fn port_error(port: u32) -> Option<String> {
+    if (MIN_PORT..=65535).contains(&port) {
+        None
+    } else {
+        Some("the port must be between 1024 and 65535".to_string())
+    }
+}
+
 /// The firewall notice must be shown before a first non-loopback enable.
 pub const FIREWALL_FIRST: &str = "firewall_notice_required";
 
@@ -195,8 +207,8 @@ pub fn validate(
     firewall_notice_seen: bool,
     current: &[Interface],
 ) -> Result<Settings, String> {
-    if !(MIN_PORT..=65535).contains(&port) {
-        return Err("the port must be between 1024 and 65535".to_string());
+    if let Some(why) = port_error(port) {
+        return Err(why);
     }
     if binds.len() > MAX_BINDS {
         return Err("too many addresses".to_string());
@@ -292,6 +304,42 @@ mod tests {
             let (s, ro) = load(&dir);
             assert_eq!((s.enabled, ro), (false, Some(ReadOnly::Unreadable)), "{bad}");
             assert_eq!(fs::read_to_string(dir.join("config.json")).unwrap(), bad);
+        }
+    }
+
+    #[test]
+    fn link_config_port_range_is_1024_to_65535() {
+        for port in [0u32, 22, 1023] {
+            assert!(port_error(port).is_some(), "port {port}");
+        }
+        for port in [1024u32, 65535] {
+            assert!(port_error(port).is_none(), "port {port}");
+        }
+        let prev = Settings::default();
+        let cur = lan();
+        let bind = vec!["127.0.0.1".to_string()];
+        let cur = [cur, interfaces_from(&[("lo".into(), "127.0.0.1".parse().unwrap())])].concat();
+        for port in [0u32, 22, 1023] {
+            assert!(validate(&prev, true, &bind, port, false, &cur).is_err(), "port {port}");
+        }
+        for port in [1024u32, 65535] {
+            assert!(validate(&prev, true, &bind, port, false, &cur).is_ok(), "port {port}");
+        }
+    }
+
+    #[test]
+    fn link_config_low_port_on_disk_loads_editable_and_left_alone() {
+        for port in [0u32, 22, 1023, 1024, 65535] {
+            let dir = scratch();
+            let text = format!(
+                r#"{{"schema":1,"enabled":true,"port":{port},"binds":["127.0.0.1"],"firewall_notice_seen":false}}"#
+            );
+            fs::write(dir.join(FILE), &text).unwrap();
+            let (settings, read_only) = load(&dir);
+            assert_eq!(settings.port as u32, port);
+            assert!(read_only.is_none(), "port {port} must stay editable");
+            assert_eq!(fs::read_to_string(dir.join(FILE)).unwrap(), text, "port {port}: file untouched");
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 

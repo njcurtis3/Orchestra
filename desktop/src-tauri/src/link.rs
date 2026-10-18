@@ -351,7 +351,13 @@ impl LinkState {
         let mut missing = Vec::new();
         let mut addrs = Vec::new();
         let mut started = None;
-        if settings.enabled && read_only.is_none() {
+        if settings.enabled && read_only.is_none() && link_config::port_error(settings.port as u32).is_some() {
+            // A saved port the app will not bind: not a read-only file, so a save of a valid port fixes it.
+            error = Some(format!(
+                "Port {} is not allowed. Pick a port from 1024 to 65535 and Save.",
+                settings.port
+            ));
+        } else if settings.enabled && read_only.is_none() {
             let (present, skipped) = link_config::split_binds(&settings.binds, &link_config::interfaces());
             missing = skipped;
             match (&self.link_dir, present.is_empty()) {
@@ -776,6 +782,34 @@ mod tests {
         assert!(s.enabled && !s.running);
         assert!(s.error.unwrap().contains(&port.to_string()));
         assert_eq!(link_config::load(&r.dir.join("link")).0.enabled, true);
+    }
+
+    #[test]
+    fn link_low_port_on_disk_is_a_start_error_and_fixable() {
+        for bad in [0u16, 22, 1023] {
+            let saved = format!(
+                r#"{{"schema":1,"enabled":true,"port":{bad},"binds":["127.0.0.1"],"firewall_notice_seen":false}}"#
+            );
+            let r = rig_with_dir(true, |dir| std::fs::write(dir.join("config.json"), &saved).unwrap());
+            r.state.auto_start();
+            let t = std::time::Instant::now();
+            while r.state.status().error.is_none() && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let s = r.state.status();
+            assert!(!s.running && s.enabled, "port {bad}");
+            assert!(s.config_readonly.is_none(), "port {bad} stays editable");
+            let e = s.error.expect("a start error");
+            assert!(e.contains(&format!("Port {bad}")) && e.contains("1024 to 65535"), "{e}");
+            let path = r.dir.join("link").join("config.json");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "file untouched");
+            if bad == 22 {
+                let port = free_port();
+                let fixed = enable(&r, port).unwrap();
+                assert!(fixed.running, "{:?}", fixed.error);
+                assert_eq!(link_config::load(&r.dir.join("link")).0.port, port);
+            }
+        }
     }
 
     #[test]
