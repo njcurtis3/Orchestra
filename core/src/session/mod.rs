@@ -2201,6 +2201,12 @@ mod tests {
         std::fs::write(r.base.join(&p.id).join("t1").join("b.txt"), "left over").unwrap();
         let hook = repo.join(".git").join("hooks").join("pre-commit");
         std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        // git runs a hook only if it is executable, which Windows has no bit for.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         assert!(r.sessions.land_task("t1").unwrap_err().contains("hook"));
         assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
         assert_replyable(&r, &sid);
