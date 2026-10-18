@@ -262,7 +262,7 @@ Still open after P2: the choice between the two JS crypto options (A1) and the s
 
 The host side of the link, built in `orchestra_core::link` (P3a): listen, pair, authenticate,
 stream a snapshot and events, and run calls. The desktop Devices UI and its OS keyring
-provider are P3b; the phone Noise is A1. Nothing starts listening unless a caller gives
+provider are P3b (built; see below); the phone Noise is A1. Nothing starts listening unless a caller gives
 `LinkConfig::binds` an address, so the link is off by default on every host.
 
 - **Two paths, two handshakes.** The WebSocket path selects the mode. `/pair` runs
@@ -343,12 +343,22 @@ provider are P3b; the phone Noise is A1. Nothing starts listening unless a calle
   created once, mode `0600` on Unix, the per-user app data ACL on Windows) and `clients.json`
   (`{schema: 1, clients: [{id, name, public_key, scopes, paired_at}]}`, written atomically; a
   schema this build does not know, or a file that does not parse, stops the link from starting
-  and the file is left alone). The desktop will keep its host key in the OS keyring (P3b,
-  from the shell crate, never in core); the file is the permanent `orchestrad` provider.
+  and the file is left alone). The desktop keeps its host key in Windows Credential Manager (P3b, built: a generic
+  credential `com.telosrg.orchestra/link/host_key`, from the shell crate, never in core) and
+  never reads or writes `link/host_key` on Windows; off Windows it uses the file. The file is
+  the permanent `orchestrad` provider. The file is now written atomically: a unique temp (mode
+  `0600` on Unix), synced, then published with a hard link that fails if `host_key` exists, so
+  a crash leaves at most a stray temp and a second creator reads the first one's key.
+  The desktop's own switch is `link/config.json` (P3b): `{schema: 1, enabled, port, binds,
+  firewall_notice_seen}`, off by default, `enabled` persists and starts the link at launch, one
+  fixed port (default 47800) for every bind, and a file it cannot read turns the link off and
+  is left alone.
 - **Binding.** Every address is explicit. `0.0.0.0` and `::` are refused before any socket is
   opened, with no override in v1. An empty list listens on nothing. Binding a loopback
   address never raises the Windows Firewall prompt; a LAN or Tailscale address can, once, for
-  an executable with no inbound rule, so the desktop will warn before it enables one (P3b).
+  an executable with no inbound rule, so the desktop warns before it first enables one (P3b, built: the Rust command refuses the
+  first non-loopback enable until the notice was shown). The desktop offers only addresses its
+  adapters have now (IPv4: loopback, Tailscale `100.64.0.0/10`, private ranges), never free text.
 - **The CSP bullet is moot.** Rust owns the socket in both roles, so the webview opens no
   connection and `connect-src` stays `ipc: http://ipc.localhost`.
 - **`v` as a number.** An integral JSON number such as `1.0` is the integer it denotes for
@@ -357,7 +367,13 @@ provider are P3b; the phone Noise is A1. Nothing starts listening unless a calle
   Rust rejects `1.0` was wrong.) One asymmetry remains: Rust `decode_host` reads `seq` as an
   unsigned integer and rejects `seq: 1.0`, where the TypeScript codec accepts it. It matters
   only to a Rust client (H3), since a Rust host never emits `1.0`.
-- **Not in P3a.** The desktop Devices view (QR, paired list, revoke, scope grants, the
-  confirm dialog), the persisted enable flag, the keyring provider and the Tauri commands
-  (P3b); the phone Noise and its test vectors (A1); a Rust client (H3); `orchestrad` (H2);
+- **Built in P3b** (changes to P3a's host, no wire change): a pairing client name is cut to
+  128 bytes with control and bidirectional-formatting characters dropped before the host
+  shows or stores it, so the confirm dialog and the paired list agree; and a confirm that
+  lands as the connection's deadline passes is honoured instead of stored without a welcome
+  (the connection takes its own pending entry, or waits up to a second for the decision the
+  host already took).
+- **Not in P3a, now built in P3b.** The desktop Devices view (QR, paired list, revoke,
+  scope grants, the confirm dialog), the persisted enable flag, the keyring provider and the
+  Tauri commands. **Still not built:** the phone Noise and its test vectors (A1); a Rust client (H3); `orchestrad` (H2);
   replay after a reconnect; TLS, a relay and mDNS.
