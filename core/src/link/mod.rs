@@ -1,14 +1,21 @@
 //! The host side of the link between a host and its phones, in the core so the desktop and
 //! `orchestrad` serve the same one. Nothing listens until a caller starts it with at least
-//! one explicit address. This part is the building blocks: Noise handshakes (`noise`),
-//! message framing (`frame`), key material (`keys`), the paired clients (`clients`) and the
-//! pairing window (`pairing`). See `protocol/README.md` "What P3 decided".
+//! one explicit address. The pieces: Noise handshakes (`noise`), message framing (`frame`),
+//! key material (`keys`), the paired clients (`clients`), the pairing window (`pairing`),
+//! the listener (`server`) and one thread per connection (`conn`). See
+//! `protocol/README.md` "What P3 decided".
 
 pub mod clients;
+mod conn;
 pub mod frame;
 pub mod keys;
 pub mod noise;
 pub mod pairing;
+pub mod server;
+
+pub use server::{
+    BindError, LinkCallbacks, LinkError, LinkHost, LinkLog, PendingPairing, validate_binds,
+};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
