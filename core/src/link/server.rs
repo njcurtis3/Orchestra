@@ -39,9 +39,10 @@ impl fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
-/// Refuse an unspecified address before any socket is touched.
+/// Refuse an unspecified address before any socket is touched. The IPv4-mapped form
+/// (::ffff:0.0.0.0) is canonicalised first: on Linux it binds every IPv4 interface.
 pub fn validate_binds(binds: &[SocketAddr]) -> Result<(), BindError> {
-    match binds.iter().find(|a| a.ip().is_unspecified()) {
+    match binds.iter().find(|a| a.ip().to_canonical().is_unspecified()) {
         Some(a) => Err(BindError::Unspecified(*a)),
         None => Ok(()),
     }
@@ -492,13 +493,15 @@ mod tests {
 
     #[test]
     fn unspecified_addresses_are_refused_before_any_socket_call() {
-        for bad in ["0.0.0.0:7000", "0.0.0.0:0", "[::]:7000", "[::]:0"] {
+        for bad in ["0.0.0.0:7000", "0.0.0.0:0", "[::]:7000", "[::]:0", "[::ffff:0.0.0.0]:7000", "[::ffff:0.0.0.0]:0"] {
             assert_eq!(validate_binds(&[sa(bad)]), Err(BindError::Unspecified(sa(bad))), "{bad}");
         }
         // One bad address among good ones refuses the lot.
         assert!(validate_binds(&[sa("127.0.0.1:0"), sa("0.0.0.0:0")]).is_err());
         assert!(validate_binds(&[sa("127.0.0.1:0"), sa("192.168.1.5:7000"), sa("[::1]:0")]).is_ok());
         assert!(validate_binds(&[]).is_ok());
+        // A mapped loopback is not unspecified.
+        assert!(validate_binds(&[sa("[::ffff:127.0.0.1]:0")]).is_ok());
     }
 
     fn host(binds: Vec<SocketAddr>) -> (LinkHost, std::path::PathBuf) {
