@@ -12,8 +12,13 @@ use super::state::ClaudeSessionId;
 
 #[cfg(windows)]
 mod job;
-/// Off Windows there is no job; the handle never exists.
-#[cfg(not(windows))]
+/// On Unix the job is a process group; it has the same `terminate` and `active`.
+#[cfg(unix)]
+mod group;
+#[cfg(unix)]
+use group as job;
+/// Anywhere else there is no job; the handle never exists.
+#[cfg(not(any(windows, unix)))]
 mod job {
     pub struct Job;
     impl Job {
@@ -24,8 +29,8 @@ mod job {
     }
 }
 
-/// Resolved on PATH to `claude.exe`. A `.cmd` shim is not found by this lookup and is
-/// reported as unsupported; nothing here ever goes through a shell.
+/// Resolved on PATH to `claude` (`claude.exe` on Windows). A `.cmd` shim is not found by this
+/// lookup and is reported as unsupported; nothing here ever goes through a shell.
 const PROGRAM: &str = "claude";
 
 /// Fixed spawn args (stream-json spike, `tests/fixtures/stream_json/README.md`).
@@ -81,7 +86,7 @@ pub enum Output {
 pub trait Proc: Send + Sync {
     fn send_line(&self, line: &str) -> Result<(), String>;
     fn kill(&self);
-    /// Block until the process, and on Windows every process in its job, has exited, or
+    /// Block until the process, and every process in its job or group, has exited, or
     /// `timeout` passes. True when it is gone. Takes no session lock, so call it with none held.
     fn wait_exit(&self, timeout: Duration) -> bool;
 }
@@ -101,14 +106,78 @@ fn attach_job(child: &Child) -> Option<Arc<job::Job>> {
     job.assign(child).then(|| Arc::new(job))
 }
 
-#[cfg(not(windows))]
+/// The child already leads its own group (see `spawn_program`); this only names it.
+#[cfg(unix)]
+fn attach_job(child: &Child) -> Option<Arc<job::Group>> {
+    job::Group::new(child.id()).map(Arc::new)
+}
+
+#[cfg(not(any(windows, unix)))]
 fn attach_job(_child: &Child) -> Option<Arc<job::Job>> {
     None
 }
 
+#[cfg(windows)]
+type Job = job::Job;
+#[cfg(unix)]
+type Job = job::Group;
+#[cfg(not(any(windows, unix)))]
+type Job = job::Job;
+
+/// One thread that lives as long as the process and does every fork. `PR_SET_PDEATHSIG`
+/// fires when the thread that forked the child exits, not the process, and the threads that
+/// call `spawn_program` are one-shot. This thread never exits before the process does.
+#[cfg(target_os = "linux")]
+mod spawner {
+    use std::process::{Child, Command};
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::OnceLock;
+
+    type Job = (Command, Sender<std::io::Result<Child>>);
+
+    pub fn spawn(cmd: Command) -> std::io::Result<Child> {
+        static TX: OnceLock<Sender<Job>> = OnceLock::new();
+        let tx = TX.get_or_init(|| {
+            let (tx, rx) = channel::<Job>();
+            std::thread::spawn(move || {
+                for (mut cmd, reply) in rx {
+                    let _ = reply.send(cmd.spawn());
+                }
+            });
+            tx
+        });
+        let (reply, rx) = channel();
+        let gone = || std::io::Error::other("the process spawner is gone");
+        tx.send((cmd, reply)).map_err(|_| gone())?;
+        rx.recv().map_err(|_| gone())?
+    }
+}
+
+/// Make the kernel SIGKILL the child if this process dies. Covers `claude` itself only;
+/// its descendants are not signalled (the group handles them on every graceful path).
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: runs between fork and exec, so it makes only async-signal-safe calls
+    // (prctl, getppid, _exit) and allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may have died before the prctl took effect.
+            if libc::getppid() != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
 pub struct ProcessHandle {
     child: Arc<Mutex<Child>>,
-    job: Option<Arc<job::Job>>,
+    job: Option<Arc<Job>>,
     stdin: Mutex<ChildStdin>,
     exited: ExitLatch,
 }
@@ -182,15 +251,26 @@ fn spawn_program(
     dir: &Path,
     sink: Box<dyn Fn(Output) + Send>,
 ) -> Result<Arc<dyn Proc>, String> {
+    Ok(spawn_handle(program, args, dir, sink)?)
+}
+
+/// `spawn_program` with the concrete handle, so a test can look at the job.
+fn spawn_handle(
+    program: &str,
+    args: &[String],
+    dir: &Path,
+    sink: Box<dyn Fn(Output) + Send>,
+) -> Result<Arc<ProcessHandle>, String> {
     // Checked first, so a folder that vanished is not reported as a missing claude.exe.
     if !dir.is_dir() {
         return Err("the working folder no longer exists".to_string());
     }
     let mut cmd = std::process::Command::new(program);
     // The child ends of these pipes are inheritable by design (std creates them so). A
-    // grandchild that claude starts with handle inheritance also holds them: if it outlives
-    // claude, the reader sees no EOF and Exit is late. With a job, stop and app exit still
-    // kill it. This cannot be closed here because claude makes that CreateProcess call.
+    // grandchild that claude starts with handle (Windows) or fd (Unix) inheritance also holds
+    // them: if it outlives claude, the reader sees no EOF and Exit is late. With a job or
+    // group, stop and app exit still kill it. This cannot be closed here because claude
+    // makes that spawn call.
     cmd.args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -201,9 +281,21 @@ fn spawn_program(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd.spawn().map_err(|e| {
+    // The child leads a new process group, so one signal reaches its whole tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(target_os = "linux")]
+    die_with_parent(&mut cmd);
+    #[cfg(target_os = "linux")]
+    let spawned = spawner::spawn(cmd);
+    #[cfg(not(target_os = "linux"))]
+    let spawned = cmd.spawn();
+    let mut child = spawned.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            "claude.exe was not found on PATH (a .cmd shim is not supported)".to_string()
+            format!("{} was not found on PATH (a .cmd shim is not supported)", if cfg!(windows) { "claude.exe" } else { "claude" })
         } else {
             "failed to start claude".to_string()
         }
@@ -214,6 +306,8 @@ fn spawn_program(
     let child = Arc::new(Mutex::new(child));
 
     let reader_child = Arc::clone(&child);
+    #[cfg(unix)]
+    let reader_job = job.clone();
     let has_job = job.is_some();
     let exited: ExitLatch = Arc::new((Mutex::new(false), Condvar::new()));
     let reader_exited = Arc::clone(&exited);
@@ -254,6 +348,16 @@ fn spawn_program(
             cv.notify_all();
         }
         sink(Output::Exit(code));
+        // The group's pid can be recycled once it is empty, so keep probing until it is,
+        // then latch it so a late kill or Drop signals nothing.
+        #[cfg(unix)]
+        if let Some(group) = reader_job {
+            let mut attempt = 0;
+            while group.active() > 0 {
+                std::thread::sleep(reap_delay(attempt));
+                attempt += 1;
+            }
+        }
     });
 
     Ok(Arc::new(ProcessHandle { child, job, stdin: Mutex::new(stdin), exited }))
@@ -327,6 +431,163 @@ mod tests {
         assert!(exit.is_some(), "Exit never arrived after wait_exit returned");
         assert!(proc.wait_exit(Duration::from_millis(1)), "the latch stays set");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run `sh -c script` through the real `spawn_program`, lines and exit on the channel.
+    #[cfg(unix)]
+    fn spawn_sh(script: &str) -> (Arc<dyn Proc>, mpsc::Receiver<Output>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let args = vec!["-c".to_string(), script.to_string()];
+        let proc = spawn_program(
+            "sh",
+            &args,
+            &std::env::temp_dir(),
+            Box::new(move |o| {
+                let _ = tx.lock().unwrap().send(o);
+            }),
+        )
+        .expect("spawn sh");
+        (proc, rx)
+    }
+
+    #[cfg(unix)]
+    fn first_pid(rx: &mpsc::Receiver<Output>) -> i32 {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Output::Line(l)) => l.trim().parse().expect("a pid"),
+            other => panic!("expected a pid line, got {other:?}"),
+        }
+    }
+
+    /// Absent, or a zombie waiting for its parent: dead either way.
+    #[cfg(target_os = "linux")]
+    fn is_dead(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // "pid (comm) S ...": the state is the first field after the last ')'.
+            Ok(stat) => stat.rsplit(')').next().map(|r| r.trim_start().starts_with('Z')).unwrap_or(true),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_dead(pid: i32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if is_dead(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        is_dead(pid)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_kill_reaches_the_grandchild() {
+        let (proc, rx) = spawn_sh("sleep 60 & echo $!; wait");
+        let grandchild = first_pid(&rx);
+        #[cfg(target_os = "linux")]
+        assert!(!is_dead(grandchild), "the grandchild must be running before the kill");
+        proc.kill();
+        assert!(proc.wait_exit(Duration::from_secs(5)));
+        #[cfg(target_os = "linux")]
+        assert!(wait_dead(grandchild, Duration::from_secs(5)), "grandchild {grandchild} survived kill()");
+        #[cfg(not(target_os = "linux"))]
+        let _ = grandchild;
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_wait_exit_waits_for_the_group() {
+        // The shell exits at once; the grandchild has no pipe to hold, so only the group knows.
+        let started = Instant::now();
+        let (proc, rx) = spawn_sh("sleep 1 >/dev/null </dev/null 2>&1 & echo $!");
+        let _ = first_pid(&rx);
+        assert!(proc.wait_exit(Duration::from_secs(10)));
+        assert!(started.elapsed() >= Duration::from_millis(800), "returned after {:?}", started.elapsed());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_group_is_gone_after_it_empties() {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let args = vec!["-c".to_string(), "echo $$".to_string()];
+        let proc = spawn_handle(
+            "sh",
+            &args,
+            &std::env::temp_dir(),
+            Box::new(move |o| {
+                let _ = tx.lock().unwrap().send(o);
+            }),
+        )
+        .expect("spawn sh");
+        let _ = first_pid(&rx);
+        assert!(proc.wait_exit(Duration::from_secs(5)));
+        let group = proc.job.as_ref().expect("a group").clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.is_gone() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(group.is_gone(), "the reader never latched the empty group");
+        assert_eq!(group.active(), 0);
+        group.terminate(); // must not signal a recycled pgid; nothing to observe but no panic
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_a_child_outlives_the_thread_that_spawned_it() {
+        // PR_SET_PDEATHSIG fires when the forking thread exits. The spawner thread forks, so
+        // a child started from a one-shot thread must survive that thread.
+        let (proc, rx) = std::thread::spawn(|| spawn_sh("echo $$; exec sleep 60")).join().unwrap();
+        let pid = first_pid(&rx);
+        assert!(!proc.wait_exit(Duration::from_millis(500)), "the child died with its spawning thread");
+        assert!(!is_dead(pid));
+        proc.kill();
+        assert!(proc.wait_exit(Duration::from_secs(5)));
+    }
+
+    #[cfg(target_os = "linux")]
+    const PDEATH_ENV: &str = "ORCHESTRA_PDEATHSIG_HELPER";
+
+    /// Run only by `linux_pdeathsig_kills_the_child_when_the_host_dies`, in a child copy of
+    /// this test binary: spawn a child, print its pid, then die without cleanup.
+    #[test]
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn pdeathsig_helper() {
+        if std::env::var_os(PDEATH_ENV).is_none() {
+            return;
+        }
+        let (_proc, rx) = spawn_sh("echo $$; exec sleep 60");
+        let pid = first_pid(&rx);
+        println!("PDEATH_PID={pid}");
+        std::process::abort();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_pdeathsig_kills_the_child_when_the_host_dies() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "session::process::tests::pdeathsig_helper", "--ignored", "--nocapture"])
+            .env(PDEATH_ENV, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let pid: i32 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("PDEATH_PID="))
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap_or_else(|| panic!("helper printed no pid: {text} {}", String::from_utf8_lossy(&out.stderr)));
+        assert!(!out.status.success(), "the helper must have aborted");
+        let dead = wait_dead(pid, Duration::from_secs(5));
+        if !dead {
+            // SAFETY: a plain kill of the pid the helper reported, so the runner is left clean.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(dead, "child {pid} outlived its host");
     }
 
     #[test]
