@@ -478,3 +478,66 @@ fn pairing_offer_names_the_bound_address() {
     assert_eq!(offer.host_id, rig.host_key.host_id());
     assert!(offer.addrs[0].starts_with("127.0.0.1:"));
 }
+
+#[test]
+fn pairing_name_huge_name_reaches_the_host_clipped() {
+    let rig = Rig::new();
+    let me = Identity::new();
+    let offer = rig.host.open_pairing().unwrap();
+    // As long as the wire allows a string to be (MAX_TEXT_BYTES, 32 KiB); clip is also unit-tested at 4 MiB.
+    let huge = "n".repeat(30_000);
+    let _conn = Conn::pair(rig.addr, &offer, &me, &huge).unwrap();
+    let request = rig.pairing.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(request.client_name.len(), 128);
+    assert!(request.client_name.bytes().all(|b| b == b'n'));
+    let client = rig.host.confirm_pairing(&request.id, None).unwrap();
+    assert_eq!(client.name, request.client_name, "shown and stored names agree");
+}
+
+#[test]
+fn pairing_name_control_and_bidi_characters_are_dropped() {
+    let rig = Rig::new();
+    let me = Identity::new();
+    let offer = rig.host.open_pairing().unwrap();
+    let _conn = Conn::pair(rig.addr, &offer, &me, " \u{202E}Pi\u{0}xel\r\n\u{2066}7\u{1b}[2J ").unwrap();
+    let request = rig.pairing.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(request.client_name, "Pixel7[2J");
+    let client = rig.host.confirm_pairing(&request.id, None).unwrap();
+    assert_eq!(client.name, "Pixel7[2J");
+}
+
+#[test]
+fn confirm_race_a_confirm_after_the_deadline_stores_nothing() {
+    let rig = Rig::with(|l| l.confirm_timeout = Duration::from_millis(250));
+    let offer = rig.host.open_pairing().unwrap();
+    let mut conn = Conn::pair(rig.addr, &offer, &Identity::new(), "Late").unwrap();
+    let request = rig.pairing.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(rig.host.confirm_pairing(&request.id, None).is_err());
+    conn.expect_closed();
+    assert!(rig.host.list_clients().unwrap().is_empty());
+}
+
+#[test]
+fn confirm_race_a_confirm_at_the_deadline_is_welcomed_or_leaves_no_client() {
+    let rig = Rig::with(|l| l.confirm_timeout = Duration::from_millis(300));
+    // Confirms landing before, at and after the deadline: whichever side wins, a stored
+    // client always got its welcome, and a refused confirm leaves nothing stored.
+    for delay_ms in [100u64, 220, 260, 280, 295, 305, 320, 400] {
+        let before = rig.host.list_clients().unwrap().len();
+        let offer = rig.host.open_pairing().unwrap();
+        let mut conn = Conn::pair(rig.addr, &offer, &Identity::new(), "Racer").unwrap();
+        let request = rig.pairing.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        match rig.host.confirm_pairing(&request.id, None) {
+            Ok(_) => {
+                assert!(matches!(conn.expect(), HostMessage::Welcome(_)), "delay {delay_ms}: stored but not welcomed");
+                assert_eq!(rig.host.list_clients().unwrap().len(), before + 1);
+            }
+            Err(_) => {
+                conn.expect_closed();
+                assert_eq!(rig.host.list_clients().unwrap().len(), before, "delay {delay_ms}: refused but stored");
+            }
+        }
+    }
+}

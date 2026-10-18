@@ -212,7 +212,8 @@ pub trait KeyProvider: Send + Sync {
 }
 
 /// `<link dir>/host_key`: 32 raw bytes, created once with mode 0600 on Unix. On Windows it
-/// inherits the per-user app data folder it lives in.
+/// inherits the per-user app data folder it lives in. It is written to a temp file and
+/// published whole by a hard link, so a crash leaves at most a stray temp, never a short key.
 pub struct FileKeyProvider {
     path: PathBuf,
 }
@@ -274,6 +275,31 @@ fn create_new(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
+impl FileKeyProvider {
+    /// A sibling of the key file with a name no other creator picks.
+    fn temp_path(&self) -> Result<PathBuf, KeyError> {
+        let mut name = self.path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(format!(".tmp-{}", to_hex(&random_bytes::<4>()?)));
+        Ok(self.path.with_file_name(name))
+    }
+
+    /// Write `key` to a temp file (mode 0600 on Unix), flush it, then publish it with a hard
+    /// link, which fails if the key file already exists. The key file therefore appears whole
+    /// or not at all, and a second creator never replaces the first one's key. `Ok(false)`
+    /// means another creator got there first.
+    fn publish(&self, tmp: &Path, key: &SecretKey) -> Result<bool, KeyError> {
+        let mut f = create_new(tmp)?;
+        f.write_all(key.expose())?;
+        f.sync_all()?;
+        drop(f);
+        match fs::hard_link(tmp, &self.path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 impl KeyProvider for FileKeyProvider {
     fn load_or_create(&self) -> Result<SecretKey, KeyError> {
         match self.read() {
@@ -285,15 +311,15 @@ impl KeyProvider for FileKeyProvider {
             create_dir(dir)?;
         }
         let key = SecretKey::generate()?;
-        match create_new(&self.path) {
-            Ok(mut f) => {
-                f.write_all(key.expose())?;
-                f.sync_all()?;
-                Ok(key)
-            }
+        let tmp = self.temp_path()?;
+        let published = self.publish(&tmp, &key);
+        // The temp is a second copy of the key: it never outlives this call.
+        let _ = fs::remove_file(&tmp);
+        match published {
+            Ok(true) => Ok(key),
             // Another thread or process created it first: use theirs.
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => self.read(),
-            Err(e) => Err(e.into()),
+            Ok(false) => self.read(),
+            Err(e) => Err(e),
         }
     }
 }
@@ -394,6 +420,72 @@ mod tests {
         fs::set_permissions(link.join("host_key"), fs::Permissions::from_mode(0o644)).unwrap();
         FileKeyProvider::new(&link).load_or_create().unwrap();
         assert_eq!(mode(&link.join("host_key")), 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_atomic_leftover_temp_does_not_block_creation() {
+        let dir = scratch("keystale");
+        // A crash that left temps behind, one of them empty.
+        fs::write(dir.join("host_key.tmp-00000000"), b"").unwrap();
+        fs::write(dir.join("host_key.tmp-deadbeef"), [9u8; 3]).unwrap();
+        let key = FileKeyProvider::new(&dir).load_or_create().unwrap();
+        assert_eq!(fs::read(dir.join("host_key")).unwrap(), key.expose());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_atomic_second_creator_gets_the_first_key() {
+        let dir = scratch("keyrace");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || FileKeyProvider::new(&dir).load_or_create().unwrap().expose().to_vec())
+            })
+            .collect();
+        let keys: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(keys.iter().all(|k| *k == keys[0]));
+        assert_eq!(fs::read(dir.join("host_key")).unwrap(), keys[0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_atomic_publish_never_replaces_an_existing_key() {
+        let dir = scratch("keynoclobber");
+        let provider = FileKeyProvider::new(&dir);
+        let first = SecretKey::generate().unwrap();
+        let second = SecretKey::generate().unwrap();
+        let tmp1 = provider.temp_path().unwrap();
+        let tmp2 = provider.temp_path().unwrap();
+        assert_ne!(tmp1, tmp2);
+        assert!(provider.publish(&tmp1, &first).unwrap());
+        assert!(!provider.publish(&tmp2, &second).unwrap());
+        assert_eq!(fs::read(dir.join("host_key")).unwrap(), first.expose());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_key_atomic_temp_is_gone_after_success() {
+        let dir = scratch("keytemp");
+        FileKeyProvider::new(&dir).load_or_create().unwrap();
+        let names: Vec<String> =
+            fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["host_key".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_key_atomic_is_mode_0600_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("keytempmode");
+        let provider = FileKeyProvider::new(&dir);
+        let tmp = provider.temp_path().unwrap();
+        assert!(provider.publish(&tmp, &SecretKey::generate().unwrap()).unwrap());
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // The temp and the published key are the same inode.
+        assert_eq!(mode(&tmp), 0o600);
+        assert_eq!(mode(&dir.join("host_key")), 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 }

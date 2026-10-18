@@ -19,7 +19,7 @@ use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Error as WsError, Message, WebSocket};
 
-use super::clients::Client;
+use super::clients::{Client, clip};
 use super::frame;
 use super::keys::PublicKey;
 use super::noise::{Handshake, Mode, Transport, prologue};
@@ -323,30 +323,52 @@ fn handshake(shared: &Arc<Shared>, ws: &mut Ws, mode: Mode) -> Option<Joined> {
     }
 }
 
+/// How long a connection that gave up waits for a decision the host already took.
+const SETTLE_GRACE: Duration = Duration::from_secs(1);
+
+/// The connection's deadline (or a stop) has passed. `we_removed` says whether it took its own
+/// pending entry. If it did, no decision will come. If it did not, the host took the entry
+/// first and is storing a client; its decision is already on the way and is honoured, so a
+/// client is stored only if it also gets its welcome.
+fn settle(rx: &Receiver<Decision>, we_removed: bool, grace: Duration) -> Option<Client> {
+    if we_removed {
+        return None;
+    }
+    match rx.recv_timeout(grace) {
+        Ok(Decision::Confirmed(client)) => Some(client),
+        _ => None,
+    }
+}
+
 /// Hold the pairing until the host confirms or rejects it, or the time runs out.
 fn await_confirmation(shared: &Arc<Shared>, key: &PublicKey, name: &str) -> Option<Client> {
+    // What a person is shown is clipped and clean, however long the phone said it was.
+    let name = clip(name);
     let id = shared.next_pending_id();
     let (tx, rx) = mpsc::sync_channel(1);
-    shared.add_pending(id.clone(), PendingEntry { key: *key, name: name.to_string(), tx });
+    shared.add_pending(id.clone(), PendingEntry { key: *key, name: name.clone(), tx });
     shared.log(LinkLog::PairingRequested { id: id.clone() });
     (shared.callbacks.on_pairing_request)(PendingPairing {
         id: id.clone(),
-        client_name: name.to_string(),
+        client_name: name,
         fingerprint: key.fingerprint(),
     });
     let deadline = Instant::now() + shared.config.limits.confirm_timeout;
-    let outcome = loop {
+    loop {
         if shared.stopped() || Instant::now() >= deadline {
-            break None;
+            // Removing the entry is the one point where this and the host's confirm are ordered.
+            let we_removed = shared.remove_pending(&id);
+            return settle(&rx, we_removed, SETTLE_GRACE);
         }
         match rx.recv_timeout(POLL) {
-            Ok(Decision::Confirmed(client)) => break Some(client),
-            Ok(Decision::Rejected) | Err(RecvTimeoutError::Disconnected) => break None,
+            Ok(Decision::Confirmed(client)) => return Some(client),
+            Ok(Decision::Rejected) | Err(RecvTimeoutError::Disconnected) => {
+                shared.remove_pending(&id);
+                return None;
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
-    };
-    shared.remove_pending(&id);
-    outcome
+    }
 }
 
 // ---- the message loop ----
@@ -596,5 +618,47 @@ mod tests {
         let err = sock.read(&mut [0u8; 4]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         drop(client);
+    }
+
+    fn client() -> Client {
+        Client {
+            id: "c-1".into(),
+            name: "Pixel".into(),
+            public_key: super::super::keys::SecretKey::from_bytes([5u8; 32]).public(),
+            scopes: vec![Scope::Read],
+            paired_at: 1,
+        }
+    }
+
+    #[test]
+    fn confirm_race_settle_honours_a_decision_the_host_already_sent() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Decision::Confirmed(client())).unwrap();
+        // The host took the entry first: its confirm is honoured, not dropped.
+        assert_eq!(settle(&rx, false, Duration::from_millis(50)).map(|c| c.id), Some("c-1".to_string()));
+        // A rejection, or a host that never sends, leaves no client.
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Decision::Rejected).unwrap();
+        assert!(settle(&rx, false, Duration::from_millis(50)).is_none());
+        let (_tx, rx) = mpsc::sync_channel::<Decision>(1);
+        assert!(settle(&rx, false, Duration::from_millis(30)).is_none());
+    }
+
+    #[test]
+    fn confirm_race_settle_ignores_a_decision_when_we_took_the_entry() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(Decision::Confirmed(client())).unwrap();
+        assert!(settle(&rx, true, Duration::from_millis(50)).is_none());
+    }
+
+    #[test]
+    fn confirm_race_settle_waits_for_a_late_decision() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = tx.send(Decision::Confirmed(client()));
+        });
+        assert!(settle(&rx, false, Duration::from_secs(5)).is_some());
+        sender.join().unwrap();
     }
 }
