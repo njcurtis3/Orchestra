@@ -27,3 +27,12 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-window-state = "2"
 orchestra-core = { path = "../../core" }
+# The pairing QR is drawn as an SVG string in Rust; `svg` has no dependency of its own.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# Lists this computer's addresses so the link can only be bound to one that exists.
+if-addrs = "0.15"
+
+# Credential Manager holds the host's private key on Windows (src/keyring.rs). Shell only:
+# the core takes a `KeyProvider` and depends on no keyring.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
