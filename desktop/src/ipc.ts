@@ -3,18 +3,27 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   DIFF_FILE_STATUSES,
   INBOX_KINDS,
+  INTERFACE_KINDS,
+  LINK_OSES,
   MODELS,
   PERMISSION_MODES,
+  SCOPES,
   SESSION_STATUSES,
   TASK_STATUSES,
   type Answer,
   type CommitView,
+  type Device,
   type DiffFile,
   type InboxItem,
+  type LinkInterface,
+  type LinkStatus,
   type Model,
+  type PairingView,
+  type PendingPairing,
   type PermissionMode,
   type Project,
   type Question,
+  type Scope,
   type SessionSummary,
   type TaskDiff,
   type TaskSummary,
@@ -391,6 +400,153 @@ export function onTaskUpdated(
   return listen<unknown>("task-updated", (e) => {
     try {
       cb(decodeTask(e.payload));
+    } catch (err) {
+      onError(err);
+    }
+  });
+}
+
+// ---- the phone link ----
+
+const strs = (o: Obj, k: string): string[] =>
+  arr(o[k], k).map((x) => {
+    if (typeof x !== "string") throw new Error(`bad field ${k}`);
+    return x;
+  });
+
+export function decodeScopes(v: unknown): Scope[] {
+  return arr(v, "scopes").map((x) => {
+    if (typeof x !== "string" || !(SCOPES as readonly string[]).includes(x)) throw new Error("unknown scope");
+    return x as Scope;
+  });
+}
+
+export function decodeLinkStatus(v: unknown): LinkStatus {
+  const o = obj(v, "link status");
+  return {
+    available: bool(o, "available"),
+    os: oneOf(o, "os", LINK_OSES),
+    enabled: bool(o, "enabled"),
+    running: bool(o, "running"),
+    addrs: strs(o, "addrs"),
+    port: num(o, "port"),
+    binds: strs(o, "binds"),
+    missing: strs(o, "missing"),
+    error: strOrNull(o, "error"),
+    config_readonly: strOrNull(o, "config_readonly"),
+    firewall_notice_seen: bool(o, "firewall_notice_seen"),
+  };
+}
+
+export function decodeLinkInterface(v: unknown): LinkInterface {
+  const o = obj(v, "link interface");
+  return { ip: str(o, "ip"), kind: oneOf(o, "kind", INTERFACE_KINDS), name: str(o, "name") };
+}
+
+// The pairing secret is in the QR and nowhere else: a payload that carries a secret field is
+// refused, so it can never be put on screen as text by a later change on either side.
+export function decodePairingView(v: unknown): PairingView {
+  const o = obj(v, "pairing");
+  for (const k of Object.keys(o)) {
+    if (/secret|psk|private/i.test(k)) throw new Error("bad pairing");
+  }
+  const qr = str(o, "qr_svg");
+  if (!/^(<\?xml[^>]*\?>)?<svg[\s>]/.test(qr)) throw new Error("bad field qr_svg");
+  return { qr_svg: qr, host_name: str(o, "host_name"), addrs: strs(o, "addrs"), expires_at: num(o, "expires_at") };
+}
+
+export function decodePendingPairing(v: unknown): PendingPairing {
+  const o = obj(v, "pairing request");
+  return {
+    id: str(o, "id"),
+    client_name: str(o, "client_name"),
+    fingerprint: str(o, "fingerprint"),
+    expires_at: num(o, "expires_at"),
+  };
+}
+
+export function decodeDevice(v: unknown): Device {
+  const o = obj(v, "device");
+  return {
+    id: str(o, "id"),
+    name: str(o, "name"),
+    fingerprint: str(o, "fingerprint"),
+    scopes: decodeScopes(o.scopes),
+    paired_at: num(o, "paired_at"),
+  };
+}
+
+export const decodeDevices = (v: unknown): Device[] => arr(v, "devices").map(decodeDevice);
+export const decodeLinkInterfaces = (v: unknown): LinkInterface[] => arr(v, "interfaces").map(decodeLinkInterface);
+export const decodePendingPairings = (v: unknown): PendingPairing[] => arr(v, "requests").map(decodePendingPairing);
+
+export type LinkConfigChange = { enabled: boolean; binds: string[]; port: number; firewall_notice_seen: boolean };
+
+export async function linkStatus(): Promise<LinkStatus> {
+  return decodeLinkStatus(await invoke<unknown>("link_status"));
+}
+export async function linkInterfaces(): Promise<LinkInterface[]> {
+  return decodeLinkInterfaces(await invoke<unknown>("link_interfaces"));
+}
+export async function linkSetConfig(change: LinkConfigChange): Promise<LinkStatus> {
+  return decodeLinkStatus(await invoke<unknown>("link_set_config", { args: change }));
+}
+export async function linkOpenPairing(): Promise<PairingView> {
+  return decodePairingView(await invoke<unknown>("link_open_pairing"));
+}
+export async function linkClosePairing(): Promise<void> {
+  await invoke<void>("link_close_pairing");
+}
+export async function linkPending(): Promise<PendingPairing[]> {
+  return decodePendingPairings(await invoke<unknown>("link_pending"));
+}
+export async function linkConfirmPairing(id: string, scopes: Scope[]): Promise<Device> {
+  return decodeDevice(await invoke<unknown>("link_confirm_pairing", { args: { id, scopes } }));
+}
+export async function linkRejectPairing(id: string): Promise<void> {
+  await invoke<void>("link_reject_pairing", { args: { id } });
+}
+export async function linkListDevices(): Promise<Device[]> {
+  return decodeDevices(await invoke<unknown>("link_list_devices"));
+}
+export async function linkSetScopes(clientId: string, scopes: Scope[]): Promise<void> {
+  await invoke<void>("link_set_scopes", { args: { client_id: clientId, scopes } });
+}
+export async function linkRevoke(clientId: string): Promise<void> {
+  await invoke<void>("link_revoke", { args: { client_id: clientId } });
+}
+
+export function onLinkPairingRequest(
+  cb: (p: PendingPairing) => void,
+  onError: (e: unknown) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("link-pairing-request", (e) => {
+    try {
+      cb(decodePendingPairing(e.payload));
+    } catch (err) {
+      onError(err);
+    }
+  });
+}
+export function onLinkStatusChanged(
+  cb: (s: LinkStatus) => void,
+  onError: (e: unknown) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("link-status-changed", (e) => {
+    try {
+      cb(decodeLinkStatus(e.payload));
+    } catch (err) {
+      onError(err);
+    }
+  });
+}
+export function onLinkDevicesChanged(
+  cb: (d: Device[]) => void,
+  onError: (e: unknown) => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("link-devices-changed", (e) => {
+    try {
+      cb(decodeDevices(e.payload));
     } catch (err) {
       onError(err);
     }
