@@ -13,6 +13,9 @@ name = "orchestra_core"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
