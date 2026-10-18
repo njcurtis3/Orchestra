@@ -20,7 +20,7 @@ Standalone app under the repos/ umbrella. Never import from a sibling app; see .
 | `mobile/` | Android remote | Expo (React Native, TypeScript), expo-router |
 | `protocol/` | Client <-> host message format, with shared JSON fixtures | TypeScript (source of truth), Rust copy in `core/src/wire` (`orchestra_core::wire`) |
 | `fleet/` | Vendored orchestration model | synced from upstream, **never hand-edited** |
-| `.github/workflows/` | Release matrix (desktop) | GitHub Actions, tauri-action |
+| `.github/workflows/` | `test.yml` (core on Linux x64 and arm64, Windows workspace, both front ends, macOS check); release matrix (desktop) | GitHub Actions, tauri-action |
 
 There is no root `package.json`. The root `Cargo.toml` is a Rust workspace (`core/`,
 `desktop/src-tauri`); `desktop/` and `mobile/` each install on their own.
@@ -38,8 +38,9 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (181 core + 4 wire fixtures + 10 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (185 core + 4 wire fixtures + 10 shell)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
+# Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
 
 # mobile
 cd mobile && npm install
