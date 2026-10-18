@@ -474,3 +474,111 @@ pre.diff {
     background: #1d2a48;
   }
 }
+
+/* ---- the phone link ---- */
+
+.pill {
+  align-self: center;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.pill-off {
+  background: #e3e3e8;
+  color: #3a3a42;
+}
+
+.pill-on {
+  background: #d6f2dc;
+  color: #14361e;
+}
+
+.pill-error {
+  background: #fde2e2;
+  color: #7a1212;
+}
+
+.devices {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 44rem;
+}
+
+.devices h3,
+.devices h4 {
+  margin: 0 0 6px;
+}
+
+.devices .port {
+  width: 8rem;
+}
+
+.mono {
+  font-family: ui-monospace, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.name-ellipsis {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.status-line {
+  margin: 6px 0;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dialog {
+  width: 100%;
+  max-width: 28rem;
+  max-height: 100%;
+  overflow: auto;
+  padding: 16px;
+}
+
+.dialog h3 {
+  margin: 0 0 8px;
+}
+
+.qr {
+  display: block;
+  width: 100%;
+  max-width: 280px;
+  height: auto;
+  margin: 8px auto;
+  background: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  .pill-off {
+    background: #3a3a42;
+    color: #ececf0;
+  }
+
+  .pill-on {
+    background: #1d4a2a;
+    color: #d6f2dc;
+  }
+
+  .pill-error {
+    background: #4a1a1a;
+    color: #fbd0d0;
+  }
+}

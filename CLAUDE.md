@@ -38,7 +38,7 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (245 core + 26 link + 4 wire fixtures + 10 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (253 core + 30 link + 4 wire fixtures + 41 shell)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 # Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
 
@@ -110,6 +110,25 @@ and allowed to drift.
   `cfg(desktop)`; the frontend never calls it, so no capability is granted). The plugin
   restores size and position; `src/window.rs` then checks the title bar is reachable on a
   current monitor and otherwise clamps to the primary monitor and centres the window.
+- **The host key lives in Windows Credential Manager** (`src-tauri/src/keyring.rs`): a
+  generic credential named `com.telosrg.orchestra/link/host_key`, 32 raw bytes, written
+  through `windows-sys` (shell crate only; the core takes a `KeyProvider` and has no keyring).
+  Off Windows the shell uses the core's `FileKeyProvider` (`link/host_key`, mode 0600). The key
+  never crosses IPC; the pairing secret reaches the webview only inside the QR image. Deleting
+  the credential gives the host a new key, and every paired phone then refuses it until it
+  pairs again. Tests use their own target names, never the real one.
+- **`link/config.json` is the link's switch** (`src-tauri/src/link_config.rs`, under
+  `app_data_dir/link/` beside `clients.json`): schema 1, `enabled` (off by default, and it
+  persists: an enabled link starts when the app starts), one `port` (default 47800, 1024-65535,
+  never 0) and `binds` (IPv4 addresses chosen from this computer's adapters, never `0.0.0.0`
+  or `::`). A saved address that is gone is skipped at start and kept in the file. A schema
+  this build does not know, or a file that does not parse, turns the link off and is left alone.
+  A first non-loopback enable is refused until the firewall notice was shown. Start, stop and
+  reconfigure run off the main thread; the app waits at most 2 seconds for the link on exit.
+- **The CSP is pinned by a test** (`csp_pinned` in `src-tauri/src/lib.rs` reads
+  `tauri.conf.json` and compares the exact string), because the pairing QR is an `<img>`
+  `data:` URL that only `img-src 'self' data:` allows. Changing the CSP means changing that
+  test in the same commit, with a reason.
 - **Menus follow the OS**; accelerators use `CmdOrCtrl`.
 - **Webviews differ**: WebView2 (Windows), WKWebView (macOS), WebKitGTK (Linux, the floor).
   Check web features against all three.

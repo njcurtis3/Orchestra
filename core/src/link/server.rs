@@ -227,8 +227,9 @@ impl Shared {
         lock(&self.pending).insert(id, entry);
     }
 
-    pub(crate) fn remove_pending(&self, id: &str) {
-        lock(&self.pending).remove(id);
+    /// True when this call took the entry; false when the host already had (it is deciding).
+    pub(crate) fn remove_pending(&self, id: &str) -> bool {
+        lock(&self.pending).remove(id).is_some()
     }
 
     /// Note a live connection for this client and tell the one it replaces to go.

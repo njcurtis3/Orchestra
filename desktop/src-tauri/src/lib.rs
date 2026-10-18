@@ -1,4 +1,8 @@
 mod commands;
+mod keyring;
+mod link;
+mod link_config;
+mod qr;
 mod window;
 
 use tauri::{Emitter, Manager, RunEvent};
@@ -7,6 +11,7 @@ use tauri_plugin_notification::NotificationExt;
 use orchestra_core::{notify, projects, session};
 
 use commands::AppSessions;
+use link::{LinkRef, LinkState};
 use session::{Event, Sessions, process, store, transcript};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -79,8 +84,23 @@ pub fn run() {
             sessions.pump_in_background();
             // Cleanups left pending get one more try now that no child can be holding a folder.
             sessions.retry_pending_in_background();
+            // The phone link: its files sit beside the app's, and it is off unless the saved
+            // settings say otherwise. Starting it waits on sockets, so it runs off this thread.
+            let link_handle = app.handle().clone();
+            let link = LinkState::new(
+                std::sync::Arc::clone(&sessions),
+                status.clone(),
+                data_dir.as_ref().map(|dir| dir.join("link")),
+                link::host_name_from_env(),
+                std::sync::Arc::new(keyring::provider_for),
+                std::sync::Arc::new(move |name, payload| {
+                    let _ = link_handle.emit(name, payload);
+                }),
+            );
+            link.auto_start();
             app.manage(sessions);
             app.manage(status);
+            app.manage(link);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -100,15 +120,46 @@ pub fn run() {
             commands::retry_cleanup,
             commands::get_transcript,
             commands::storage_status,
+            link::link_status,
+            link::link_interfaces,
+            link::link_set_config,
+            link::link_open_pairing,
+            link::link_close_pairing,
+            link::link_pending,
+            link::link_confirm_pairing,
+            link::link_reject_pairing,
+            link::link_list_devices,
+            link::link_set_scopes,
+            link::link_revoke,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
+            // Stopping the link joins its threads, which can take long: wait 2 seconds at most.
+            if let Some(link) = handle.try_state::<LinkRef>() {
+                link.shutdown(std::time::Duration::from_secs(2));
+            }
             if let Some(sessions) = handle.try_state::<AppSessions>() {
                 sessions.shutdown();
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// The webview's CSP is part of the link's safety: the pairing QR is an `<img>` data URL
+    /// and nothing inline may run. Changing it is a decision, so the exact text is pinned.
+    #[test]
+    fn csp_pinned() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["app"]["security"]["csp"].as_str(),
+            Some(
+                "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost"
+            )
+        );
+    }
 }

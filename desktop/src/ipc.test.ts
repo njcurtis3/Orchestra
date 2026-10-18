@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  decodeDevice,
   decodeInboxItem,
+  decodeLinkInterface,
+  decodeLinkStatus,
+  decodePairingView,
+  decodePendingPairing,
   decodeSession,
   decodeStorageStatus,
   decodeTask,
@@ -222,5 +227,91 @@ describe("decodeTaskDiff", () => {
   });
   it("rejects an unknown file status", () => {
     expect(() => decodeTaskDiff({ ...wireDiff, files: [{ ...wireDiff.files[0], status: "renamed" }] })).toThrow();
+  });
+});
+
+const linkWire = () => ({
+  available: true,
+  os: "windows",
+  enabled: true,
+  running: true,
+  addrs: ["127.0.0.1:47800"],
+  port: 47800,
+  binds: ["127.0.0.1"],
+  missing: [],
+  error: null,
+  config_readonly: null,
+  firewall_notice_seen: false,
+});
+
+describe("decodeLinkStatus", () => {
+  it("decodes a status and keeps null as null", () => {
+    const s = decodeLinkStatus(linkWire());
+    expect([s.os, s.running, s.addrs, s.error, s.config_readonly]).toEqual([
+      "windows",
+      true,
+      ["127.0.0.1:47800"],
+      null,
+      null,
+    ]);
+    expect(decodeLinkStatus({ ...linkWire(), error: "Port 47800 is already in use." }).error).toContain("47800");
+  });
+
+  it("rejects an unknown OS, a missing field and a non-string address", () => {
+    expect(() => decodeLinkStatus({ ...linkWire(), os: "plan9" })).toThrow("unknown os");
+    const { running: _running, ...rest } = linkWire();
+    expect(() => decodeLinkStatus(rest)).toThrow("bad field running");
+    expect(() => decodeLinkStatus({ ...linkWire(), addrs: [1] })).toThrow("bad field addrs");
+  });
+});
+
+describe("decodeLinkInterface", () => {
+  it("decodes the four kinds and rejects another", () => {
+    for (const kind of ["loopback", "lan", "tailscale", "other"]) {
+      expect(decodeLinkInterface({ ip: "10.0.0.1", kind, name: "x" }).kind).toBe(kind);
+    }
+    expect(() => decodeLinkInterface({ ip: "10.0.0.1", kind: "vpn", name: "x" })).toThrow("unknown kind");
+  });
+});
+
+describe("decodePairingView", () => {
+  const view = {
+    qr_svg: '<?xml version="1.0" standalone="yes"?><svg xmlns="http://www.w3.org/2000/svg"></svg>',
+    host_name: "Desk",
+    addrs: ["127.0.0.1:47800"],
+    expires_at: 5,
+  };
+
+  it("decodes the view", () => {
+    expect(decodePairingView(view).host_name).toBe("Desk");
+  });
+
+  it("rejects a payload that carries a secret field, however it is spelled", () => {
+    for (const key of ["secret", "psk", "pairing_secret", "private_key"]) {
+      expect(() => decodePairingView({ ...view, [key]: "ab".repeat(32) }), key).toThrow("bad pairing");
+    }
+  });
+
+  it("rejects an image that is not an svg", () => {
+    expect(() => decodePairingView({ ...view, qr_svg: "<script>alert(1)</script>" })).toThrow("bad field qr_svg");
+    expect(() => decodePairingView({ ...view, qr_svg: "data:image/png;base64,AAAA" })).toThrow("bad field qr_svg");
+  });
+});
+
+describe("decodePendingPairing and decodeDevice", () => {
+  it("decodes a request", () => {
+    const p = decodePendingPairing({ id: "p1", client_name: "Pixel", fingerprint: "aaaa-bbbb", expires_at: 9 });
+    expect([p.id, p.client_name, p.expires_at]).toEqual(["p1", "Pixel", 9]);
+    expect(() => decodePendingPairing({ id: "p1", client_name: "Pixel", expires_at: 9 })).toThrow(
+      "bad field fingerprint",
+    );
+  });
+
+  it("decodes a device and refuses a scope outside the four", () => {
+    const d = decodeDevice({ id: "c-1", name: "Pixel", fingerprint: "aaaa-bbbb", scopes: ["read", "land"], paired_at: 3 });
+    expect(d.scopes).toEqual(["read", "land"]);
+    expect(() => decodeDevice({ id: "c-1", name: "Pixel", fingerprint: "f", scopes: ["root"], paired_at: 3 })).toThrow(
+      "unknown scope",
+    );
   });
 });

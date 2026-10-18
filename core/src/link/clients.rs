@@ -237,8 +237,12 @@ fn uniq(scopes: Vec<Scope>) -> Vec<Scope> {
     out
 }
 
-fn clip(name: &str) -> String {
-    let name = name.trim();
+/// A name fit to show and store: control and bidirectional-formatting characters dropped
+/// (they can hide or reorder what a person reads), trimmed, at most `MAX_NAME_BYTES` bytes
+/// on a char boundary.
+pub(crate) fn clip(name: &str) -> String {
+    let cleaned: String = name.chars().filter(|c| !c.is_control() && !is_bidi_format(*c)).collect();
+    let name = cleaned.trim();
     if name.len() <= MAX_NAME_BYTES {
         return name.to_string();
     }
@@ -246,7 +250,12 @@ fn clip(name: &str) -> String {
     while !name.is_char_boundary(end) {
         end -= 1;
     }
-    name[..end].to_string()
+    name[..end].trim_end().to_string()
+}
+
+/// Marks, embeddings, overrides and isolates (U+061C, U+200E/F, U+202A-E, U+2066-9).
+fn is_bidi_format(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -375,5 +384,17 @@ mod tests {
         let c = store.add(&long, key(), &[], 1).unwrap();
         assert!(c.name.len() <= MAX_NAME_BYTES);
         assert!(c.name.chars().all(|ch| ch == '\u{00e9}'));
+    }
+
+    #[test]
+    fn pairing_name_clip_drops_control_and_bidi_characters() {
+        assert_eq!(clip("  Pi\u{0}x\u{1b}el\n"), "Pixel");
+        assert_eq!(clip("a\u{202E}b\u{2066}c\u{200F}d"), "abcd");
+        assert_eq!(clip("\u{202E}\u{0007}"), "");
+        let long = clip(&"x".repeat(4 << 20));
+        assert_eq!(long.len(), MAX_NAME_BYTES);
+        // A multi-byte name is cut on a char boundary and never ends in a space.
+        let cut = clip(&format!("{}\u{00e9}", "y".repeat(MAX_NAME_BYTES - 1)));
+        assert_eq!(cut, "y".repeat(MAX_NAME_BYTES - 1));
     }
 }

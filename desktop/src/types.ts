@@ -139,3 +139,39 @@ export type TaskDiff = {
 };
 
 export const DIFF_CAP_KIB = 1024;
+
+// ---- the phone link ----
+
+export const SCOPES = ["read", "answer", "control", "land"] as const;
+export type Scope = (typeof SCOPES)[number];
+
+export const LINK_OSES = ["windows", "macos", "linux"] as const;
+export type LinkOs = (typeof LINK_OSES)[number];
+
+export const INTERFACE_KINDS = ["loopback", "lan", "tailscale", "other"] as const;
+export type InterfaceKind = (typeof INTERFACE_KINDS)[number];
+
+// The link's settings and whether it is running. Carries no path and no key.
+export type LinkStatus = {
+  available: boolean; // false when the app has no data folder to keep the link's files in
+  os: LinkOs;
+  enabled: boolean;
+  running: boolean;
+  addrs: string[]; // ip:port, as bound
+  port: number;
+  binds: string[]; // saved addresses, bare IPs
+  missing: string[]; // saved addresses skipped because they are not on this computer now
+  error: string | null;
+  config_readonly: string | null; // why the settings cannot be changed, if they cannot
+  firewall_notice_seen: boolean;
+};
+
+export type LinkInterface = { ip: string; kind: InterfaceKind; name: string };
+
+// What the pairing dialog shows. The secret is in the QR image and in no field here.
+export type PairingView = { qr_svg: string; host_name: string; addrs: string[]; expires_at: number };
+
+// A phone waiting for the person at this computer to accept or refuse it.
+export type PendingPairing = { id: string; client_name: string; fingerprint: string; expires_at: number };
+
+export type Device = { id: string; name: string; fingerprint: string; scopes: Scope[]; paired_at: number };
