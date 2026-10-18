@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useModalFocus } from "../focus";
 import { linkConfirmPairing, linkRejectPairing } from "../ipc";
 import {
   DEFAULT_SCOPES,
@@ -68,8 +69,8 @@ export function PairingRequest({ request, waiting, onDone, onError }: Props) {
   // sees a stale state.
   const escape = useRef<() => void>(() => undefined);
   escape.current = () => void reject();
+  useModalFocus(dialog);
   useEffect(() => {
-    dialog.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") escape.current();
     };

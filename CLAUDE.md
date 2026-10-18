@@ -38,7 +38,7 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (253 core + 30 link + 4 wire fixtures + 41 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (253 core + 30 link + 4 wire fixtures + 44 shell)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 # Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
 
@@ -122,7 +122,8 @@ and allowed to drift.
   persists: an enabled link starts when the app starts), one `port` (default 47800, 1024-65535,
   never 0) and `binds` (IPv4 addresses chosen from this computer's adapters, never `0.0.0.0`
   or `::`). A saved address that is gone is skipped at start and kept in the file. A schema
-  this build does not know, or a file that does not parse, turns the link off and is left alone.
+  this build does not know, or a file that does not parse, turns the link off and is left alone. A saved port outside 1024-65535 keeps the link off with an
+  error and is fixed by saving a valid port.
   A first non-loopback enable is refused until the firewall notice was shown. Start, stop and
   reconfigure run off the main thread; the app waits at most 2 seconds for the link on exit.
 - **The CSP is pinned by a test** (`csp_pinned` in `src-tauri/src/lib.rs` reads

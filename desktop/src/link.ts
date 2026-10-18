@@ -167,13 +167,15 @@ export type LinkUi = {
   status: LinkStatus | null;
   requests: PendingPairing[]; // oldest first
   pairing: boolean; // the QR dialog is open
+  statusSeen: boolean; // a status event or a save result arrived, so the startup snapshot is stale
 };
 
-export const initialLinkUi: LinkUi = { view: "work", status: null, requests: [], pairing: false };
+export const initialLinkUi: LinkUi = { view: "work", status: null, requests: [], pairing: false, statusSeen: false };
 
 export type LinkAction =
   | { type: "show"; view: LinkView }
   | { type: "status"; status: LinkStatus }
+  | { type: "snapshot"; status: LinkStatus }
   | { type: "request"; request: PendingPairing }
   | { type: "requests-loaded"; requests: PendingPairing[] }
   | { type: "answered"; id: string }
@@ -189,15 +191,21 @@ function addRequests(current: PendingPairing[], more: PendingPairing[]): Pending
   return next.slice(-MAX_REQUESTS);
 }
 
+function applyStatus(state: LinkUi, status: LinkStatus): LinkUi {
+  // A link that stopped has no request left to answer.
+  const requests = status.running ? state.requests : [];
+  return { ...state, status, requests, pairing: status.running ? state.pairing : false };
+}
+
 export function linkReducer(state: LinkUi, action: LinkAction): LinkUi {
   switch (action.type) {
     case "show":
       return { ...state, view: action.view, pairing: action.view === "devices" ? state.pairing : false };
-    case "status": {
-      // A link that stopped has no request left to answer.
-      const requests = action.status.running ? state.requests : [];
-      return { ...state, status: action.status, requests, pairing: action.status.running ? state.pairing : false };
-    }
+    case "status":
+      return { ...applyStatus(state, action.status), statusSeen: true };
+    case "snapshot":
+      // The startup read loses to any event that already arrived: events are never older.
+      return state.statusSeen ? state : applyStatus(state, action.status);
     case "request":
       // The pairing window is single-use and a request consumed it: the QR is done.
       return { ...state, requests: addRequests(state.requests, [action.request]), pairing: false };
