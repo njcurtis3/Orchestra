@@ -12,6 +12,7 @@ pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,7 @@ use serde_json::Value;
 use crate::git;
 use crate::notify::{self, Notice};
 use crate::projects::{Project, Projects};
+use crate::wire::args::Answer;
 use process::{Output, Proc, SpawnArgs};
 use settings::{Model, PermissionMode, SessionSettings};
 use state::{Commit, Decision, InboxItem, SessionState, SessionStatus};
@@ -64,6 +66,89 @@ pub enum Event {
 }
 
 pub type Emit = Box<dyn Fn(Event) + Send + Sync>;
+
+/// An event with the process-wide sequence number it was published under.
+pub type Sequenced = Arc<(u64, Event)>;
+
+/// Why an answer did not apply. `AlreadyAnswered` is an item that is no longer pending;
+/// every other refusal is `Failed` with the core's message, which carries no path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerError {
+    AlreadyAnswered,
+    Failed(String),
+}
+
+impl AnswerError {
+    pub fn message(&self) -> &str {
+        match self {
+            AnswerError::AlreadyAnswered => "unknown or resolved item",
+            AnswerError::Failed(m) => m,
+        }
+    }
+}
+
+impl From<AnswerError> for String {
+    fn from(e: AnswerError) -> String {
+        e.message().to_string()
+    }
+}
+
+/// The connect-time state, read in one step with the sequence number it is current to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotView {
+    /// Every event with a larger `seq` happened after this state was read.
+    pub seq: u64,
+    pub projects: Vec<Project>,
+    pub sessions: Vec<SessionSummary>,
+    pub inbox: Vec<InboxItem>,
+    pub tasks: Vec<TaskSummary>,
+}
+
+/// The subscriber list and the sequence counter. Only ever locked under `emit_order` (or by
+/// a `Subscription` dropping), and nothing is called while it is held, so it is a leaf lock.
+#[derive(Default)]
+struct Hub {
+    state: Mutex<HubState>,
+}
+
+#[derive(Default)]
+struct HubState {
+    /// The `seq` of the last event published; 0 before the first.
+    seq: u64,
+    next_id: u64,
+    subs: Vec<(u64, SyncSender<Sequenced>)>,
+}
+
+impl Hub {
+    fn lock(&self) -> MutexGuard<'_, HubState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A live feed of events. Dropping it unsubscribes. A feed that falls `capacity` events
+/// behind is cut off: its queue drains and then reports `Disconnected`.
+pub struct Subscription {
+    rx: Receiver<Sequenced>,
+    id: u64,
+    hub: Arc<Hub>,
+}
+
+impl Subscription {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Sequenced, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
+    pub fn try_recv(&self) -> Result<Sequenced, TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.hub.lock().subs.retain(|(i, _)| *i != id);
+    }
+}
 pub type Sink = Box<dyn Fn(Output) + Send>;
 /// Called with the project name and a notice after a change worth telling the user about.
 /// Runs on the reader thread with no lock held, and must not call back into `Sessions`.
@@ -382,6 +467,8 @@ pub struct Sessions {
     /// `Sessions`.
     emit_order: Mutex<()>,
     emit: Emit,
+    /// Fan-out to link subscribers, fed from `deliver` under `emit_order`.
+    hub: Arc<Hub>,
     spawner: Spawner,
     notify: Notify,
     /// `None` when saving is off: tests, or a state file this build must not touch.
@@ -406,6 +493,7 @@ impl Sessions {
             inner: Mutex::new(Inner::default()),
             emit_order: Mutex::new(()),
             emit,
+            hub: Arc::new(Hub::default()),
             spawner,
             notify,
             writer,
@@ -551,7 +639,7 @@ impl Sessions {
         drop(inner);
         self.queue_save(snapshot);
         for e in events {
-            (self.emit)(e);
+            self.deliver(e);
         }
         drop(order);
     }
@@ -571,6 +659,48 @@ impl Sessions {
         }
         inner.revision += 1;
         Some(inner.snapshot())
+    }
+
+    /// Number the event, hand it to every subscriber, then to the shell's closure. Called
+    /// with `emit_order` held, so seq order is emit order. Never blocks: a subscriber whose
+    /// queue is full is dropped here, and its receiver disconnects.
+    fn deliver(&self, event: Event) {
+        {
+            let mut hub = self.hub.lock();
+            hub.seq += 1;
+            if !hub.subs.is_empty() {
+                let item: Sequenced = Arc::new((hub.seq, event.clone()));
+                hub.subs.retain(|(_, tx)| tx.try_send(Arc::clone(&item)).is_ok());
+            }
+        }
+        (self.emit)(event);
+    }
+
+    /// The current state and a feed of everything after it, with no gap and no overlap:
+    /// the state is read under `inner`, and the feed is registered under `emit_order` before
+    /// `inner` is released, so every event the state does not yet show is delivered to it.
+    pub fn subscribe(&self, capacity: usize) -> (SnapshotView, Subscription) {
+        let inner = self.lock();
+        let mut view = SnapshotView {
+            seq: 0,
+            projects: inner.projects.list(),
+            sessions: inner.order.iter().filter_map(|id| inner.sessions.get(id)).map(Session::summary).collect(),
+            inbox: inner.inbox(),
+            tasks: inner.tasks.iter().map(Task::summary).collect(),
+        };
+        let order = self.emit_order.lock().unwrap_or_else(|e| e.into_inner());
+        drop(inner);
+        let (tx, rx) = sync_channel(capacity.max(1));
+        let id = {
+            let mut hub = self.hub.lock();
+            view.seq = hub.seq;
+            hub.next_id += 1;
+            let id = hub.next_id;
+            hub.subs.push((id, tx));
+            id
+        };
+        drop(order);
+        (view, Subscription { rx, id, hub: Arc::clone(&self.hub) })
     }
 
     fn queue_save(&self, snapshot: Option<Snapshot>) {
@@ -611,7 +741,7 @@ impl Sessions {
         drop(inner);
         self.queue_save(snapshot);
         if let Some(e) = event {
-            (self.emit)(e);
+            self.deliver(e);
         }
         drop(order);
     }
@@ -1283,11 +1413,7 @@ impl Sessions {
     }
 
     pub fn answer_question(&self, item_id: &str, answers: &BTreeMap<String, String>) -> Result<(), String> {
-        if answers.len() > MAX_ANSWERS
-            || answers.iter().any(|(k, v)| k.len() > MAX_ANSWER_BYTES || v.len() > MAX_ANSWER_BYTES)
-        {
-            return Err("answers too large".into());
-        }
+        check_answers(answers)?;
         self.answer_item(item_id, |state| state.question_line(item_id, answers))
     }
 
@@ -1296,13 +1422,48 @@ impl Sessions {
         item_id: &str,
         build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
     ) -> Result<(), String> {
+        self.answer_item_typed(item_id, build).map_err(String::from)
+    }
+
+    /// `answer_item` with the item-gone case told apart, both when it is gone before the
+    /// lookup and when another answer takes it between the lookup and the write.
+    fn answer_item_typed(
+        &self,
+        item_id: &str,
+        build: impl FnOnce(&SessionState) -> Result<(String, Commit), String>,
+    ) -> Result<(), AnswerError> {
         let inner = self.lock();
         if inner.is_expired_item(item_id) {
-            return Err("this request expired when Orchestra closed".into());
+            return Err(AnswerError::Failed("this request expired when Orchestra closed".into()));
         }
-        let sid = inner.session_of_item(item_id).ok_or("unknown or resolved item")?;
+        let sid = inner.session_of_item(item_id).ok_or(AnswerError::AlreadyAnswered)?;
         drop(inner);
-        self.send_through(&sid, build)
+        let gone = std::cell::Cell::new(false);
+        self.send_through(&sid, |state| {
+            if !state.has_pending(item_id) {
+                gone.set(true);
+                return Err("unknown or resolved item".to_string());
+            }
+            build(state)
+        })
+        .map_err(|m| if gone.get() { AnswerError::AlreadyAnswered } else { AnswerError::Failed(m) })
+    }
+
+    /// Apply an answer from any front end: the desktop's IPC and the link share this.
+    pub fn answer(&self, answer: Answer) -> Result<(), AnswerError> {
+        match answer {
+            Answer::Permission { item_id, decision, message } => {
+                if let Some(m) = &message {
+                    check_len(m).map_err(AnswerError::Failed)?;
+                }
+                self.answer_item_typed(&item_id, |state| state.permission_line(&item_id, decision, message.as_deref()))
+            }
+            Answer::Question { item_id, answers } => {
+                check_answers(&answers).map_err(AnswerError::Failed)?;
+                self.answer_item_typed(&item_id, |state| state.question_line(&item_id, &answers))
+            }
+            Answer::Reply { session_id, text } => self.reply(&session_id, &text).map_err(AnswerError::Failed),
+        }
     }
 
     pub fn reply(&self, session_id: &str, text: &str) -> Result<(), String> {
@@ -1528,6 +1689,15 @@ impl Sessions {
 fn check_len(text: &str) -> Result<(), String> {
     if text.len() > MAX_TEXT_BYTES {
         return Err("text too long".into());
+    }
+    Ok(())
+}
+
+fn check_answers(answers: &BTreeMap<String, String>) -> Result<(), String> {
+    if answers.len() > MAX_ANSWERS
+        || answers.iter().any(|(k, v)| k.len() > MAX_ANSWER_BYTES || v.len() > MAX_ANSWER_BYTES)
+    {
+        return Err("answers too large".into());
     }
     Ok(())
 }
@@ -2711,6 +2881,216 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(v["message"]["content"], "hello");
         assert!(!r.events.lock().unwrap().is_empty());
+    }
+
+    fn drain(sub: &Subscription) -> Vec<Sequenced> {
+        let mut out = vec![];
+        while let Ok(e) = sub.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn fanout_reaches_emit_and_every_subscriber() {
+        let (r, p) = rig();
+        let (_, a) = r.sessions.subscribe(64);
+        let (_, b) = r.sessions.subscribe(64);
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        let emitted = r.events.lock().unwrap().len();
+        assert!(emitted >= 3);
+        for sub in [&a, &b] {
+            let got = drain(sub);
+            assert_eq!(got.len(), emitted);
+            for (g, e) in got.iter().zip(r.events.lock().unwrap().iter()) {
+                assert_eq!(std::mem::discriminant(&g.1), std::mem::discriminant(e));
+            }
+        }
+    }
+
+    #[test]
+    fn fanout_seq_strictly_increasing() {
+        let (r, p) = rig();
+        let (view, sub) = r.sessions.subscribe(64);
+        assert_eq!(view.seq, 0);
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        r.feed(DONE);
+        let seqs: Vec<u64> = drain(&sub).iter().map(|e| e.0).collect();
+        assert!(seqs.len() >= 4);
+        assert_eq!(seqs[0], 1);
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+        // The counter is process-wide: a later subscriber starts from where it stands.
+        let (later, _keep) = r.sessions.subscribe(4);
+        assert_eq!(later.seq, *seqs.last().unwrap());
+    }
+
+    #[test]
+    fn fanout_full_queue_drops_subscriber_without_blocking() {
+        let (r, p) = rig();
+        let (_, slow) = r.sessions.subscribe(1);
+        let (_, quick) = r.sessions.subscribe(64);
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        // The publisher returned, so it did not wait on the slow queue. The slow feed holds
+        // what fitted, then reports a disconnect; the other feed saw everything.
+        assert_eq!(drain(&slow).len(), 1);
+        assert!(matches!(slow.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_eq!(drain(&quick).len(), r.events.lock().unwrap().len());
+        assert!(matches!(quick.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn fanout_dropping_a_subscription_unsubscribes_it() {
+        let (r, p) = rig();
+        let (_, sub) = r.sessions.subscribe(8);
+        assert_eq!(r.sessions.hub.lock().subs.len(), 1);
+        drop(sub);
+        assert!(r.sessions.hub.lock().subs.is_empty());
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        assert!(!r.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn subscribe_snapshot_has_current_state_and_seq() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT);
+        r.feed(PERM);
+        let (view, sub) = r.sessions.subscribe(8);
+        assert_eq!(view.projects, r.sessions.list_projects());
+        assert_eq!(view.sessions, r.sessions.list_sessions());
+        assert_eq!(view.inbox, r.sessions.list_inbox());
+        assert_eq!(view.sessions[0].id, s.id);
+        assert_eq!(view.seq, r.events.lock().unwrap().len() as u64);
+        assert!(drain(&sub).is_empty());
+    }
+
+    /// Fold the events after a snapshot into its state, the way a client does.
+    fn fold(
+        view: &SnapshotView,
+        events: &[Sequenced],
+    ) -> (BTreeMap<String, SessionSummary>, BTreeMap<String, InboxItem>) {
+        let mut sessions: BTreeMap<_, _> = view.sessions.iter().map(|s| (s.id.clone(), s.clone())).collect();
+        let mut inbox: BTreeMap<_, _> = view.inbox.iter().map(|i| (i.id.clone(), i.clone())).collect();
+        for e in events {
+            assert!(e.0 > view.seq, "an event at or before the snapshot was delivered");
+            match &e.1 {
+                Event::SessionUpdated(s) => {
+                    sessions.insert(s.id.clone(), s.clone());
+                }
+                // One session's whole inbox: replace what the snapshot held for it.
+                Event::InboxUpdated(items) => {
+                    if let Some(first) = items.first() {
+                        inbox.retain(|_, i| i.session_id != first.session_id);
+                    }
+                    inbox.extend(items.iter().map(|i| (i.id.clone(), i.clone())));
+                }
+                Event::TranscriptAppended(_) | Event::TaskUpdated(_) => {}
+            }
+        }
+        (sessions, inbox)
+    }
+
+    #[test]
+    fn subscribe_snapshot_then_events_converge() {
+        const N: usize = 4;
+        let sinks: Arc<Mutex<Vec<Arc<Mutex<Sink>>>>> = Arc::new(Mutex::new(Vec::new()));
+        let fake = Arc::new(Fake {
+            lines: Mutex::new(vec![]),
+            killed: AtomicBool::new(false),
+            fail: AtomicBool::new(false),
+            on_write: Mutex::new(None),
+            on_wait: Mutex::new(None),
+        });
+        let (s2, f2) = (sinks.clone(), fake.clone());
+        let sessions = Sessions::with_writer(
+            Box::new(|_| {}),
+            Box::new(move |_, _, sk| {
+                s2.lock().unwrap().push(Arc::new(Mutex::new(sk)));
+                Ok(f2.clone() as Arc<dyn Proc>)
+            }),
+            Box::new(|_, _| {}),
+            None,
+            TranscriptStore::memory(),
+            scratch("converge"),
+        );
+        let p = sessions.add_project(&std::env::temp_dir()).unwrap();
+        let ids: Vec<String> =
+            (0..N).map(|_| sessions.start(&p.id, "go", SessionSettings::default()).unwrap().id).collect();
+        let sinks: Vec<_> = sinks.lock().unwrap().clone();
+        let done = Arc::new(AtomicBool::new(false));
+
+        let watcher = {
+            let (sessions, done) = (sessions.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut taken = vec![];
+                while !done.load(Ordering::SeqCst) {
+                    taken.push(sessions.subscribe(4096));
+                    std::thread::yield_now();
+                }
+                taken.push(sessions.subscribe(4096));
+                taken
+            })
+        };
+        let publishers: Vec<_> = (0..N)
+            .map(|i| {
+                let (sessions, sink, id) = (sessions.clone(), sinks[i].clone(), ids[i].clone());
+                std::thread::spawn(move || {
+                    let feed = |l: &str| (sink.lock().unwrap())(Output::Line(l.to_string()));
+                    for round in 0..5 {
+                        feed(INIT);
+                        feed(PERM);
+                        let item = sessions
+                            .list_inbox()
+                            .into_iter()
+                            .find(|x| x.session_id == id && !x.resolved && x.kind == state::InboxKind::Permission)
+                            .unwrap_or_else(|| panic!("round {round}: no open item"));
+                        let answer = Answer::Permission { item_id: item.id, decision: Decision::Allow, message: None };
+                        sessions.answer(answer).unwrap();
+                        feed(DONE);
+                        sessions.reply(&id, "again").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in publishers {
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        let taken = watcher.join().unwrap();
+        assert!(taken.len() >= 2);
+
+        let final_sessions: BTreeMap<_, _> = sessions.list_sessions().into_iter().map(|s| (s.id.clone(), s)).collect();
+        let final_inbox: BTreeMap<_, _> = sessions.list_inbox().into_iter().map(|i| (i.id.clone(), i)).collect();
+        for (view, sub) in &taken {
+            let (s, i) = fold(view, &drain(sub));
+            assert_eq!(s, final_sessions);
+            assert_eq!(i, final_inbox);
+        }
+    }
+
+    #[test]
+    fn answer_maps_a_gone_item_to_already_answered_and_the_rest_to_failed() {
+        let (r, p) = rig();
+        r.sessions.start(&p.id, "go", SessionSettings::default()).unwrap();
+        r.feed(INIT);
+        let gone = Answer::Permission { item_id: "zzz".into(), decision: Decision::Allow, message: None };
+        assert_eq!(r.sessions.answer(gone), Err(AnswerError::AlreadyAnswered));
+        r.feed(PERM);
+        let item = r.sessions.list_inbox().into_iter().find(|i| !i.resolved).unwrap();
+        let mk = || Answer::Permission { item_id: item.id.clone(), decision: Decision::Allow, message: None };
+        assert_eq!(r.sessions.answer(mk()), Ok(()));
+        assert_eq!(r.sessions.answer(mk()), Err(AnswerError::AlreadyAnswered));
+        let unknown = Answer::Reply { session_id: "nope".into(), text: "hi".into() };
+        assert!(matches!(r.sessions.answer(unknown), Err(AnswerError::Failed(_))));
+        let long = "m".repeat(MAX_TEXT_BYTES + 1);
+        let huge = Answer::Permission { item_id: "x".into(), decision: Decision::Deny, message: Some(long) };
+        assert!(matches!(r.sessions.answer(huge), Err(AnswerError::Failed(_))));
     }
 
     #[test]

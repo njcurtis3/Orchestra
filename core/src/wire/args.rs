@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::settings::{Model, PermissionMode};
+use crate::session::settings::{Model, PermissionMode, SessionSettings};
 use crate::session::state::Decision;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +30,18 @@ pub struct CreateTaskArgs {
     pub model: Option<Model>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+}
+
+impl StartArgs {
+    pub fn settings(&self) -> SessionSettings {
+        SessionSettings { model: self.model, permission_mode: self.permission_mode }
+    }
+}
+
+impl CreateTaskArgs {
+    pub fn settings(&self) -> SessionSettings {
+        SessionSettings { model: self.model, permission_mode: self.permission_mode }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
