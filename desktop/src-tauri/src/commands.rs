@@ -12,7 +12,6 @@ use tauri_plugin_dialog::DialogExt;
 use crate::projects::Project;
 use crate::session::{SessionSummary, TaskDiff};
 use crate::session::Sessions;
-use crate::session::settings::SessionSettings;
 use crate::session::state::InboxItem;
 use crate::session::task::TaskSummary;
 use crate::session::store::StorageStatus;
@@ -42,10 +41,7 @@ pub fn list_projects(sessions: State<'_, AppSessions>) -> Vec<Project> {
 #[tauri::command]
 pub async fn start_session(args: StartArgs, sessions: State<'_, AppSessions>) -> Result<SessionSummary, String> {
     let sessions = Arc::clone(sessions.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        let settings = SessionSettings { model: args.model, permission_mode: args.permission_mode };
-        sessions.start(&args.project_id, &args.prompt, settings)
-    })
+    tauri::async_runtime::spawn_blocking(move || sessions.start(&args.project_id, &args.prompt, args.settings()))
         .await
         .map_err(|_| "session task failed".to_string())?
 }
@@ -64,19 +60,9 @@ pub fn list_inbox(sessions: State<'_, AppSessions>) -> Vec<InboxItem> {
 #[tauri::command]
 pub async fn answer(args: Answer, sessions: State<'_, AppSessions>) -> Result<(), String> {
     let sessions = Arc::clone(sessions.inner());
-    tauri::async_runtime::spawn_blocking(move || dispatch_answer(&sessions, args))
+    tauri::async_runtime::spawn_blocking(move || sessions.answer(args).map_err(String::from))
         .await
         .map_err(|_| "answer task failed".to_string())?
-}
-
-fn dispatch_answer(sessions: &Sessions, args: Answer) -> Result<(), String> {
-    match args {
-        Answer::Permission { item_id, decision, message } => {
-            sessions.answer_permission(&item_id, decision, message.as_deref())
-        }
-        Answer::Question { item_id, answers } => sessions.answer_question(&item_id, &answers),
-        Answer::Reply { session_id, text } => sessions.reply(&session_id, &text),
-    }
 }
 
 /// Async because it reads the session's file.
@@ -98,11 +84,8 @@ pub fn storage_status(status: State<'_, StorageStatus>) -> StorageStatus {
 #[tauri::command]
 pub async fn create_task(args: CreateTaskArgs, sessions: State<'_, AppSessions>) -> Result<TaskSummary, String> {
     let sessions = Arc::clone(sessions.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        let settings = SessionSettings { model: args.model, permission_mode: args.permission_mode };
-        sessions.create_task(&args.project_id, &args.prompt, settings)
-    })
-    .await
+    tauri::async_runtime::spawn_blocking(move || sessions.create_task(&args.project_id, &args.prompt, args.settings()))
+        .await
     .map_err(|_| "task creation failed".to_string())?
 }
 

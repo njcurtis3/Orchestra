@@ -60,7 +60,7 @@ then B.
 
 **Decided: A, with confirmation on the host.** The host (desktop window, or the `orchestrad`
 terminal for H2) shows a QR code carrying `{v, host_id, host name, addresses + port, host
-static public key, 128-bit one-time secret, expiry}`. The handshake is Noise `IKpsk2` with
+static public key, one-time secret (256-bit as built; see "What P3 decided"), expiry}`. The handshake is Noise `IKpsk2` with
 the secret as the psk; the client sends its own static key inside it. The host then shows the
 client name and key fingerprint, and the user **confirms on the host** before the client is
 stored.
@@ -230,9 +230,12 @@ shared fixtures. Where the sections above left a gap:
 
 - **Size.** `MAX_MESSAGE_BYTES` = 4194304 (4 MiB) for one decoded JSON message, checked
   first, before parsing. One snapshot carries every inbox item, and an item can hold several
-  32 KiB text fields. Splitting a message across Noise frames (65535 bytes each) is P3's.
+  32 KiB text fields. Splitting a message across Noise frames (65535 bytes each) was left
+  to P3, and is done there (see "What P3 decided").
 - **Field types.** `v` is the integer 1. `call.id` is a non-empty string of at most 128
-  bytes. `seq` is a non-negative integer; the codec does not check its order (P3). Every
+  bytes. `seq` is a non-negative integer; the codec does not check its order (the host
+  assigns it in order in P3; a client checks it). `v` is read as the integer it denotes:
+  `1.0` is `1` (see "What P3 decided"). Every
   string a client sends is at most `MAX_TEXT_BYTES`. `result` has exactly one of `ok`
   (any JSON, `null` for unit commands) and `error{code, message}`. The handshake frames are
   `{proto: "orchestra", v}` and `{proto, v, supported: [1]}`, with no `type`. The 15 methods
@@ -252,4 +255,109 @@ shared fixtures. Where the sections above left a gap:
   `host` are declared optional on the payloads; the core does not emit them today.
 - **No `ack`.** `result{id}` acknowledges a call.
 
-Still for P3: the choice between the two JS crypto options and the scope UI.
+Still open after P2: the choice between the two JS crypto options (A1) and the scope UI
+(P3b).
+
+## What P3 decided
+
+The host side of the link, built in `orchestra_core::link` (P3a): listen, pair, authenticate,
+stream a snapshot and events, and run calls. The desktop Devices UI and its OS keyring
+provider are P3b; the phone Noise is A1. Nothing starts listening unless a caller gives
+`LinkConfig::binds` an address, so the link is off by default on every host.
+
+- **Two paths, two handshakes.** The WebSocket path selects the mode. `/pair` runs
+  `Noise_IKpsk2_25519_ChaChaPoly_SHA256` and upgrades only while a pairing window is open;
+  `/link` runs `Noise_KK_25519_ChaChaPoly_SHA256`. Any other path, and `/pair` with no open
+  window, gets a plain HTTP 404, so a closed window looks like a path that does not exist.
+  The `{proto, v}` frames are unchanged (no mode field, no codec or fixture change).
+- **Version exchange.** The client sends the plaintext `{"proto":"orchestra","v":1}` as one
+  WebSocket **text** message; the host answers with its reply frame as one text message
+  (`{proto, v, supported: [1]}`, or `error{code: unsupported_version, supported}` and then
+  closes). Each Noise handshake message is one WebSocket **binary** message.
+- **Prologue, exactly.** The bytes `orchestra-link v1` (ASCII, 17 bytes), then three parts in
+  this order, each as a 4-byte big-endian length and its bytes: the path (`/pair` or
+  `/link`), the client request frame, the host reply frame. The two frames are the exact
+  text strings as sent and received, never re-serialised. The path and both frames are
+  therefore bound into the handshake: swapping the path, or rewriting a frame to downgrade
+  the version, fails it.
+- **Framing.** After the handshake one application message is one WebSocket binary message
+  holding a sequence of `[u16 big-endian length][Noise ciphertext]`. Each ciphertext is at
+  most 65535 bytes, so each plaintext chunk is at most 65519 (65519 bytes is one chunk, 65520
+  is two). A message of 0 bytes is one empty chunk. The receiver joins the chunks and refuses
+  when the plaintext would pass `MAX_MESSAGE_BYTES`; the WebSocket layer cap is the matching
+  ciphertext bound (65537 bytes per chunk), so memory is capped before anything is decrypted.
+  A message that does not decrypt, is not UTF-8, or is too large closes the connection.
+- **Pairing secret and offer.** The secret is 32 random bytes from the OS generator, used
+  directly as the IKpsk2 psk: **256 bits**, which amends the 128 bits written under Pairing
+  (a strengthening, and no KDF to mirror in JS). The offer a QR carries is JSON
+  `{v: 1, host_id, host_name, addrs: ["ip:port"], host_key, secret, expires_at}`: `host_key`
+  and `secret` are lowercase hex, `expires_at` is milliseconds since the Unix epoch.
+  `host_id` is the hex of the first 16 bytes of SHA-256 of the host static public key.
+  The window lasts 5 minutes and is single use: it closes when the client first transport
+  message (its `hello`) decrypts, which is what proves the psk.
+- **Confirmation on the host.** After the hello the core holds the connection and tells the
+  host (`on_pairing_request`) the client name and fingerprint: the first 8 bytes of SHA-256
+  of the client static key as lowercase hex in groups of four joined by `-`
+  (`1a2b-3c4d-5e6f-7a8b`). `confirm_pairing` stores the client (default scopes `read` and
+  `answer`, or the ones the host picks) and only then sends `welcome` and the snapshot.
+  `reject_pairing`, the expiry of the confirm wait, or `stop` closes the socket with no
+  message, the same as an unknown key.
+- **Reconnect lookup.** A host does not know which paired client is calling before it reads
+  Noise `KK` message 1, so it tries each stored client key (at most 32) and keeps the one whose
+  tag verifies. No match closes the socket with no message. Handshakes are limited to 10 a
+  minute per source address, which bounds the cost of the trial.
+- **No message on failure.** A wrong psk, an unknown or revoked key and a rejected pairing
+  all end as a closed socket. (A client with the wrong psk fails earlier still: it cannot open
+  the second handshake message of the host, so it never sends a hello and the host never sees
+  a request.)
+- **Scopes.** The table under Authorisation, enforced in one place: after the call decodes
+  and before it runs. A call outside the client scopes returns `error{code: forbidden}` and
+  the host logs the method name and client id, never the arguments. Scopes are read from the
+  store on every call, so `set_scopes` and `revoke` act on a live connection. An unknown scope
+  string in `clients.json` grants nothing. The snapshot and events go only to a client holding
+  `read`; a client without it gets `welcome` and may still make the calls it holds scopes for.
+- **Idempotency.** The host keeps the last 256 call ids per client, in memory and across
+  reconnects, for every call that is not a `read` call. A resent id returns the first result
+  without running again; a resent id whose first run is still going returns `failed`. Read
+  calls are not cached.
+- **Errors from commands.** A command error is `failed` with the core own message, which has
+  no path in it. The one exception is an `answer` whose inbox item is no longer pending
+  (answered, resolved or unknown), which is `already_answered`. It is decided by the typed
+  error of the core, never by the message text.
+- **Snapshot and events.** `seq` is one process-wide counter starting at 1, assigned to every
+  event as it is published, in publish order. `snapshot.seq` is the `seq` of the last event
+  that snapshot already reflects; the first event after it has `snapshot.seq + 1`. A client
+  applies events with a larger `seq` and checks they are consecutive. Each connection has a
+  bounded queue (1024 events); one that falls behind is closed and the client reconnects for a
+  fresh snapshot, because v1 has no replay. `notice` is not forwarded yet (H2).
+- **Revocation.** `revoke` deletes the client key and its cached call ids. A live connection
+  receives `error{code: revoked}` and is closed, queued calls are dropped, and the next
+  handshake with that key fails with no message.
+- **Limits and timeouts.** 16 connections, 32 paired clients, 8 calls in flight per
+  connection (the ninth is `failed`, "busy"), 120 seconds without a message before the
+  connection is closed (clients ping within 60), 30 seconds for a stuck write, 10 seconds for
+  the version exchange and handshake. A newer connection from the same client replaces the
+  older one.
+- **Where things live.** All in a directory the caller names (`link/` under the app data
+  directory for the desktop, the state directory for `orchestrad`): `host_key` (32 raw bytes,
+  created once, mode `0600` on Unix, the per-user app data ACL on Windows) and `clients.json`
+  (`{schema: 1, clients: [{id, name, public_key, scopes, paired_at}]}`, written atomically; a
+  schema this build does not know, or a file that does not parse, stops the link from starting
+  and the file is left alone). The desktop will keep its host key in the OS keyring (P3b,
+  from the shell crate, never in core); the file is the permanent `orchestrad` provider.
+- **Binding.** Every address is explicit. `0.0.0.0` and `::` are refused before any socket is
+  opened, with no override in v1. An empty list listens on nothing. Binding a loopback
+  address never raises the Windows Firewall prompt; a LAN or Tailscale address can, once, for
+  an executable with no inbound rule, so the desktop will warn before it enables one (P3b).
+- **The CSP bullet is moot.** Rust owns the socket in both roles, so the webview opens no
+  connection and `connect-src` stays `ipc: http://ipc.localhost`.
+- **`v` as a number.** An integral JSON number such as `1.0` is the integer it denotes for
+  `v`, in both copies: JavaScript cannot tell `1.0` from `1` after `JSON.parse`, so the Rust
+  codec existing leniency is the one consistent rule. (The note in the P2 open items that
+  Rust rejects `1.0` was wrong.) One asymmetry remains: Rust `decode_host` reads `seq` as an
+  unsigned integer and rejects `seq: 1.0`, where the TypeScript codec accepts it. It matters
+  only to a Rust client (H3), since a Rust host never emits `1.0`.
+- **Not in P3a.** The desktop Devices view (QR, paired list, revoke, scope grants, the
+  confirm dialog), the persisted enable flag, the keyring provider and the Tauri commands
+  (P3b); the phone Noise and its test vectors (A1); a Rust client (H3); `orchestrad` (H2);
+  replay after a reconnect; TLS, a relay and mDNS.

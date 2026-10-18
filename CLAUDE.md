@@ -15,7 +15,7 @@ Standalone app under the repos/ umbrella. Never import from a sibling app; see .
 
 | Path | What | Stack |
 |---|---|---|
-| `core/` | `orchestra-core`: the host engine (sessions, tasks, projects, notifications); no tauri dependency | Rust 2024 |
+| `core/` | `orchestra-core`: the host engine (sessions, tasks, projects, notifications) and `link/`, the host side of the phone link (off until given an address); no tauri dependency | Rust 2024 |
 | `desktop/` | Tauri shell over `core/` (`desktop/src-tauri`), UI in `desktop/src` | Tauri 2, React, TypeScript, Vite |
 | `mobile/` | Android remote | Expo (React Native, TypeScript), expo-router |
 | `protocol/` | Client <-> host message format, with shared JSON fixtures | TypeScript (source of truth), Rust copy in `core/src/wire` (`orchestra_core::wire`) |
@@ -38,7 +38,7 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (185 core + 4 wire fixtures + 10 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (245 core + 26 link + 4 wire fixtures + 10 shell)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 # Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
 
@@ -94,7 +94,9 @@ and allowed to drift.
   capability.
 - **CSP is set** in `tauri.conf.json` (`app.security.csp`), never `null`, no `unsafe-eval`,
   no `unsafe-inline` for scripts. `connect-src` lists real origins plus `ipc:
-  http://ipc.localhost`. When the desktop<->phone link lands, add its origin explicitly.
+  http://ipc.localhost`. The phone link needs no origin: Rust owns the socket in both roles
+  (the host listener in `core/src/link`, and the desktop as a client in H3), so the webview
+  opens no connection. A new `connect-src` origin needs a reason written here first.
 - **IPC commands validate every argument** in Rust (typed serde structs/enums). No frontend
   string is used as a path or a shell command; paths resolve against a base dir and reject
   `..` and absolute paths. Errors do not leak absolute paths or secrets.

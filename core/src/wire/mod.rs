@@ -1,11 +1,13 @@
 //! Protocol v1, the Rust copy. The TypeScript definitions in `protocol/` are the source of
 //! truth; `tests/wire_fixtures.rs` runs the shared `protocol/fixtures/*.json` through this
-//! module so the two cannot drift. Nothing here opens a socket (P3) or enforces a scope.
+//! module so the two cannot drift. Nothing here opens a socket or enforces a scope: `link`
+//! does both, and calls `dispatch` once a call has passed its scope check.
 //!
 //! Named `wire` because `session::protocol` is the claude stream-json parser.
 
 pub mod args;
 pub mod codec;
+pub mod dispatch;
 pub mod message;
 
 use std::fmt;
@@ -14,6 +16,7 @@ pub use codec::{
     decode_client, decode_handshake_reply, decode_handshake_request, decode_host, encode_client,
     encode_handshake_reply, encode_handshake_request, encode_host,
 };
+pub use dispatch::{dispatch, dispatch_json};
 pub use message::{
     Call, ClientMessage, ErrorBody, ErrorMessage, HandshakeReply, HostEvent, HostMessage,
     Snapshot, Welcome, WireStorageStatus,
