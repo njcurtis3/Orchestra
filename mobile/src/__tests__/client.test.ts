@@ -8,6 +8,10 @@ const flush = async () => {
   for (let i = 0; i < 20; i++) await Promise.resolve();
 };
 
+// Pending handshake timers (up to 310 s on /pair) would keep jest alive, so close them all.
+const open: { close(): void }[] = [];
+afterEach(() => open.splice(0).forEach((c) => c.close()));
+
 function run(v: Vector, mode: 'pair' | 'link', script: Script, over: Partial<ConnectOptions> = {}) {
   const host = fakeHost(v, script);
   const messages: HostMessage[] = [];
@@ -29,6 +33,7 @@ function run(v: Vector, mode: 'pair' | 'link', script: Script, over: Partial<Con
     onClose: (f) => closes.push(f),
     ...over,
   });
+  open.push(conn);
   return { host, conn, messages, phases, closes, sock: () => host.sockets[0] };
 }
 
