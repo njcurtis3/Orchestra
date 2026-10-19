@@ -1,0 +1,501 @@
+import { LinkController, backoffDelay } from '../link/controller';
+import type { Deps } from '../link/controller';
+import type { PairingOffer } from '../link/offer';
+import type { HostRecord } from '../link/store';
+import {
+  eventMsg,
+  fakeHost,
+  loadVector,
+  sessionOf,
+  snapshotMsg,
+  vectorHostId,
+  vectorRandom,
+  welcomeMsg,
+} from './fake-host';
+import type { Script, Vector } from './fake-host';
+
+const ADDR = '192.168.1.20:47800';
+
+function recordOf(v: Vector): HostRecord {
+  return {
+    schema: 1,
+    host_id: vectorHostId(v),
+    host_name: 'Vector desktop',
+    host_key: v.host_static_public_hex,
+    addrs: [ADDR],
+    client_secret_key: v.client_static_secret_hex,
+    client_public_key: v.client_static_public_hex,
+    fingerprint: '0000-0000-0000-0000',
+    paired_at: 1,
+  };
+}
+
+function setup(
+  v: Vector,
+  scripts: Script[],
+  o: { hosts?: HostRecord[]; online?: boolean; pairing?: boolean; jitter?: number } = {},
+) {
+  const host = fakeHost(v, ...scripts);
+  const saved: HostRecord[] = [];
+  const forgotten: string[] = [];
+  const hosts = o.hosts ?? [];
+  let netCb: (online: boolean) => void = () => undefined;
+  let fgCb: () => void = () => undefined;
+  const deps: Deps = {
+    store: {
+      listHosts: async () => hosts,
+      saveHost: async (r) => {
+        saved.push(r);
+      },
+      forgetHost: async (id) => {
+        forgotten.push(id);
+      },
+    },
+    random: vectorRandom(v, o.pairing ?? false),
+    clientName: 'Vector phone',
+    appVersion: '1.0.0',
+    WebSocketImpl: host.WebSocketImpl,
+    isOnline: async () => o.online ?? true,
+    onNetwork: (cb) => {
+      netCb = cb;
+      return () => undefined;
+    },
+    onForeground: (cb) => {
+      fgCb = cb;
+      return () => undefined;
+    },
+    jitter: () => o.jitter ?? 0,
+  };
+  const ctl = new LinkController(deps);
+  return {
+    ctl,
+    host,
+    saved,
+    forgotten,
+    network: (online: boolean) => netCb(online),
+    foreground: () => fgCb(),
+  };
+}
+
+const tick = (ms: number) => jest.advanceTimersByTimeAsync(ms);
+
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+
+describe('keepalive', () => {
+  const v = loadVector('kk');
+
+  it('goes live and keeps the snapshot', async () => {
+    const t = setup(v, [{}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    const s = t.ctl.getState();
+    expect(s.phase).toBe('live');
+    expect(s.host?.host_id).toBe(vectorHostId(v));
+    expect(s.data.sessions.map((x) => x.id)).toEqual(['s1']);
+    expect(s.data.hostName).toBe('Vector desktop');
+    expect(s.error).toBeNull();
+    expect(JSON.stringify(s.host)).not.toContain(v.client_static_secret_hex);
+    t.ctl.dispose();
+  });
+
+  it('pings by 25 s, always before the host 60 s limit', async () => {
+    const t = setup(v, [{}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    const sock = t.host.sockets[0];
+    await tick(24_999);
+    expect(sock.pings).toBe(0);
+    await tick(1);
+    expect(sock.pings).toBe(1);
+    for (let i = 2; i <= 6; i++) {
+      await tick(25_000);
+      expect(sock.pings).toBe(i);
+    }
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.host.sockets.length).toBe(1);
+    t.ctl.dispose();
+  });
+
+  it('reconnects when no pong arrives within 15 s', async () => {
+    const t = setup(v, [{ noPong: true }, {}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    await tick(25_000 + 14_999);
+    expect(t.host.sockets.length).toBe(1);
+    expect(t.ctl.getState().phase).toBe('live');
+    await tick(1);
+    expect(t.host.sockets[0].closed).toBe(true);
+    expect(t.ctl.getState().phase).toBe('waiting');
+    await tick(1_000);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.ctl.getState().phase).toBe('live');
+    t.ctl.dispose();
+  });
+
+  it('counts any host message as proof of life', async () => {
+    const t = setup(v, [{ noPong: true }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    await tick(25_000);
+    t.host.sockets[0].pushHost(eventMsg(2, 'session-updated', sessionOf('s1', 'idle')));
+    await tick(14_000);
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.ctl.getState().data.sessions[0].status).toBe('idle');
+    t.ctl.dispose();
+  });
+});
+
+describe('backoff and rate', () => {
+  const v = loadVector('kk');
+  const dead: Script = { openFail: { error: 'connect failed' } };
+
+  async function attemptTimes(jitter: number, totalMs: number): Promise<number[]> {
+    const t = setup(v, [dead], { hosts: [recordOf(v)], jitter });
+    const times: number[] = [];
+    const t0 = Date.now();
+    await t.ctl.start();
+    let seen = 0;
+    for (let at = 0; at < totalMs; at += 10) {
+      await tick(10);
+      while (seen < t.host.sockets.length) {
+        times.push(Date.now() - t0);
+        seen += 1;
+      }
+    }
+    t.ctl.dispose();
+    return times;
+  }
+
+  it('waits 1, 2, 4, 8, 16, then 30 s, never shrinking', async () => {
+    const times = await attemptTimes(0, 200_000);
+    const gaps = times.slice(1).map((x, i) => x - times[i]);
+    const round = gaps.map((g) => Math.round(g / 100) * 100);
+    expect(round.slice(0, 8)).toEqual([1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+  });
+
+  it('with the most jitter it still never shrinks and never passes 30 s', async () => {
+    const times = await attemptTimes(0.999, 200_000);
+    const gaps = times.slice(1).map((x, i) => x - times[i]);
+    for (let i = 1; i < gaps.length; i++) expect(gaps[i]).toBeGreaterThanOrEqual(gaps[i - 1] - 20);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(30_020);
+    expect(gaps[0]).toBeGreaterThan(1_100);
+  });
+
+  it('backoffDelay is monotone with jitter in [0, 1)', () => {
+    for (const j of [0, 0.5, 0.999]) {
+      const d = [0, 1, 2, 3, 4, 5, 6, 9].map((i) => backoffDelay(i, j));
+      for (let i = 1; i < d.length; i++) expect(d[i]).toBeGreaterThanOrEqual(d[i - 1]);
+      expect(d[d.length - 1]).toBe(30_000);
+    }
+  });
+
+  it('never starts more than 10 attempts in any 60 s, even when triggers pile up', async () => {
+    const t = setup(v, [dead], { hosts: [recordOf(v)] });
+    const times: number[] = [];
+    const t0 = Date.now();
+    await t.ctl.start();
+    let seen = 0;
+    for (let at = 0; at < 130_000; at += 250) {
+      t.foreground();
+      t.network(false);
+      t.network(true);
+      t.ctl.retryNow();
+      await tick(250);
+      while (seen < t.host.sockets.length) {
+        times.push(Date.now() - t0);
+        seen += 1;
+      }
+    }
+    expect(times.length).toBeGreaterThan(10);
+    for (let i = 0; i + 10 < times.length; i++) {
+      expect(times[i + 10] - times[i]).toBeGreaterThanOrEqual(60_000 - 300);
+    }
+    t.ctl.dispose();
+  }, 60_000);
+
+  it('makes no attempt while offline, and one at once when the network returns', async () => {
+    const t = setup(v, [{}], { hosts: [recordOf(v)], online: false });
+    await t.ctl.start();
+    await tick(120_000);
+    expect(t.host.sockets.length).toBe(0);
+    expect(t.ctl.getState().phase).toBe('offline');
+    t.network(true);
+    await tick(0);
+    expect(t.host.sockets.length).toBe(1);
+    expect(t.ctl.getState().phase).toBe('live');
+    t.ctl.dispose();
+  });
+
+  it('closes a live link when the network goes, and stays quiet until it returns', async () => {
+    const t = setup(v, [{}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    t.network(false);
+    await tick(120_000);
+    expect(t.host.sockets.length).toBe(1);
+    expect(t.host.sockets[0].closed).toBe(true);
+    expect(t.ctl.getState().phase).toBe('offline');
+    t.network(true);
+    await tick(0);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.ctl.getState().phase).toBe('live');
+    t.ctl.dispose();
+  });
+
+  it('retries at once on app foreground and on Try now', async () => {
+    const t = setup(v, [dead, dead, {}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(1_100);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.ctl.getState().phase).toBe('waiting');
+    t.foreground();
+    await tick(0);
+    expect(t.host.sockets.length).toBe(3);
+    expect(t.ctl.getState().phase).toBe('live');
+    t.ctl.dispose();
+  });
+});
+
+describe('failure rules', () => {
+  const v = loadVector('kk');
+
+  it('two LinkRefused in a row give NotPaired, with the keys still stored', async () => {
+    const t = setup(v, [{ silentAfter: 'msg1' }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('waiting');
+    expect(t.ctl.getState().error).toEqual({ kind: 'LinkRefused' });
+    await tick(1_000);
+    expect(t.ctl.getState().phase).toBe('not_paired');
+    expect(t.forgotten).toEqual([]);
+    expect(t.ctl.getState().host).not.toBeNull();
+    // It keeps trying, at the slowest backoff.
+    await tick(30_000);
+    expect(t.host.sockets.length).toBe(3);
+    expect(t.ctl.getState().phase).toBe('not_paired');
+    t.ctl.dispose();
+  });
+
+  it('a success between two refusals resets the count', async () => {
+    const t = setup(v, [{ silentAfter: 'msg1' }, {}, { silentAfter: 'msg1' }], {
+      hosts: [recordOf(v)],
+    });
+    await t.ctl.start();
+    await tick(0);
+    await tick(1_000);
+    expect(t.ctl.getState().phase).toBe('live');
+    t.host.sockets[1].closeFromHost();
+    await tick(1_000);
+    expect(t.ctl.getState().phase).toBe('waiting');
+    expect(t.forgotten).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('Revoked calls forgetHost and returns to unpaired', async () => {
+    const revoked = { v: 1, type: 'error', code: 'revoked', message: 'revoked' };
+    const t = setup(v, [{ live: [revoked] }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.forgotten).toEqual([vectorHostId(v)]);
+    const s = t.ctl.getState();
+    expect(s.phase).toBe('unpaired');
+    expect(s.host).toBeNull();
+    expect(s.error).toEqual({ kind: 'Revoked' });
+    await tick(60_000);
+    expect(t.host.sockets.length).toBe(1);
+    t.ctl.dispose();
+  });
+
+  it('an unreachable host keeps its keys and backs off', async () => {
+    const t = setup(v, [{ openFail: { error: 'x' } }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('waiting');
+    expect(t.ctl.getState().error).toEqual({ kind: 'Unreachable' });
+    expect(t.forgotten).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('a version mismatch is shown and retried', async () => {
+    const reply = JSON.stringify({
+      type: 'error',
+      v: 1,
+      code: 'unsupported_version',
+      message: 'no',
+      supported: [2],
+    });
+    const t = setup(v, [{ reply }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().error).toEqual({ kind: 'VersionMismatch', supported: [2] });
+    expect(t.ctl.getState().phase).toBe('waiting');
+    t.ctl.dispose();
+  });
+
+  it('a seq gap reconnects at once, once; a repeat backs off', async () => {
+    const gap = [welcomeMsg(v), snapshotMsg(1), eventMsg(3, 'session-updated', sessionOf('s2'))];
+    const t = setup(v, [{ live: gap }], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    await tick(10);
+    expect(t.host.sockets.length).toBe(2);
+    await tick(10);
+    expect(t.host.sockets.length).toBe(2);
+    await tick(1_100);
+    expect(t.host.sockets.length).toBe(3);
+    t.ctl.dispose();
+  });
+
+  it('a TEXT frame after the handshake reconnects and does not delete keys', async () => {
+    const t = setup(v, [{ textAfterHello: '{}' }, {}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(10);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.forgotten).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('forget deletes the record and returns to unpaired', async () => {
+    const t = setup(v, [{}], { hosts: [recordOf(v)] });
+    await t.ctl.start();
+    await tick(0);
+    await t.ctl.forget();
+    expect(t.forgotten).toEqual([vectorHostId(v)]);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(t.ctl.getState().data.sessions).toEqual([]);
+    expect(t.host.sockets[0].closed).toBe(true);
+    await tick(60_000);
+    expect(t.host.sockets.length).toBe(1);
+    t.ctl.dispose();
+  });
+
+  it('with no stored host it is unpaired and connects to nothing', async () => {
+    const t = setup(v, [{}]);
+    await t.ctl.start();
+    await tick(60_000);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(t.host.sockets.length).toBe(0);
+    t.ctl.dispose();
+  });
+});
+
+describe('pairing', () => {
+  const v = loadVector('ikpsk2');
+  const offer = (): PairingOffer => ({
+    v: 1,
+    host_id: vectorHostId(v),
+    host_name: 'Vector desktop',
+    host_key: v.host_static_public_hex,
+    secret: v.psk_hex!,
+    addrs: [ADDR],
+    expires_at: Date.now() + 300_000,
+  });
+
+  it('saves the host only after welcome', async () => {
+    const t = setup(v, [{ live: [] }], { pairing: true });
+    await t.ctl.start();
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    const waiting = t.ctl.getState();
+    expect(waiting.phase).toBe('pairing');
+    expect(waiting.pairStep).toBe('confirm');
+    expect(waiting.pairFingerprint).toMatch(/^[0-9a-f]{4}(-[0-9a-f]{4}){3}$/);
+    await tick(120_000);
+    expect(t.saved).toEqual([]);
+
+    t.host.sockets[0].pushHost(welcomeMsg(v));
+    t.host.sockets[0].pushHost(snapshotMsg(1));
+    await tick(0);
+    const out = await p;
+    expect(out.ok).toBe(true);
+    expect(t.saved.length).toBe(1);
+    expect(t.saved[0]).toMatchObject({
+      schema: 1,
+      host_id: vectorHostId(v),
+      host_name: 'Vector desktop',
+      host_key: v.host_static_public_hex,
+      addrs: [ADDR],
+      client_secret_key: v.client_static_secret_hex,
+      client_public_key: v.client_static_public_hex,
+    });
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.ctl.getState().host?.host_id).toBe(vectorHostId(v));
+    expect(t.ctl.getState().data.sessions.length).toBe(1);
+    // The pairing connection carries on as the live link; no second connection is made.
+    expect(t.host.sockets.length).toBe(1);
+    t.ctl.dispose();
+  });
+
+  it('never saves when the desktop does not confirm', async () => {
+    const t = setup(v, [{ silentAfter: 'hello' }], { pairing: true });
+    await t.ctl.start();
+    const out = await Promise.all([t.ctl.pair(offer()), tick(0)]).then(([o]) => o);
+    expect(out).toEqual({ ok: false, failure: { kind: 'PairNotConfirmed' } });
+    expect(t.saved).toEqual([]);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(t.ctl.getState().error).toEqual({ kind: 'PairNotConfirmed' });
+    t.ctl.dispose();
+  });
+
+  it('a wrong code gives PairAuthFailed and saves nothing', async () => {
+    const t = setup(v, [{ flipMsg2: true }], { pairing: true });
+    await t.ctl.start();
+    const out = await Promise.all([t.ctl.pair(offer()), tick(0)]).then(([o]) => o);
+    expect(out).toEqual({ ok: false, failure: { kind: 'PairAuthFailed' } });
+    expect(t.saved).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('a closed window gives PairWindowClosed', async () => {
+    const t = setup(v, [{ openFail: { reason: "was '404 Not Found'" } }], { pairing: true });
+    await t.ctl.start();
+    const out = await Promise.all([t.ctl.pair(offer()), tick(0)]).then(([o]) => o);
+    expect(out).toEqual({ ok: false, failure: { kind: 'PairWindowClosed' } });
+    t.ctl.dispose();
+  });
+
+  it('tries the next address when the first is unreachable', async () => {
+    const t = setup(v, [{ openFail: { error: 'x' } }, { live: [] }], { pairing: true });
+    await t.ctl.start();
+    const p = t.ctl.pair({ ...offer(), addrs: ['10.0.0.1:47800', '10.0.0.2:47800'] });
+    await tick(0);
+    expect(t.host.sockets.map((s) => s.url)).toEqual([
+      'ws://10.0.0.1:47800/pair',
+      'ws://10.0.0.2:47800/pair',
+    ]);
+    t.ctl.cancelPair();
+    await tick(0);
+    await p;
+    t.ctl.dispose();
+  });
+
+  it('cancelPair closes the socket and saves nothing', async () => {
+    const t = setup(v, [{ live: [] }], { pairing: true });
+    await t.ctl.start();
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    t.ctl.cancelPair();
+    await tick(0);
+    const out = await p;
+    expect(out.ok).toBe(false);
+    expect(t.host.sockets[0].closed).toBe(true);
+    expect(t.saved).toEqual([]);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(t.ctl.getState().error).toBeNull();
+    t.ctl.dispose();
+  });
+
+  it('a failed save closes the link and reports it', async () => {
+    const t = setup(v, [{}], { pairing: true });
+    (t.ctl as unknown as { deps: Deps }).deps.store.saveHost = async () => {
+      throw new Error('disk full');
+    };
+    await t.ctl.start();
+    const out = await Promise.all([t.ctl.pair(offer()), tick(0)]).then(([o]) => o);
+    expect(out).toEqual({ ok: false, failure: { kind: 'StoreFailed' } });
+    expect(t.host.sockets[0].closed).toBe(true);
+    t.ctl.dispose();
+  });
+});
