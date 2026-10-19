@@ -1,3 +1,4 @@
+import * as ExpoCrypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 
 import {
@@ -9,6 +10,7 @@ import {
   saveHost,
   type HostRecord,
 } from '../link/store';
+import { random } from '../link/random';
 
 jest.mock('expo-secure-store', () => {
   const data = new Map<string, string>();
@@ -40,6 +42,7 @@ const record = (id: string): HostRecord => ({
 
 const ID1 = '1'.repeat(32);
 const ID2 = '2'.repeat(32);
+const ID3 = '3'.repeat(32);
 
 beforeEach(() => {
   data.clear();
@@ -61,10 +64,10 @@ describe('host store', () => {
     expect((await getHost(ID1))!.host_name).toBe('Renamed');
   });
 
-  it('writes the record before the index', async () => {
+  it('writes the index entry before the record', async () => {
     await saveHost(record(ID1));
     const keys = (SecureStore.setItemAsync as jest.Mock).mock.calls.map((c) => c[0]);
-    expect(keys).toEqual([hostKey(ID1), INDEX_KEY]);
+    expect(keys).toEqual([INDEX_KEY, hostKey(ID1)]);
   });
 
   it('forget removes both keys and leaves other hosts', async () => {
@@ -115,5 +118,66 @@ describe('host store', () => {
   it('ignores a record with no index entry', async () => {
     data.set(hostKey(ID1), JSON.stringify(record(ID1)));
     expect(await listHosts()).toEqual([]);
+  });
+
+  it('serializes concurrent saves and forgets so the index keeps every host', async () => {
+    await Promise.all([saveHost(record(ID1)), saveHost(record(ID2)), forgetHost(ID1)]);
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID2]);
+    await Promise.all([saveHost(record(ID1)), forgetHost(ID2), saveHost(record(ID3))]);
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID1, ID3]);
+  });
+
+  it('a crash after the index write leaves an id with no record, which the next save fills', async () => {
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(async (k: string, v: string) => {
+      data.set(k, v);
+    });
+    (SecureStore.setItemAsync as jest.Mock).mockImplementationOnce(async () => {
+      throw new Error('crash');
+    });
+    await expect(saveHost(record(ID1))).rejects.toThrow('crash');
+    expect(data.has(hostKey(ID1))).toBe(false);
+    expect(await listHosts()).toEqual([]);
+    await saveHost(record(ID1));
+    expect((await listHosts()).map((h) => h.host_id)).toEqual([ID1]);
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID1]);
+  });
+
+  it('treats a throwing read as absent, but never writes the index back after a failed read', async () => {
+    await saveHost(record(ID1));
+    (SecureStore.getItemAsync as jest.Mock).mockRejectedValueOnce(new Error('keystore'));
+    expect(await getHost(ID1)).toBeNull();
+    (SecureStore.getItemAsync as jest.Mock).mockRejectedValueOnce(new Error('keystore'));
+    await expect(saveHost(record(ID2))).rejects.toThrow('keystore');
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID1]);
+  });
+});
+
+describe('random', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('draws from getRandomValues and never from Math.random, even in a dev bundle', () => {
+    const g = globalThis as { __DEV__?: boolean; nativeCallSyncHook?: unknown };
+    const dev = g.__DEV__;
+    const hook = g.nativeCallSyncHook;
+    g.__DEV__ = true;
+    delete g.nativeCallSyncHook;
+    const math = jest.spyOn(Math, 'random');
+    const values = jest.spyOn(ExpoCrypto, 'getRandomValues');
+    let bytes: Uint8Array;
+    try {
+      bytes = random(32);
+    } finally {
+      g.__DEV__ = dev;
+      g.nativeCallSyncHook = hook;
+    }
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(bytes.length).toBe(32);
+    expect(values).toHaveBeenCalledTimes(1);
+    expect(math).not.toHaveBeenCalled();
+  });
+
+  it('throws rather than return the wrong shape', () => {
+    jest.spyOn(ExpoCrypto, 'getRandomValues').mockReturnValue(new Uint8Array(3) as never);
+    expect(() => random(32)).toThrow(/secure random/);
   });
 });

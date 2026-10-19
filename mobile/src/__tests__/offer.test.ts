@@ -75,4 +75,14 @@ describe('parseOffer', () => {
   it('rejects a non-numeric expires_at', () => {
     expect(parse({ ...base, expires_at: '1800000000000' }).kind).toBe('bad_code');
   });
+
+  it('clips host_name to 128 bytes on a character boundary and drops control characters', () => {
+    const e = '\u00e9';
+    const r = parse({ ...base, host_name: '\u0007' + e.repeat(100) });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(new TextEncoder().encode(r.offer.host_name).length).toBe(128);
+      expect(r.offer.host_name).toBe(e.repeat(64));
+    }
+  });
 });

@@ -18,7 +18,8 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.telosrg.orchestra"
+      "package": "com.telosrg.orchestra",
+      "blockedPermissions": ["android.permission.RECORD_AUDIO"]
     },
     "web": {
       "output": "static",
@@ -48,8 +49,7 @@
         "expo-build-properties",
         {
           "android": {
-            "usesCleartextTraffic": true,
-            "blockedPermissions": ["android.permission.RECORD_AUDIO"]
+            "usesCleartextTraffic": true
           }
         }
       ]

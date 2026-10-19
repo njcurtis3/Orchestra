@@ -24,6 +24,7 @@ export type OfferResult =
 export const EXPIRY_SLACK_MS = 60_000;
 
 const MAX_ADDRS = 8;
+const MAX_NAME_BYTES = 128;
 const HEX_32 = /^[0-9a-f]{32}$/;
 const HEX_64 = /^[0-9a-f]{64}$/;
 
@@ -35,6 +36,23 @@ function parseAddr(addr: unknown): { text: string; loopback: boolean } | null {
   const port = Number(m[5]);
   if (octets.some((o) => o > 255) || port < 1 || port > 65535) return null;
   return { text: addr, loopback: octets[0] === 127 };
+}
+
+// Same rule as the host: control and bidi-format characters dropped, trimmed, at most
+// MAX_NAME_BYTES of UTF-8 cut on a character boundary.
+function clipName(name: string): string {
+  const cleaned = name
+    .replace(/[\p{Cc}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu, '')
+    .trim();
+  const enc = new TextEncoder();
+  let out = '';
+  let bytes = 0;
+  for (const ch of cleaned) {
+    bytes += enc.encode(ch).length;
+    if (bytes > MAX_NAME_BYTES) break;
+    out += ch;
+  }
+  return out.trimEnd();
 }
 
 export function parseOffer(text: string, now: number): OfferResult {
@@ -81,7 +99,7 @@ export function parseOffer(text: string, now: number): OfferResult {
     offer: {
       v: 1,
       host_id,
-      host_name: typeof host_name === 'string' ? host_name : '',
+      host_name: typeof host_name === 'string' ? clipName(host_name) : '',
       host_key,
       secret,
       addrs: usable,

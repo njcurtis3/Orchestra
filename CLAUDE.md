@@ -160,7 +160,8 @@ and allowed to drift.
   because the link is `ws://` to a LAN or Tailscale IP and Android 9+ blocks that by default.
   The Noise channel carries the security, not the transport; the app opens no other
   connection, so no `http://` or `https://` URL belongs in `src`. The camera plugin declares
-  no microphone (`RECORD_AUDIO` is also in `blockedPermissions`).
+  no microphone, and `RECORD_AUDIO` is also in `expo.android.blockedPermissions` (the
+  merged manifest carries it as `tools:node="remove"`, so no library can add it back).
 - **`src/link/` is the phone link**: pairing offer parsing (`offer.ts`), per-host key storage
   (`store.ts`), Noise and framing, and the one randomness source (`random.ts`, expo-crypto).
   Everything else receives randomness as an argument, so tests pass fixed bytes.
