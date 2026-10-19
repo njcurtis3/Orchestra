@@ -156,6 +156,20 @@ and allowed to drift.
   `Linking.openSettings()`, declarations only in `app.json`.
 - **Secrets** (pairing keys, tokens) only in `expo-secure-store`. Never `AsyncStorage`, never
   `EXPO_PUBLIC_*`.
+- **Cleartext is allowed app-wide** (`expo-build-properties`, `android.usesCleartextTraffic`),
+  because the link is `ws://` to a LAN or Tailscale IP and Android 9+ blocks that by default.
+  The Noise channel carries the security, not the transport; the app opens no other
+  connection, so no `http://` or `https://` URL belongs in `src`. The camera plugin declares
+  no microphone, and `RECORD_AUDIO` is also in `expo.android.blockedPermissions` (the
+  merged manifest carries it as `tools:node="remove"`, so no library can add it back).
+- **`src/link/` is the phone link**: pairing offer parsing (`offer.ts`), per-host key storage
+  (`store.ts`), Noise and framing, and the one randomness source (`random.ts`, expo-crypto).
+  Everything else receives randomness as an argument, so tests pass fixed bytes.
+- **Device testing is an owner check**, not a slice gate: run `npx expo start --go` in Expo
+  Go against a desktop started with `npm run tauri dev` and its link on a LAN address. Expo
+  Go allows cleartext; our own merged manifest is proven by `npx expo prebuild --platform
+  android --no-install --clean` and a grep of `android/app/src/main/AndroidManifest.xml`
+  (delete `android/` afterwards).
 - **Accessibility**: `accessibilityLabel`/`accessibilityRole` on every control; font scaling
   stays on.
 

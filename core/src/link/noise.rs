@@ -212,6 +212,38 @@ impl Transport {
     }
 }
 
+/// A handshake with the ephemeral key fixed, so a transcript is the same every run. Test
+/// only: it exists to write and replay the vectors in `protocol/fixtures/noise`. It also
+/// exposes the handshake hash those vectors record.
+#[cfg(test)]
+impl Handshake {
+    pub(crate) fn with_ephemeral(
+        mode: Mode,
+        local: &SecretKey,
+        remote: Option<&PublicKey>,
+        psk: Option<&Psk>,
+        prologue: &[u8],
+        initiator: bool,
+        ephemeral: &[u8; 32],
+    ) -> Result<Self, NoiseError> {
+        let mut b = Builder::new(params(mode)?).local_private_key(local.expose()).map_err(|_| NoiseError::Init)?;
+        b = b.prologue(prologue).map_err(|_| NoiseError::Init)?;
+        if let Some(r) = remote {
+            b = b.remote_public_key(r.as_bytes()).map_err(|_| NoiseError::Init)?;
+        }
+        if let Some(p) = psk {
+            b = b.psk(2, p.expose()).map_err(|_| NoiseError::Init)?;
+        }
+        b = b.fixed_ephemeral_key_for_testing_only(ephemeral);
+        let state = if initiator { b.build_initiator() } else { b.build_responder() };
+        Ok(Self { state: state.map_err(|_| NoiseError::Init)? })
+    }
+
+    pub(crate) fn handshake_hash(&self) -> Vec<u8> {
+        self.state.get_handshake_hash().to_vec()
+    }
+}
+
 /// Two connected transports from a finished KK handshake. For the tests of this module and
 /// of `frame`.
 #[cfg(test)]

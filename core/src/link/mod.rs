@@ -13,6 +13,9 @@ pub mod noise;
 pub mod pairing;
 pub mod server;
 
+#[cfg(test)]
+mod vectors;
+
 pub use server::{
     BindError, LinkCallbacks, LinkError, LinkHost, LinkLog, PendingPairing, validate_binds,
 };
