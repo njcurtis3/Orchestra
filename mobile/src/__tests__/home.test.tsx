@@ -1,33 +1,159 @@
-import { render, screen } from '@testing-library/react-native';
+import { fireEvent, render, screen } from '@testing-library/react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import HomeScreen from '@/app/index';
+import { copy, extra, fill, splitActions } from '@/constants/copy';
+import type { LinkContextValue } from '@/link/provider';
+
+const mockRouter = { push: jest.fn(), replace: jest.fn(), back: jest.fn() };
+let mockLink: LinkContextValue;
+
+jest.mock('expo-router', () => ({ useRouter: () => mockRouter }));
+jest.mock('@/link/provider', () => ({ useLink: () => mockLink }));
 
 const metrics = {
   frame: { x: 0, y: 0, width: 360, height: 800 },
   insets: { top: 24, left: 0, right: 0, bottom: 16 },
 };
 
-describe('HomeScreen', () => {
-  it('says the phone needs a paired host', async () => {
-    await render(
-      <SafeAreaProvider initialMetrics={metrics}>
-        <HomeScreen />
-      </SafeAreaProvider>,
-    );
-    expect(screen.getByText('Orchestra needs a host')).toBeTruthy();
-    expect(screen.getByText(/does nothing on its own/)).toBeTruthy();
-    expect(screen.getByText(/orchestrad/)).toBeTruthy();
-    expect(screen.getByText(/Pairing arrives in a later version/)).toBeTruthy();
+const session = (id: string, over: Record<string, unknown> = {}) => ({
+  id,
+  project_id: `p-${id}`,
+  project_name: `Project ${id}`,
+  status: 'working',
+  started_at: 1,
+  last_activity_at: 10,
+  last_message: `message ${id}`,
+  claude_session_id: null,
+  ...over,
+});
+
+const host = { host_id: 'a'.repeat(32), host_name: 'Desk', fingerprint: 'f', addrs: ['10.0.0.2:47800'] };
+
+function link(over: Partial<LinkContextValue> = {}): LinkContextValue {
+  return {
+    phase: 'live',
+    host,
+    sessions: [],
+    inboxCount: 0,
+    error: null,
+    scopes: ['read', 'answer'],
+    pairStep: null,
+    pairFingerprint: null,
+    retryAt: null,
+    pair: jest.fn(),
+    cancelPair: jest.fn(),
+    retryNow: jest.fn(),
+    forget: jest.fn().mockResolvedValue(undefined),
+    ...over,
+  } as LinkContextValue;
+}
+
+async function show(over: Partial<LinkContextValue> = {}) {
+  mockLink = link(over);
+  await render(
+    <SafeAreaProvider initialMetrics={metrics}>
+      <HomeScreen />
+    </SafeAreaProvider>,
+  );
+}
+
+const text = (template: string, values: Record<string, string | number> = { host: 'Desk' }) =>
+  fill(splitActions(template).text, values);
+
+jest.setTimeout(30_000);
+
+beforeEach(() => jest.clearAllMocks());
+
+describe('HomeScreen not paired', () => {
+  it('shows the title, body and the Pair button, and the old placeholder is gone', async () => {
+    await show({ phase: 'unpaired', host: null, scopes: [] });
+    expect(screen.getByText(copy.not_paired_title)).toBeTruthy();
+    expect(screen.getByText(copy.not_paired_body)).toBeTruthy();
+    expect(screen.getByText(copy.not_paired_hint)).toBeTruthy();
+    expect(screen.queryByText(/later version/)).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: copy.not_paired_button }));
+    expect(mockRouter.push).toHaveBeenCalledWith('/pair');
   });
 
-  it('shows no session or list content', async () => {
-    await render(
-      <SafeAreaProvider initialMetrics={metrics}>
-        <HomeScreen />
-      </SafeAreaProvider>,
-    );
-    expect(screen.queryByRole('button')).toBeNull();
-    expect(screen.queryByText(/session/i)).toBeNull();
+  it('renders a blank screen while loading', async () => {
+    await show({ phase: 'loading', host: null });
+    expect(screen.queryByText(copy.not_paired_title)).toBeNull();
+  });
+
+  it('shows the removed banner above the not-paired view', async () => {
+    await show({ phase: 'unpaired', host: null, error: { kind: 'Revoked' } });
+    expect(screen.getByText(text(copy.revoked, { host: 'your desktop' }))).toBeTruthy();
+    expect(screen.getByText(copy.not_paired_title)).toBeTruthy();
+  });
+});
+
+describe('HomeScreen connected', () => {
+  it('shows the host, the need-you count and two session rows', async () => {
+    await show({
+      sessions: [
+        session('1', { last_activity_at: 5 }),
+        session('2', { status: 'waiting_permission', last_activity_at: 9 }),
+      ] as never,
+      inboxCount: 2,
+    });
+    expect(screen.getByText('Desk')).toBeTruthy();
+    expect(screen.getByText(extra.need_you(2))).toBeTruthy();
+    expect(screen.getByText('Project 1')).toBeTruthy();
+    expect(screen.getByText('Project 2')).toBeTruthy();
+    expect(screen.getByText('Needs permission')).toBeTruthy();
+    expect(screen.getByText('message 1')).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows the empty state when live with no sessions', async () => {
+    await show();
+    expect(screen.getByText(text(copy.no_sessions))).toBeTruthy();
+  });
+});
+
+describe('HomeScreen banners', () => {
+  it('offline, over the cached list', async () => {
+    await show({ phase: 'offline', sessions: [session('1')] as never });
+    expect(screen.getByText(copy.offline)).toBeTruthy();
+    expect(screen.getByText('Project 1')).toBeTruthy();
+  });
+
+  it('reconnecting, over the cached list', async () => {
+    await show({ phase: 'connecting', sessions: [session('1')] as never });
+    expect(screen.getByText(text(copy.reconnecting))).toBeTruthy();
+    expect(screen.getByText('Project 1')).toBeTruthy();
+  });
+
+  it('unreachable shows the countdown and Try now calls retryNow', async () => {
+    const retryNow = jest.fn();
+    await show({ phase: 'waiting', retryAt: Date.now() + 12_000, retryNow });
+    expect(screen.getByText(/Trying again in (11|12) s\./)).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: 'Try now' }));
+    expect(retryNow).toHaveBeenCalled();
+  });
+
+  it('version mismatch names the supported list and the version this app speaks', async () => {
+    await show({ phase: 'waiting', error: { kind: 'VersionMismatch', supported: [2, 3] } });
+    expect(
+      screen.getByText(text(copy.version_mismatch, { host: 'Desk', supported: '2, 3' })),
+    ).toBeTruthy();
+    expect(screen.getByText(/version 2, 3; this app speaks version 1\./)).toBeTruthy();
+  });
+
+  it('not paired with this host offers Pair again and Forget', async () => {
+    const forget = jest.fn().mockResolvedValue(undefined);
+    await show({ phase: 'not_paired', error: { kind: 'LinkRefused' }, forget });
+    expect(screen.getByText(text(copy.not_paired_with_host))).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: 'Pair again' }));
+    expect(mockRouter.push).toHaveBeenCalledWith('/pair');
+    await fireEvent.press(screen.getByRole('button', { name: 'Forget this desktop' }));
+    expect(forget).toHaveBeenCalled();
+  });
+
+  it('no read scope', async () => {
+    await show({ scopes: ['answer'] });
+    expect(screen.getByText(text(copy.no_read_scope))).toBeTruthy();
+    expect(screen.queryByText(text(copy.no_sessions))).toBeNull();
   });
 });
