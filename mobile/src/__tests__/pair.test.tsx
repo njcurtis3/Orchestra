@@ -16,7 +16,7 @@ const OFFER = JSON.parse(OFFER_TEXT);
 const NOW = 1_799_999_000_000;
 const FINGERPRINT = 'abcd-1234-ef56-7890';
 
-const mockRouter = { push: jest.fn(), replace: jest.fn(), back: jest.fn() };
+const mockRouter = { push: jest.fn(), replace: jest.fn(), dismissTo: jest.fn(), back: jest.fn() };
 let mockLink: LinkContextValue;
 let mockPermission: { granted: boolean; status: string; canAskAgain: boolean } | null;
 const mockRequest = jest.fn();
@@ -177,12 +177,13 @@ describe('PairScreen pairing steps', () => {
     expect(mockRouter.back).toHaveBeenCalled();
   });
 
-  it('paired shows the host and replaces the route with home', async () => {
+  it('paired shows the host and dismisses back to the existing home', async () => {
     const pair = jest.fn().mockResolvedValue({ ok: true, host: { host_name: 'Desk' } });
     await toScanner({ pair: pair as never });
     await scan(OFFER_TEXT);
     expect(screen.getByText(fill(copy.paired, { host: 'Desk' }))).toBeTruthy();
-    expect(mockRouter.replace).toHaveBeenCalledWith('/');
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/');
+    expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
   it.each([

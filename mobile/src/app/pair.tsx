@@ -99,7 +99,7 @@ export default function PairScreen() {
     if (!mounted.current) return;
     if (outcome.ok) {
       setPhase({ kind: 'paired', host: outcome.host.host_name });
-      router.replace('/');
+      router.dismissTo('/');
     } else if (outcome.failure.kind !== 'Closed') {
       setPhase({ kind: 'failed', text: failureText(outcome.failure, offer) });
     }
