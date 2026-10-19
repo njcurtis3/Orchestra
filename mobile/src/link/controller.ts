@@ -22,6 +22,8 @@ const WINDOW_MS = 60_000;
 // A protocol-class drop reconnects at once, but only once a minute; repeats back off.
 const IMMEDIATE_ONCE_MS = 60_000;
 export const LINK_REFUSED_LIMIT = 2;
+// A link must stay live this long before the backoff starts over.
+export const STABLE_LINK_MS = 30_000;
 
 export type ControllerPhase =
   | 'loading'
@@ -108,11 +110,14 @@ export class LinkController {
   private attempting = false;
   private pairing = false;
   private pairCancelled = false;
+  // Set once by dispose; after it nothing schedules, dials or listens again.
+  private disposed = false;
   // Bumped whenever in-flight work must be abandoned.
   private epoch = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setTimeout> | null = null;
   private pongTimer: ReturnType<typeof setTimeout> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
   private backoffIndex = 0;
   private refused = 0;
   private lastImmediateAt = -Infinity;
@@ -144,6 +149,7 @@ export class LinkController {
   // ---- lifecycle ----
 
   async start(): Promise<void> {
+    if (this.disposed) return;
     this.unsubs.push(
       this.deps.onNetwork((online) => this.networkChanged(online)),
       this.deps.onForeground(() => this.foreground()),
@@ -164,6 +170,7 @@ export class LinkController {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.epoch++;
     this.unsubs.forEach((u) => u());
     this.unsubs = [];
@@ -214,7 +221,9 @@ export class LinkController {
       this.conn = null;
       const quiet = failure.kind === 'Closed' || failure.kind === 'StoreFailed';
       this.set({ pairStep: null, pairFingerprint: null, error: quiet ? null : failure });
-      if (this.record) {
+      if (this.disposed) {
+        // nothing runs after dispose
+      } else if (this.record) {
         this.set({ phase: 'waiting' });
         this.attempt();
       } else {
@@ -268,6 +277,12 @@ export class LinkController {
           return finish({ kind: 'StoreFailed' });
         }
         if (epoch !== this.epoch) return finish({ kind: 'Closed' });
+        if (this.pairCancelled) {
+          // The user cancelled before the host was saved: do not keep it (G6).
+          this.conn?.close();
+          void this.deps.store.forgetHost(record.host_id).catch(() => undefined);
+          return finish({ kind: 'Closed' });
+        }
         this.pairing = false;
         this.record = record;
         this.set({ host: summary(record), pairStep: null, pairFingerprint: null });
@@ -284,10 +299,10 @@ export class LinkController {
   // ---- connecting ----
 
   private clearTimers(): void {
-    for (const t of [this.retryTimer, this.pingTimer, this.pongTimer]) {
+    for (const t of [this.retryTimer, this.pingTimer, this.pongTimer, this.stableTimer]) {
       if (t !== null) clearTimeout(t);
     }
-    this.retryTimer = this.pingTimer = this.pongTimer = null;
+    this.retryTimer = this.pingTimer = this.pongTimer = this.stableTimer = null;
   }
 
   // Close the socket and forget every timer; callbacks of the old socket are ignored.
@@ -384,7 +399,7 @@ export class LinkController {
 
   private attempt(): void {
     const record = this.record;
-    if (!record || this.attempting || this.conn || this.pairing) return;
+    if (this.disposed || !record || this.attempting || this.conn || this.pairing) return;
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     if (!this.online) {
@@ -425,9 +440,14 @@ export class LinkController {
 
   private goLive(): void {
     this.refused = 0;
-    this.backoffIndex = 0;
     this.set({ phase: 'live', error: null, retryAt: null });
     this.schedulePing();
+    // Backoff starts over only for a link that stayed up; welcome-then-close keeps backing off.
+    if (this.stableTimer !== null) clearTimeout(this.stableTimer);
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      this.backoffIndex = 0;
+    }, STABLE_LINK_MS);
   }
 
   // A live connection ended.
@@ -438,6 +458,9 @@ export class LinkController {
 
   // An attempt or a live connection ended with this failure (G6, G9).
   private failed(failure: LinkFailure): void {
+    if (this.disposed) return;
+    // Only LinkRefused attempts in a row count towards NotPaired.
+    if (failure.kind !== 'LinkRefused') this.refused = 0;
     this.set({ error: failure });
     switch (failure.kind) {
       case 'Revoked': {
@@ -473,7 +496,7 @@ export class LinkController {
   }
 
   private scheduleRetry(delay: number): void {
-    if (!this.record) return;
+    if (this.disposed || !this.record) return;
     if (this.retryTimer !== null) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     if (!this.online) {
@@ -523,6 +546,7 @@ export class LinkController {
   private networkChanged(online: boolean): void {
     if (online === this.online) return;
     this.online = online;
+    this.refused = 0;
     if (!this.record || this.pairing) return;
     if (!online) {
       this.epoch++;

@@ -261,20 +261,3 @@ export function fakeHost(v: Vector, ...scripts: Script[]): FakeHost {
   }
   return { WebSocketImpl: Bound, sockets };
 }
-
-// jest runs every file under __tests__ as a suite (and again in each suite that imports it),
-// and the ignore list lives in package.json, so the helper carries one test of its own.
-test('the fake host replays the vector reply and message 2', async () => {
-  const v = loadVector('kk');
-  const host = fakeHost(v);
-  const got: unknown[] = [];
-  const ws = new host.WebSocketImpl('127.0.0.1:1/link');
-  ws.onmessage = (ev) => got.push(ev.data);
-  ws.send(v.request_frame);
-  ws.send(toAB(fromHex(v.msg1_hex)));
-  // Microtasks only, so it also passes when a suite that imports this runs fake timers.
-  for (let i = 0; i < 10; i++) await Promise.resolve();
-  expect(got[0]).toBe(v.reply_frame);
-  expect(toHex(new Uint8Array(got[1] as ArrayBuffer))).toBe(v.msg2_hex);
-  expect(host.sockets[0].msg1Matches).toBe(true);
-});

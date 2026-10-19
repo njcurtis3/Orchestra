@@ -487,6 +487,42 @@ describe('pairing', () => {
     t.ctl.dispose();
   });
 
+  it('dispose during pair with a stored host leaves nothing running', async () => {
+    const t = setup(v, [{ live: [] }], { pairing: true, hosts: [recordOf(v)] });
+    await t.ctl.start();
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    expect(t.ctl.getState().pairStep).toBe('confirm');
+    t.ctl.dispose();
+    await p;
+    const before = t.host.sockets.length;
+    await tick(180_000);
+    expect(t.host.sockets.length).toBe(before);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('cancelPair while the host is being saved keeps nothing', async () => {
+    const t = setup(v, [{}], { pairing: true });
+    let release: () => void = () => undefined;
+    (t.ctl as unknown as { deps: Deps }).deps.store.saveHost = (r) =>
+      new Promise<void>((res) => {
+        t.saved.push(r);
+        release = res;
+      });
+    await t.ctl.start();
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    expect(t.saved.length).toBe(1);
+    t.ctl.cancelPair();
+    release();
+    const out = await p;
+    expect(out).toEqual({ ok: false, failure: { kind: 'Closed' } });
+    expect(t.forgotten).toEqual([vectorHostId(v)]);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(t.ctl.getState().host).toBeNull();
+    t.ctl.dispose();
+  });
+
   it('a failed save closes the link and reports it', async () => {
     const t = setup(v, [{}], { pairing: true });
     (t.ctl as unknown as { deps: Deps }).deps.store.saveHost = async () => {

@@ -155,7 +155,8 @@ export function connect(o: ConnectOptions): LinkConnection {
       case 'version':
         return { kind: 'Unreachable' };
       case 'msg1-sent':
-        return o.mode === 'link' ? { kind: 'LinkRefused' } : { kind: 'Unreachable' };
+        // On /pair the host answered, so a close here is a wrong key or a closed window (G6).
+        return o.mode === 'link' ? { kind: 'LinkRefused' } : { kind: 'PairAuthFailed' };
       case 'hello-sent':
         return o.mode === 'pair' ? { kind: 'PairNotConfirmed' } : { kind: 'Closed' };
       default:

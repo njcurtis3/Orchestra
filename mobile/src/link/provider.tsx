@@ -45,7 +45,7 @@ function createController(): LinkController {
   return new LinkController({
     store: { listHosts, saveHost, forgetHost },
     random,
-    clientName: Device.deviceName ?? Device.modelName ?? 'Android phone',
+    clientName: Device.deviceName || Device.modelName || 'Android phone',
     appVersion: Constants.expoConfig?.version ?? '1.0.0',
     isOnline: async () => (await Network.getNetworkStateAsync()).isConnected !== false,
     onNetwork: (cb) => {
