@@ -12,7 +12,7 @@ import {
   vectorRandom,
   welcomeMsg,
 } from './fake-host';
-import type { Script, Vector } from './fake-host';
+import type { Script, Vector, Vectors } from './fake-host';
 
 const ADDR = '192.168.1.20:47800';
 
@@ -33,9 +33,16 @@ function recordOf(v: Vector): HostRecord {
 function setup(
   v: Vector,
   scripts: Script[],
-  o: { hosts?: HostRecord[]; online?: boolean; pairing?: boolean; jitter?: number } = {},
+  o: {
+    hosts?: HostRecord[];
+    online?: boolean;
+    pairing?: boolean;
+    jitter?: number;
+    vectors?: Vectors;
+    random?: Deps['random'];
+  } = {},
 ) {
-  const host = fakeHost(v, ...scripts);
+  const host = fakeHost(o.vectors ?? v, ...scripts);
   const saved: HostRecord[] = [];
   const forgotten: string[] = [];
   const hosts = o.hosts ?? [];
@@ -51,7 +58,7 @@ function setup(
         forgotten.push(id);
       },
     },
-    random: vectorRandom(v, o.pairing ?? false),
+    random: o.random ?? vectorRandom(v, o.pairing ?? false),
     clientName: 'Vector phone',
     appVersion: '1.0.0',
     WebSocketImpl: host.WebSocketImpl,
@@ -487,18 +494,65 @@ describe('pairing', () => {
     t.ctl.dispose();
   });
 
-  it('dispose during pair with a stored host leaves nothing running', async () => {
-    const t = setup(v, [{ live: [] }], { pairing: true, hosts: [recordOf(v)] });
+  // A stored host dials /link (KK) first, then the offer dials /pair (IKpsk2). The draws are
+  // the link ephemeral, then the fresh static and the pair ephemeral.
+  const kk = loadVector('kk');
+  const twoPaths = (hosts: HostRecord[], scripts: Script[]) => {
+    const eph = vectorRandom(v, false);
+    const stat = vectorRandom(v, true);
+    let calls = 0;
+    return setup(v, scripts, {
+      hosts,
+      vectors: { pair: v, link: kk },
+      random: (n) => {
+        calls += 1;
+        return calls === 2 ? stat(n) : eph(n);
+      },
+    });
+  };
+
+  it('a stored host and a pairing offer each get their own vector', async () => {
+    const t = twoPaths([recordOf(kk)], [{}, { live: [] }]);
     await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    const [link, pair] = t.host.sockets;
+    expect(link.url.endsWith('/link')).toBe(true);
+    expect(link.msg1Matches).toBe(true);
+    expect(pair.url.endsWith('/pair')).toBe(true);
+    expect(pair.msg1Matches).toBe(true);
+    t.ctl.cancelPair();
+    await tick(0);
+    await p;
+    t.ctl.dispose();
+  });
+
+  it('dispose during pair with a stored host leaves nothing running', async () => {
+    const t = twoPaths([recordOf(kk)], [{}, { live: [] }]);
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.host.sockets[0].url.endsWith('/link')).toBe(true);
+    expect(t.host.sockets[0].msg1Matches).toBe(true);
     const p = t.ctl.pair(offer());
     await tick(0);
     expect(t.ctl.getState().pairStep).toBe('confirm');
     t.ctl.dispose();
     await p;
     const before = t.host.sockets.length;
+    const pings = () => t.host.sockets.reduce((n, s) => n + s.pings, 0);
+    const pingsBefore = pings();
+    // The setup unsubscribes are no-ops, so these late callbacks still reach attempt().
+    t.ctl.retryNow();
+    t.foreground();
+    t.network(false);
+    t.network(true);
     await tick(180_000);
     expect(t.host.sockets.length).toBe(before);
     expect(jest.getTimerCount()).toBe(0);
+    expect(pings()).toBe(pingsBefore);
   });
 
   it('cancelPair while the host is being saved keeps nothing', async () => {
@@ -523,6 +577,81 @@ describe('pairing', () => {
     t.ctl.dispose();
   });
 
+  // Holds the first saveHost (the new record) until released; later calls (a restore) go
+  // through at once, or throw when `restoreFails`.
+  const holdFirstSave = (t: ReturnType<typeof setup>, restoreFails = false) => {
+    let release: () => void = () => undefined;
+    let calls = 0;
+    (t.ctl as unknown as { deps: Deps }).deps.store.saveHost = (r) => {
+      t.saved.push(r);
+      calls += 1;
+      if (calls === 1) {
+        return new Promise<void>((res) => {
+          release = res;
+        });
+      }
+      return restoreFails ? Promise.reject(new Error('disk full')) : Promise.resolve();
+    };
+    return () => release();
+  };
+
+  it('cancel while re-pairing a stored host restores its previous record', async () => {
+    const previous = recordOf(kk);
+    const t = twoPaths([previous], [{}, {}]);
+    const release = holdFirstSave(t);
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    expect(t.saved.length).toBe(1);
+    expect(t.saved[0]).not.toEqual(previous);
+    t.ctl.cancelPair();
+    release();
+    const out = await p;
+    expect(out).toEqual({ ok: false, failure: { kind: 'Closed' } });
+    expect(t.saved.length).toBe(2);
+    expect(t.saved[t.saved.length - 1]).toEqual(previous);
+    expect(t.forgotten).toEqual([]);
+    expect(t.ctl.getState().host?.host_id).toBe(previous.host_id);
+    t.ctl.dispose();
+  });
+
+  it('cancel while pairing a new host beside a stored one forgets only the new one', async () => {
+    // The stored host appears after start, so only the pairing dials.
+    const stored = { ...recordOf(kk), host_id: 'a'.repeat(32) };
+    const hosts: HostRecord[] = [];
+    const t = setup(v, [{}], { pairing: true, hosts });
+    const release = holdFirstSave(t);
+    await t.ctl.start();
+    hosts.push(stored);
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    expect(t.saved.length).toBe(1);
+    t.ctl.cancelPair();
+    release();
+    await p;
+    expect(t.saved.length).toBe(1);
+    expect(t.forgotten).toEqual([vectorHostId(v)]);
+    t.ctl.dispose();
+  });
+
+  it('a failed restore deletes nothing', async () => {
+    const t = twoPaths([recordOf(kk)], [{}, {}]);
+    const release = holdFirstSave(t, true);
+    await t.ctl.start();
+    await tick(0);
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    t.ctl.cancelPair();
+    release();
+    const out = await p;
+    expect(out).toEqual({ ok: false, failure: { kind: 'Closed' } });
+    expect(t.saved.length).toBe(2);
+    expect(t.forgotten).toEqual([]);
+    t.ctl.dispose();
+  });
+
   it('a failed save closes the link and reports it', async () => {
     const t = setup(v, [{}], { pairing: true });
     (t.ctl as unknown as { deps: Deps }).deps.store.saveHost = async () => {
@@ -532,6 +661,32 @@ describe('pairing', () => {
     const out = await Promise.all([t.ctl.pair(offer()), tick(0)]).then(([o]) => o);
     expect(out).toEqual({ ok: false, failure: { kind: 'StoreFailed' } });
     expect(t.host.sockets[0].closed).toBe(true);
+    t.ctl.dispose();
+  });
+});
+
+describe('which stored host is loaded', () => {
+  const kk = loadVector('kk');
+  const ID_A = 'a'.repeat(32);
+  const ID_B = 'b'.repeat(32);
+  const at = (host_id: string, paired_at: number): HostRecord => ({ ...recordOf(kk), host_id, paired_at });
+
+  it('loads the most recently paired of two stored hosts', async () => {
+    for (const hosts of [
+      [at(ID_A, 5), at(ID_B, 9)],
+      [at(ID_B, 9), at(ID_A, 5)],
+    ]) {
+      const t = setup(kk, [{}], { hosts });
+      await t.ctl.start();
+      expect(t.ctl.getState().host?.host_id).toBe(ID_B);
+      t.ctl.dispose();
+    }
+  });
+
+  it('a tie in paired_at goes to the later index entry', async () => {
+    const t = setup(kk, [{}], { hosts: [at(ID_A, 7), at(ID_B, 7)] });
+    await t.ctl.start();
+    expect(t.ctl.getState().host?.host_id).toBe(ID_B);
     t.ctl.dispose();
   });
 });

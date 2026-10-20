@@ -149,7 +149,7 @@ export function connect(o: ConnectOptions): LinkConnection {
   function closedBy(reason: string): LinkFailure {
     switch (phase) {
       case 'opening':
-        return o.mode === 'pair' && reason.includes('404')
+        return o.mode === 'pair' && /\bwas '404\b/.test(reason)
           ? { kind: 'PairWindowClosed' }
           : { kind: 'Unreachable' };
       case 'version':
@@ -233,6 +233,8 @@ export function connect(o: ConnectOptions): LinkConnection {
     const socket = new Ctor(`ws://${o.addr}${path}`);
     ws = socket;
     socket.binaryType = 'arraybuffer';
+    // openMs must stay below OkHttp's 10 s connectTimeout: a SocketTimeoutException's text carries
+    // the local ephemeral port, which could contain 404 and misread as a closed window in closedBy.
     arm(t.openMs, { kind: 'Unreachable' });
     socket.onopen = () => {
       if (settled || phase !== 'opening') return;
@@ -246,9 +248,9 @@ export function connect(o: ConnectOptions): LinkConnection {
       }
     };
     socket.onerror = (ev) => {
+      // Only recorded. RN reports every failure as an error with no message, then a close
+      // whose reason is the exception text, so the close decides in every phase.
       errorText = typeof ev?.message === 'string' ? ev.message : '';
-      // Before the socket opens the failure is final; the close that follows is ignored.
-      if (phase === 'opening') fail(closedBy(errorText));
     };
     socket.onclose = (ev) => {
       if (settled) return;

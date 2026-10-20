@@ -1,4 +1,4 @@
-// Owns the one paired host (the first of listHosts): connect, keep alive, reconnect, and the
+// Owns the one paired host (the most recently paired of listHosts): connect, keep alive, reconnect, and the
 // pairing flow. No React and no native modules; the app wires those in through Deps.
 // Keys are deleted only on `revoked` or on forget (G6). Nothing here logs.
 import type { HostMessage } from '../../../protocol/types';
@@ -163,7 +163,8 @@ export class LinkController {
       // An unreadable store is treated as no host; nothing is deleted.
     }
     if (epoch !== this.epoch || this.pairing) return;
-    this.record = hosts[0] ?? null;
+    // The most recently paired host; a tie in paired_at goes to the later index entry.
+    this.record = hosts.reduce<HostRecord | null>((best, h) => (best && h.paired_at < best.paired_at ? best : h), null);
     if (!this.record) return this.set({ phase: 'unpaired', host: null });
     this.set({ host: summary(this.record) });
     this.attempt();
@@ -269,6 +270,14 @@ export class LinkController {
           fingerprint: fingerprint(keys.public),
           paired_at: this.now(),
         };
+        // The stored record of the same host, so a cancel after the save can put it back.
+        // undefined: the lookup failed, and a cancel then leaves the new record alone.
+        let previous: HostRecord | null | undefined;
+        try {
+          previous = (await this.deps.store.listHosts()).find((h) => h.host_id === record.host_id) ?? null;
+        } catch {
+          previous = undefined;
+        }
         // The host is saved only now that it has sent welcome.
         try {
           await this.deps.store.saveHost(record);
@@ -278,9 +287,18 @@ export class LinkController {
         }
         if (epoch !== this.epoch) return finish({ kind: 'Closed' });
         if (this.pairCancelled) {
-          // The user cancelled before the host was saved: do not keep it (G6).
+          // The user cancelled before the host was saved: do not keep it (G6). A host that was
+          // already stored goes back to its previous record; a failed restore deletes nothing.
           this.conn?.close();
-          void this.deps.store.forgetHost(record.host_id).catch(() => undefined);
+          if (previous) {
+            try {
+              await this.deps.store.saveHost(previous);
+            } catch {
+              // the new record stays
+            }
+          } else if (previous === null) {
+            void this.deps.store.forgetHost(record.host_id).catch(() => undefined);
+          }
           return finish({ kind: 'Closed' });
         }
         this.pairing = false;

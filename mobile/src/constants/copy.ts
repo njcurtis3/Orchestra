@@ -29,7 +29,7 @@ export const copy = {
   pair_window_closed:
     'That code was already used or has closed. On the desktop, choose Pair a phone and scan the new code.',
   pair_auth_failed:
-    'This code does not match the desktop at that address. Show a new code on the desktop and scan it again.',
+    'This code did not work with the desktop at that address, or the connection dropped. Show a new code on the desktop and scan it again.',
   pair_not_confirmed:
     'Pairing did not finish. The desktop did not accept this phone, or it ran out of time. On the desktop, choose Pair a phone and try again. [Scan again]',
   pair_unreachable:

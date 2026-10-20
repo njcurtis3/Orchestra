@@ -105,6 +105,12 @@ export const eventMsg = (seq: number, name: string, payload: unknown) => ({
 export type Script = {
   // The socket never opens: an error event (the message), then a close (the reason).
   openFail?: { error?: string; reason?: string };
+  // The host drops the socket the way RN reports it: an error event with no message
+  // property, then a close 1006 whose reason is the exception text. With silentAfter
+  // 'msg1' it replaces the plain close; with openFail it replaces the error event.
+  rnShaped?: boolean;
+  // The close reason for an RN-shaped drop after msg1; defaults to 'Connection reset'.
+  rnReason?: string;
   // The host answers the version request with this text instead of the vector reply.
   reply?: string;
   // The host closes silently after receiving this step.
@@ -156,6 +162,13 @@ export class FakeSocket implements WebSocketLike {
   ) {
     this.later(() => {
       if (script.openFail) {
+        if (script.rnShaped) {
+          // RN dispatches the error and the close back to back, in one tick.
+          this.onerror?.({});
+          this.closed = true;
+          this.onclose?.({ code: 1006, reason: script.openFail.reason ?? '' });
+          return;
+        }
         if (script.openFail.error !== undefined) this.onerror?.({ message: script.openFail.error });
         this.closeFromHost(script.openFail.reason ?? '');
       } else this.onopen?.({});
@@ -172,6 +185,16 @@ export class FakeSocket implements WebSocketLike {
     this.later(() => {
       this.closed = true;
       this.onclose?.({ code: 1006, reason });
+    });
+  }
+
+  // A drop mid-handshake: plain close, or RN-shaped (error with no message, then close 1006).
+  private dropFromHost(): void {
+    if (!this.script.rnShaped) return this.closeFromHost();
+    this.later(() => {
+      this.onerror?.({});
+      this.closed = true;
+      this.onclose?.({ code: 1006, reason: this.script.rnReason ?? 'Connection reset' });
     });
   }
 
@@ -206,7 +229,7 @@ export class FakeSocket implements WebSocketLike {
     const bytes = new Uint8Array(data);
     if (this.binaries === 1) {
       this.msg1Matches = toHex(bytes) === v.msg1_hex;
-      if (this.script.silentAfter === 'msg1') return this.closeFromHost();
+      if (this.script.silentAfter === 'msg1') return this.dropFromHost();
       const msg2 = fromHex(v.msg2_hex);
       if (this.script.flipMsg2) msg2[msg2.length - 1] ^= 1;
       return this.pushRaw(msg2);
@@ -249,12 +272,16 @@ export class FakeSocket implements WebSocketLike {
   }
 }
 
-// Connection n uses scripts[n]; the last script repeats.
-export function fakeHost(v: Vector, ...scripts: Script[]): FakeHost {
+// Connection n uses scripts[n]; the last script repeats. One vector serves every path; a
+// {pair, link} pair serves /pair with the first and /link with the second, picked by URL.
+export type Vectors = Vector | { pair: Vector; link: Vector };
+
+export function fakeHost(vectors: Vectors, ...scripts: Script[]): FakeHost {
   const sockets: FakeSocket[] = [];
   const list = scripts.length ? scripts : [{}];
   class Bound extends FakeSocket {
     constructor(url: string) {
+      const v = 'pair' in vectors ? (url.endsWith('/pair') ? vectors.pair : vectors.link) : vectors;
       super(url, v, list[Math.min(sockets.length, list.length - 1)]);
       sockets.push(this);
     }

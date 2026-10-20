@@ -115,6 +115,40 @@ describe('host store', () => {
     expect(await getHost(ID1)).toBeNull();
   });
 
+  it('recovers host ids from an index that does not parse', async () => {
+    data.set(hostKey(ID1), JSON.stringify(record(ID1)));
+    data.set(hostKey(ID2), JSON.stringify(record(ID2)));
+    data.set(INDEX_KEY, `["${ID1}","${ID2}","`);
+    expect((await listHosts()).map((h) => h.host_id)).toEqual([ID1, ID2]);
+    await saveHost(record(ID3));
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID1, ID2, ID3]);
+  });
+
+  it('recovers host ids from an index that is not an array', async () => {
+    data.set(hostKey(ID1), JSON.stringify(record(ID1)));
+    data.set(hostKey(ID2), JSON.stringify(record(ID2)));
+    data.set(INDEX_KEY, JSON.stringify({ hosts: [ID1, ID2, ID1] }));
+    expect((await listHosts()).map((h) => h.host_id)).toEqual([ID1, ID2]);
+  });
+
+  it('drops index entries that are not host ids', async () => {
+    data.set(hostKey(ID1), JSON.stringify(record(ID1)));
+    data.set(INDEX_KEY, JSON.stringify(['../x', ID1, ID1, 5]));
+    expect((await listHosts()).map((h) => h.host_id)).toEqual([ID1]);
+    await saveHost(record(ID1));
+    expect(data.get(INDEX_KEY)).toBe(JSON.stringify([ID1]));
+  });
+
+  it('forget over an unparseable index keeps the other hosts', async () => {
+    data.set(hostKey(ID1), JSON.stringify(record(ID1)));
+    data.set(hostKey(ID2), JSON.stringify(record(ID2)));
+    data.set(INDEX_KEY, `["${ID1}","${ID2}"`);
+    await forgetHost(ID1);
+    expect(JSON.parse(data.get(INDEX_KEY)!)).toEqual([ID2]);
+    expect(data.has(hostKey(ID1))).toBe(false);
+    expect(data.has(hostKey(ID2))).toBe(true);
+  });
+
   it('ignores a record with no index entry', async () => {
     data.set(hostKey(ID1), JSON.stringify(record(ID1)));
     expect(await listHosts()).toEqual([]);

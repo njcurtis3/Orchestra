@@ -134,14 +134,15 @@ impl Handshake {
         Err(NoiseError::NoMatch)
     }
 
-    fn build(
+    /// The snow builder both `build` and the test-only `with_ephemeral` start from, so a
+    /// vector is produced by the same setup the production path runs.
+    fn configured<'a>(
         mode: Mode,
-        local: &SecretKey,
-        remote: Option<&PublicKey>,
-        psk: Option<&Psk>,
-        prologue: &[u8],
-        initiator: bool,
-    ) -> Result<Self, NoiseError> {
+        local: &'a SecretKey,
+        remote: Option<&'a PublicKey>,
+        psk: Option<&'a Psk>,
+        prologue: &'a [u8],
+    ) -> Result<Builder<'a>, NoiseError> {
         let mut b = Builder::new(params(mode)?).local_private_key(local.expose()).map_err(|_| NoiseError::Init)?;
         b = b.prologue(prologue).map_err(|_| NoiseError::Init)?;
         if let Some(r) = remote {
@@ -150,6 +151,18 @@ impl Handshake {
         if let Some(p) = psk {
             b = b.psk(2, p.expose()).map_err(|_| NoiseError::Init)?;
         }
+        Ok(b)
+    }
+
+    fn build(
+        mode: Mode,
+        local: &SecretKey,
+        remote: Option<&PublicKey>,
+        psk: Option<&Psk>,
+        prologue: &[u8],
+        initiator: bool,
+    ) -> Result<Self, NoiseError> {
+        let b = Self::configured(mode, local, remote, psk, prologue)?;
         let state = if initiator { b.build_initiator() } else { b.build_responder() };
         Ok(Self { state: state.map_err(|_| NoiseError::Init)? })
     }
@@ -226,15 +239,8 @@ impl Handshake {
         initiator: bool,
         ephemeral: &[u8; 32],
     ) -> Result<Self, NoiseError> {
-        let mut b = Builder::new(params(mode)?).local_private_key(local.expose()).map_err(|_| NoiseError::Init)?;
-        b = b.prologue(prologue).map_err(|_| NoiseError::Init)?;
-        if let Some(r) = remote {
-            b = b.remote_public_key(r.as_bytes()).map_err(|_| NoiseError::Init)?;
-        }
-        if let Some(p) = psk {
-            b = b.psk(2, p.expose()).map_err(|_| NoiseError::Init)?;
-        }
-        b = b.fixed_ephemeral_key_for_testing_only(ephemeral);
+        let b = Self::configured(mode, local, remote, psk, prologue)?;
+        let b = b.fixed_ephemeral_key_for_testing_only(ephemeral);
         let state = if initiator { b.build_initiator() } else { b.build_responder() };
         Ok(Self { state: state.map_err(|_| NoiseError::Init)? })
     }

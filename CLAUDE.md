@@ -38,7 +38,7 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (253 core + 30 link + 4 wire fixtures + 44 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (255 core + 30 link + 4 wire fixtures + 44 shell)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 # Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
 

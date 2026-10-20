@@ -37,15 +37,18 @@ async function write(key: string, value: string): Promise<void> {
 // paired again, which makes a new key (the old one was unreadable anyway). A read that feeds
 // a write is strict, so a transient failure cannot make the index look empty and be written
 // back over it, which would orphan every host's secret.
-async function readJson(key: string, strict = false): Promise<unknown> {
-  let text: string | null;
+async function readText(key: string, strict: boolean): Promise<string | null | undefined> {
   try {
-    text = await SecureStore.getItemAsync(key);
+    return await SecureStore.getItemAsync(key);
   } catch (e) {
     if (strict) throw e;
     return undefined;
   }
-  if (text === null) return undefined;
+}
+
+async function readJson(key: string, strict = false): Promise<unknown> {
+  const text = await readText(key, strict);
+  if (text === null || text === undefined) return undefined;
   try {
     return JSON.parse(text);
   } catch {
@@ -53,9 +56,34 @@ async function readJson(key: string, strict = false): Promise<unknown> {
   }
 }
 
+const HOST_ID = /^[0-9a-f]{32}$/;
+const HOST_ID_IN_TEXT = /(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])/g;
+
+// The ids of the index, and whether the stored text is already the clean form. An array keeps
+// its host ids once each. Text that does not parse, or parses to something else, is read for
+// the ids in it (SecureStore cannot list keys, so the records cannot be found any other way);
+// a value with no ids is empty. The next save or forget rewrites the index clean.
+async function readIndexState(strict: boolean): Promise<{ ids: string[]; clean: boolean }> {
+  const text = await readText(INDEX_KEY, strict);
+  if (text === null || text === undefined) return { ids: [], clean: text === null };
+  let ids: string[];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  if (Array.isArray(parsed)) {
+    ids = parsed.filter((x): x is string => typeof x === 'string' && HOST_ID.test(x));
+  } else {
+    ids = text.match(HOST_ID_IN_TEXT) ?? [];
+  }
+  ids = [...new Set(ids)];
+  return { ids, clean: Array.isArray(parsed) && text === JSON.stringify(ids) };
+}
+
 async function readIndex(strict = false): Promise<string[]> {
-  const raw = await readJson(INDEX_KEY, strict);
-  return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [];
+  return (await readIndexState(strict)).ids;
 }
 
 function isRecord(raw: unknown, hostId: string): raw is HostRecord {
@@ -106,8 +134,10 @@ export function saveHost(record: HostRecord): Promise<void> {
     const rec = { ...record, addrs: record.addrs.slice(0, MAX_ADDRS) };
     const body = JSON.stringify(rec);
     assertSize(hostKey(rec.host_id), body); // throws before anything is written
-    const index = await readIndex(true);
-    if (!index.includes(rec.host_id)) await write(INDEX_KEY, JSON.stringify([...index, rec.host_id]));
+    const { ids: index, clean } = await readIndexState(true);
+    if (!index.includes(rec.host_id) || !clean) {
+      await write(INDEX_KEY, JSON.stringify(index.includes(rec.host_id) ? index : [...index, rec.host_id]));
+    }
     await write(hostKey(rec.host_id), body);
   });
 }
@@ -115,9 +145,9 @@ export function saveHost(record: HostRecord): Promise<void> {
 // Delete both the record and its index entry.
 export function forgetHost(hostId: string): Promise<void> {
   return serialized(async () => {
-    const index = await readIndex(true);
+    const { ids: index, clean } = await readIndexState(true);
     await SecureStore.deleteItemAsync(hostKey(hostId));
-    if (index.includes(hostId)) {
+    if (index.includes(hostId) || !clean) {
       await write(INDEX_KEY, JSON.stringify(index.filter((id) => id !== hostId)));
     }
   });
