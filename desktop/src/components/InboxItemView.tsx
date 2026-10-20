@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { answersTooLarge } from "../answers";
 import { answer } from "../ipc";
 import { replyThenClear } from "../reply";
 import { MAX_TEXT_BYTES, type Answer, type InboxItem, type Question } from "../types";
@@ -130,7 +131,7 @@ function Questions({ item, busy, send }: Sub) {
 
   const answers = collect();
   const complete = questions.length > 0 && questions.every((q) => q.question in answers);
-  const long = Object.values(answers).some(tooLong);
+  const tooLarge = answersTooLarge(answers);
 
   return (
     <>
@@ -165,11 +166,16 @@ function Questions({ item, busy, send }: Sub) {
         <div className="actions">
           <button
             type="button"
-            disabled={busy || !complete || long}
+            disabled={busy || !complete || tooLarge}
             onClick={() => send({ kind: "question", item_id: item.id, answers })}
           >
             Send answers
           </button>
+          {tooLarge && (
+            <span className="meta">
+              Answers are too large to send: at most 32 questions, and each question and answer at most 4096 bytes.
+            </span>
+          )}
         </div>
       )}
     </>
