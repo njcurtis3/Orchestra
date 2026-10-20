@@ -236,6 +236,9 @@ export class LinkController {
     this.epoch++;
     const epoch = this.epoch;
     this.stopLink();
+    // Entries from a previous host must not show under the new host's name.
+    this.order = [];
+    this.set({ outbox: {} });
     this.set({ phase: 'pairing', pairStep: 'connecting', pairFingerprint: null, error: null, retryAt: null });
     const finish = (failure: LinkFailure | { kind: 'StoreFailed' }): PairOutcome => {
       this.pairing = false;
@@ -580,7 +583,7 @@ export class LinkController {
     this.flush();
   }
 
-  // Cancel an answer that has not gone out.
+  // Cancel an answer that has not gone out or has no reply. The draft stays in drafts.ts.
   cancelAnswer(itemId: string): void {
     this.update(itemId, box.cancel);
   }

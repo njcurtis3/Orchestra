@@ -42,8 +42,9 @@ describe('outbox transitions', () => {
     expect(box.resultError(resend, 'failed', 'anything at all', false).status).toBe('unconfirmed');
   });
 
-  it('cancel removes only a queued entry', () => {
+  it('cancel removes only a queued or unconfirmed entry', () => {
     expect(box.cancel(queued())).toBeNull();
+    expect(box.cancel(box.timedOut(box.sending(queued())))).toBeNull();
     const s = sent();
     expect(box.cancel(s)).toBe(s);
   });

@@ -267,7 +267,7 @@ describe('status line', () => {
   const statuses: [string, string, string[]][] = [
     ['queued', copy.queued, ['Cancel']],
     ['sending', copy.sending, []],
-    ['unconfirmed', copy.unconfirmed, ['Try again']],
+    ['unconfirmed', copy.unconfirmed, ['Try again', 'Cancel']],
     ['sent', copy.sent, []],
     ['failed', copy.failed, ['Try again']],
     ['refused', copy.no_answer_scope, ['Dismiss']],

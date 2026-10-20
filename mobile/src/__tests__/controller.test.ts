@@ -792,6 +792,54 @@ describe('answers', () => {
     t.ctl.dispose();
   });
 
+  it('Cancel frees an unconfirmed replayed failure, a late result is ignored, a new answer gets a new id', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].closeFromHost();
+    await tick(1_000);
+    t.host.sockets[1].pushHost(err(id, 'failed', 'replayed'));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('unconfirmed');
+    t.ctl.retryAnswer('i1');
+    await tick(0);
+    t.host.sockets[1].pushHost(err(id, 'failed', 'replayed'));
+    await tick(0);
+    expect(outbox(t).i1).toMatchObject({ status: 'unconfirmed', call_id: id });
+    t.ctl.answer(allow('i1'));
+    expect(outbox(t).i1.call_id).toBe(id);
+    t.ctl.cancelAnswer('i1');
+    expect(outbox(t)).toEqual({});
+    t.host.sockets[1].pushHost(ok(id));
+    await tick(0);
+    expect(outbox(t)).toEqual({});
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    expect(outbox(t).i1.call_id).not.toBe(id);
+    expect(outbox(t).i1.status).toBe('sending');
+    t.ctl.dispose();
+  });
+
+  it('pair empties the outbox', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    expect(outbox(t).i1).toBeDefined();
+    const pv = loadVector('ikpsk2');
+    void t.ctl.pair({
+      v: 1,
+      host_id: vectorHostId(pv),
+      host_name: 'Other desktop',
+      host_key: pv.host_static_public_hex,
+      secret: pv.psk_hex!,
+      addrs: [ADDR],
+      expires_at: Date.now() + 300_000,
+    });
+    expect(outbox(t)).toEqual({});
+    t.ctl.dispose();
+  });
+
   it('a definitive failed keeps the answer and Try again uses a new id', async () => {
     const t = await goLive([live(item('i1'))]);
     t.ctl.answer(allow('i1'));

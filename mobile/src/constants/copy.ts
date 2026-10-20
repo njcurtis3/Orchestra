@@ -59,7 +59,7 @@ export const copy = {
   back: 'Back',
   sending: 'Sending...',
   queued: 'Queued. It sends when <host> is back. Closing the app drops it. [Cancel]',
-  unconfirmed: 'No reply from <host> yet. [Try again]',
+  unconfirmed: 'No reply from <host> yet. [Try again] [Cancel]',
   sent: 'Sent.',
   failed: 'Not sent: <reason>. Your answer is kept. [Try again]',
   answered: 'This request was already answered. [Dismiss]',
