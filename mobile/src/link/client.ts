@@ -246,9 +246,9 @@ export function connect(o: ConnectOptions): LinkConnection {
       }
     };
     socket.onerror = (ev) => {
+      // Only recorded. RN reports every failure as an error with no message, then a close
+      // whose reason is the exception text, so the close decides in every phase.
       errorText = typeof ev?.message === 'string' ? ev.message : '';
-      // Before the socket opens the failure is final; the close that follows is ignored.
-      if (phase === 'opening') fail(closedBy(errorText));
     };
     socket.onclose = (ev) => {
       if (settled) return;

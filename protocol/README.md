@@ -439,7 +439,12 @@ wire change: `v` stays 1 and the desktop is unaffected.
   or the window closed). An error frame in the version exchange: version mismatch. `/link`
   closed after message 1 with no message 2, twice in a row with the network up: "Not paired
   with this host", with Pair again and Forget this desktop, retrying at the slow backoff.
-  `/pair` message 2 does not decrypt: wrong code or host key, final for that QR. `/pair`
+  `/pair` message 2 does not decrypt, or `/pair` closes after message 1: a wrong code, a
+  wrong host key at that address, a window that closed, or a network drop; final for that QR.
+  The host sends no close frame after a failed handshake (`core/src/link/conn.rs`) and RN
+  reports every drop as an error, then a close 1006 with the exception text, so the phone
+  cannot tell these apart and shows one message naming both causes. Close reason text never
+  drives behaviour beyond the 404 rule. `/pair`
   closed after the hello and before `welcome`: rejected, timed out or the desktop stopped (the
   phone cannot tell which). `error{code: revoked}`: "Removed from <host>. Pair again." The
   phone deletes a host's record and key only on `revoked` or on Forget, never after a failed

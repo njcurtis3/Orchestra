@@ -180,6 +180,26 @@ describe('link only', () => {
 describe('pair only', () => {
   const v = loadVector('ikpsk2');
 
+  it('close after msg1 gives PairAuthFailed on /pair', async () => {
+    const r = run(v, 'pair', { silentAfter: 'msg1' });
+    await flush();
+    expect(r.closes).toEqual([{ kind: 'PairAuthFailed' }]);
+  });
+
+  it('an RN-shaped drop after msg1 gives PairAuthFailed, whatever the reason text', async () => {
+    for (const rnReason of ['Connection reset', 'Software caused connection abort', '']) {
+      const r = run(v, 'pair', { silentAfter: 'msg1', rnShaped: true, rnReason });
+      await flush();
+      expect(r.closes).toEqual([{ kind: 'PairAuthFailed' }]);
+    }
+  });
+
+  it('an RN-shaped 404 (error with no message, then a close with the 404 reason) gives PairWindowClosed', async () => {
+    const r = run(v, 'pair', { openFail: { reason: HTTP_404 }, rnShaped: true });
+    await flush();
+    expect(r.closes).toEqual([{ kind: 'PairWindowClosed' }]);
+  });
+
   it('a flipped msg2 bit gives PairAuthFailed', async () => {
     const r = run(v, 'pair', { flipMsg2: true });
     await flush();
