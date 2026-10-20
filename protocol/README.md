@@ -428,7 +428,12 @@ wire change: `v` stays 1 and the desktop is unaffected.
   `addrs`, `client_secret_key`, `client_public_key`, `fingerprint`, `paired_at`). Each value
   is under 2048 bytes, `addrs` is at most 8, the index entry is written before the record (a crash between the two leaves an id with
   no record, which `listHosts` skips and the next save fills), and
-  no snapshot cache is persisted in A1.
+  no snapshot cache is persisted in A1. The controller loads the most recently paired host
+  (largest `paired_at`, a tie to the later index entry), which amends the line above that
+  the A1 UI shows the first host. The index keeps only 32-hex ids, once each. A value that
+  does not parse, or is not an array, is read for the ids in its text, and the next save or
+  forget rewrites it as a clean array. A value with no ids is empty, and its records are
+  unreachable because SecureStore cannot enumerate keys.
 - **What a silent close means (G6, amends Revocation).** The phone tracks the phase reached.
   The socket never opens: unreachable (on `/pair`, a close reason with 404: the code was used
   or the window closed). An error frame in the version exchange: version mismatch. `/link`
@@ -439,6 +444,8 @@ wire change: `v` stays 1 and the desktop is unaffected.
   phone cannot tell which). `error{code: revoked}`: "Removed from <host>. Pair again." The
   phone deletes a host's record and key only on `revoked` or on Forget, never after a failed
   handshake. This replaces the Revocation line that said a failed handshake deletes keys.
+  A Cancel that lands after the host is saved restores the previous record of that
+  `host_id`, or deletes the new one if there was none.
 - **Placement (G7).** `protocol/` gains data only (`fixtures/noise` and this section); no
   TypeScript is added there. Mobile keeps importing `protocol/` by relative path, and Noise
   and framing live in `mobile/src/link`, because `protocol/` has no `node_modules` for a
