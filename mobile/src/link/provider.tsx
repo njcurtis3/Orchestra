@@ -14,10 +14,12 @@ import {
 } from 'react';
 import { AppState } from 'react-native';
 
+import type { Answer, InboxItem } from '../../../protocol/types';
 import type { LinkFailure } from './client';
 import { LinkController } from './controller';
 import type { ControllerPhase, HostSummary, PairOutcome } from './controller';
 import type { PairingOffer } from './offer';
+import type { Outbox } from './outbox';
 import { random } from './random';
 import type { LinkData } from './state';
 import { forgetHost, listHosts, saveHost } from './store';
@@ -26,8 +28,14 @@ export type LinkContextValue = {
   phase: ControllerPhase;
   host: HostSummary | null;
   sessions: LinkData['sessions'];
-  // Pending inbox items: not resolved and not expired.
+  // Every inbox item as held, whatever its kind and state.
+  inbox: InboxItem[];
+  // Answers the phone holds, by item id. In memory only.
+  outbox: Outbox;
+  // Pending permission and question items: not resolved and not expired. What the phone lists.
   inboxCount: number;
+  // This phone may answer: the host granted the answer scope.
+  canAnswer: boolean;
   error: LinkFailure | null;
   scopes: string[];
   pairStep: 'connecting' | 'confirm' | null;
@@ -37,6 +45,10 @@ export type LinkContextValue = {
   cancelPair: () => void;
   retryNow: () => void;
   forget: () => Promise<void>;
+  answer: (a: Extract<Answer, { kind: 'permission' | 'question' }>) => void;
+  cancelAnswer: (itemId: string) => void;
+  retryAnswer: (itemId: string) => void;
+  dismissAnswer: (itemId: string) => void;
 };
 
 const LinkContext = createContext<LinkContextValue | null>(null);
@@ -73,7 +85,12 @@ export function LinkProvider({ children }: { children: ReactNode }) {
       phase: s.phase,
       host: s.host,
       sessions: s.data.sessions,
-      inboxCount: s.data.inbox.filter((i) => !i.resolved && !i.expired).length,
+      inbox: s.data.inbox,
+      outbox: s.outbox,
+      inboxCount: s.data.inbox.filter(
+        (i) => (i.kind === 'permission' || i.kind === 'question') && !i.resolved && !i.expired,
+      ).length,
+      canAnswer: s.data.scopes.includes('answer'),
       error: s.error,
       scopes: s.data.scopes,
       pairStep: s.pairStep,
@@ -83,6 +100,10 @@ export function LinkProvider({ children }: { children: ReactNode }) {
       cancelPair: () => controller.cancelPair(),
       retryNow: () => controller.retryNow(),
       forget: () => controller.forget(),
+      answer: (a) => controller.answer(a),
+      cancelAnswer: (id) => controller.cancelAnswer(id),
+      retryAnswer: (id) => controller.retryAnswer(id),
+      dismissAnswer: (id) => controller.dismissAnswer(id),
     }),
     [controller, s],
   );

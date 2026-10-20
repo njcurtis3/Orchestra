@@ -35,7 +35,10 @@ function link(over: Partial<LinkContextValue> = {}): LinkContextValue {
     phase: 'live',
     host,
     sessions: [],
+    inbox: [],
+    outbox: {},
     inboxCount: 0,
+    canAnswer: true,
     error: null,
     scopes: ['read', 'answer'],
     pairStep: null,
@@ -45,6 +48,10 @@ function link(over: Partial<LinkContextValue> = {}): LinkContextValue {
     cancelPair: jest.fn(),
     retryNow: jest.fn(),
     forget: jest.fn().mockResolvedValue(undefined),
+    answer: jest.fn(),
+    cancelAnswer: jest.fn(),
+    retryAnswer: jest.fn(),
+    dismissAnswer: jest.fn(),
     ...over,
   } as LinkContextValue;
 }
