@@ -46,12 +46,56 @@ export const copy = {
   no_read_scope:
     '<host> has not allowed this phone to see sessions. Change it in Devices on the desktop.',
   no_sessions: 'No sessions on <host> right now.',
+  inbox_title: 'Needs you',
+  inbox_empty: 'Nothing needs you right now.',
+  kind_permission: 'Permission',
+  kind_question: 'Question',
+  row_label: '<kind> from <project>',
+  allow: 'Allow',
+  deny: 'Deny',
+  deny_message: 'Deny message (optional)',
+  other: 'Other',
+  send_answers: 'Send answers',
+  back: 'Back',
+  sending: 'Sending...',
+  queued: 'Queued. It sends when <host> is back. Closing the app drops it. [Cancel]',
+  unconfirmed: 'No reply from <host> yet. [Try again]',
+  sent: 'Sent.',
+  failed: 'Not sent: <reason>. Your answer is kept. [Try again]',
+  answered: 'This request was already answered. [Dismiss]',
+  expired:
+    'This request expired when Orchestra closed and can no longer be answered. [Dismiss]',
+  gone: 'This request is no longer on <host>. [Dismiss]',
+  no_answer_scope:
+    '<host> has not allowed this phone to answer. Change it in Devices on the desktop.',
+  answer_too_long: 'This answer is too long to send. Keep each answer under 4096 bytes.',
+  deny_too_long: 'This message is too long to send.',
+  too_many_questions: 'This question has more parts than Orchestra can send.',
+  no_questions:
+    'This question has nothing to choose from. It stays open until the session ends.',
 } as const;
 
 // Wording the approved copy does not cover: the home header, and what to call an unnamed host.
 export const extra = {
   need_you: (n: number) => `${n} need you`,
   unknown_host: 'your desktop',
+  unknown_project: 'Unknown project',
+  row_status: {
+    pending: 'Waiting for you',
+    queued: 'Queued',
+    sending: 'Sending',
+    unconfirmed: 'No reply yet',
+    sent: 'Sent',
+    failed: 'Not sent',
+    refused: 'Not sent',
+    answered: 'Already answered',
+    expired: 'Expired',
+    gone: 'Gone',
+  },
+  tool_label: 'Tool',
+  input_label: 'Input',
+  missing_reason: 'the desktop did not accept it',
+  refused_reason: 'this phone may not answer',
 } as const;
 
 const statusLabels: Readonly<Record<string, string>> = {

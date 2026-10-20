@@ -165,6 +165,10 @@ and allowed to drift.
 - **`src/link/` is the phone link**: pairing offer parsing (`offer.ts`), per-host key storage
   (`store.ts`), Noise and framing, and the one randomness source (`random.ts`, expo-crypto).
   Everything else receives randomness as an argument, so tests pass fixed bytes.
+- **`src/inbox/` is the answer screens' logic**: pure answer builders and limits (`answer.ts`,
+  the desktop's shapes and the host's size caps) and in-memory drafts (`drafts.ts`). Answers
+  and drafts are held in memory only, never written to disk or logged; there is no
+  `BackHandler`, so Back keeps the draft.
 - **Device testing is an owner check**, not a slice gate: run `npx expo start --go` in Expo
   Go against a desktop started with `npm run tauri dev` and its link on a LAN address. Expo
   Go allows cleartext; our own merged manifest is proven by `npx expo prebuild --platform

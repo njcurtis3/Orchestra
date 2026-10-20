@@ -164,3 +164,56 @@ describe('HomeScreen banners', () => {
     expect(screen.queryByText(text(copy.no_sessions))).toBeNull();
   });
 });
+
+describe('HomeScreen needs you', () => {
+  const inboxItem = (id: string, session_id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    session_id,
+    kind: 'permission',
+    created_at: 1,
+    resolved: false,
+    expired: false,
+    summary: `summary ${id}`,
+    tool_name: null,
+    tool_input_preview: null,
+    questions: null,
+    result_text: null,
+    ...over,
+  });
+  const two = [session('1'), session('2')] as never;
+
+  it('says nothing needs you when the list is empty', async () => {
+    await show({ sessions: two });
+    expect(screen.getByText(copy.inbox_title)).toBeTruthy();
+    expect(screen.getByText(copy.inbox_empty)).toBeTruthy();
+  });
+
+  it("lists two sessions' items, newest first, and opens one", async () => {
+    await show({
+      sessions: two,
+      inbox: [
+        inboxItem('old', '1', { created_at: 1 }),
+        inboxItem('new', '2', { kind: 'question', created_at: 9 }),
+        inboxItem('fin', '1', { kind: 'finished', created_at: 20 }),
+      ] as never,
+      inboxCount: 2,
+    });
+    expect(screen.queryByText(copy.inbox_empty)).toBeNull();
+    const rows = screen.getAllByRole('button').map((b) => b.props.accessibilityLabel);
+    expect(rows).toEqual(['Question from Project 2, Waiting for you', 'Permission from Project 1, Waiting for you']);
+    expect(screen.queryByText('summary fin')).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: /Question from Project 2/ }));
+    expect(mockRouter.push).toHaveBeenCalledWith({ pathname: '/inbox/[id]', params: { id: 'new' } });
+  });
+
+  it('keeps a not-sent outcome listed until dismissed', async () => {
+    const answered = { item_id: 'a', status: 'answered', call_id: 'c', attempt: 1, answer: {} };
+    const inbox = [inboxItem('a', '1', { resolved: true })] as never;
+    await show({ sessions: two, inbox, outbox: { a: answered } as never });
+    expect(
+      screen.getByRole('button', { name: 'Permission from Project 1, Already answered' }),
+    ).toBeTruthy();
+    await show({ sessions: two, inbox, outbox: {} });
+    expect(screen.queryByRole('button', { name: /Permission from Project 1/ })).toBeNull();
+  });
+});
