@@ -468,15 +468,16 @@ and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture c
   is every item of the one session whose inbox changed, never another session's
   (`core/src/session/mod.rs`, `events_for`). A client replaces that session's items and keeps
   every other session's. The snapshot carries every session's items.
-- **An empty payload changes nothing (G2).** It names no session, and the host never sends
+- **An empty payload changes nothing (G1).** It names no session, and the host never sends
   one, since `inbox_rev` moves only when an item exists. A client that receives an empty
   payload leaves its inbox as it is.
-- **Answer limits (G6).** An answer map holds at most 32 keys, and each key and each value
+- **Answer limits (G11).** An answer map holds at most 32 keys, and each key and each value
   is at most 4096 bytes, else the host returns `failed` with "answers too large". A deny
   message and a reply text are capped at 32768 bytes. Each client copies these limits and
   checks them before it sends; the host stays the authority.
-- **Expired answers come back `failed` (G11).** An item that was open when Orchestra closed
-  is expired on restart. Answering it returns `failed` with "this request expired when
+- **Expired answers come back `failed` (G6, G7).** When a session is suspended, which
+  happens when Orchestra shuts down, the host marks every open permission or question item
+  expired (`core/src/session/state.rs`), and the saved state keeps that mark. Answering it returns `failed` with "this request expired when
   Orchestra closed", not `already_answered`. `already_answered` means the item is resolved
   or unknown. A client shows the two differently.
 - **Phone answer rules (G1 to G16 as approved).** The phone keeps its answer queue in
@@ -484,6 +485,10 @@ and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture c
   call id (non-empty, at most 128 bytes), so a resend is replayed by the host and applied
   once. After a reconnect the phone reconciles against the snapshot: an item the snapshot
   shows resolved or absent drops its queued answer. An answer that was sent has no undo.
-  A queued answer that the host refuses stays visible with the refusal.
+  A queued answer that the host refuses stays visible with the refusal. Cancel is allowed on
+  an answer that is queued or unconfirmed (sent, no reply): it removes the entry from the
+  phone and keeps the draft, so a late result for that id matches nothing, and a fresh
+  answer gets a new call id. Pairing a host empties the answer queue, so one host's
+  entries never show under another's name.
 - **Reopened if** the host starts sending an empty `inbox-updated` for a reason, or a
   client needs an answer to survive the app being closed (a persistent queue).
