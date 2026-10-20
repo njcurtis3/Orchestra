@@ -477,14 +477,14 @@ and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture c
   checks them before it sends; the host stays the authority.
 - **Expired answers come back `failed` (G6, G7).** When a session is suspended, which
   happens when Orchestra shuts down, the host marks every open permission or question item
-  expired (`core/src/session/state.rs`), and the saved state keeps that mark. Answering it returns `failed` with "this request expired when
-  Orchestra closed", not `already_answered`. `already_answered` means the item is resolved
+  expired (`core/src/session/state.rs`), and the saved state keeps that mark. Answering it
+  returns `failed` with "this request expired when Orchestra closed", not `already_answered`. `already_answered` means the item is resolved
   or unknown. A client shows the two differently.
 - **Phone answer rules (G1 to G16 as approved).** The phone keeps its answer queue in
   memory only, nothing is written to SecureStore. Each answer carries a client-generated
   call id (non-empty, at most 128 bytes), so a resend is replayed by the host and applied
   once. After a reconnect the phone reconciles against the snapshot: an item the snapshot
-  shows resolved or absent drops its queued answer. An answer that was sent has no undo.
+  shows resolved or absent clears a sent answer, and an unsent one shows as answered or gone. An answer that was sent has no undo.
   A queued answer that the host refuses stays visible with the refusal. Cancel is allowed on
   an answer that is queued or unconfirmed (sent, no reply): it removes the entry from the
   phone and keeps the draft, so a late result for that id matches nothing, and a fresh
