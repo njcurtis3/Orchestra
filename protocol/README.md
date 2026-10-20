@@ -444,8 +444,8 @@ wire change: `v` stays 1 and the desktop is unaffected.
   The host sends no close frame after a failed handshake (`core/src/link/conn.rs`) and RN
   reports every drop as an error, then a close 1006 with the exception text, so the phone
   cannot tell these apart and shows one message naming both causes. Close reason text never
-  drives behaviour beyond the 404 rule. `/pair`
-  closed after the hello and before `welcome`: rejected, timed out or the desktop stopped (the
+  drives behaviour beyond the 404 rule.
+  `/pair` closed after the hello and before `welcome`: rejected, timed out or the desktop stopped (the
   phone cannot tell which). `error{code: revoked}`: "Removed from <host>. Pair again." The
   phone deletes a host's record and key only on `revoked` or on Forget, never after a failed
   handshake. This replaces the Revocation line that said a failed handshake deletes keys.

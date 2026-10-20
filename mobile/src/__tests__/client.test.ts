@@ -194,6 +194,21 @@ describe('pair only', () => {
     }
   });
 
+  it('a refused connect to a port containing 404 is Unreachable, not PairWindowClosed', async () => {
+    const reason = 'Failed to connect to /192.168.1.5:4040';
+    const r = run(v, 'pair', { openFail: { reason }, rnShaped: true });
+    await flush();
+    expect(r.closes).toEqual([{ kind: 'Unreachable' }]);
+  });
+
+  it('an empty or unknown reason on /pair open failure is Unreachable', async () => {
+    for (const reason of ['', 'Connection refused', 'Expected HTTP 101 response but was 404']) {
+      const r = run(v, 'pair', { openFail: { reason }, rnShaped: true });
+      await flush();
+      expect(r.closes).toEqual([{ kind: 'Unreachable' }]);
+    }
+  });
+
   it('an RN-shaped 404 (error with no message, then a close with the 404 reason) gives PairWindowClosed', async () => {
     const r = run(v, 'pair', { openFail: { reason: HTTP_404 }, rnShaped: true });
     await flush();

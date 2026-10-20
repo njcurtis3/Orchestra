@@ -162,8 +162,14 @@ export class FakeSocket implements WebSocketLike {
   ) {
     this.later(() => {
       if (script.openFail) {
-        if (script.rnShaped) this.onerror?.({});
-        else if (script.openFail.error !== undefined) this.onerror?.({ message: script.openFail.error });
+        if (script.rnShaped) {
+          // RN dispatches the error and the close back to back, in one tick.
+          this.onerror?.({});
+          this.closed = true;
+          this.onclose?.({ code: 1006, reason: script.openFail.reason ?? '' });
+          return;
+        }
+        if (script.openFail.error !== undefined) this.onerror?.({ message: script.openFail.error });
         this.closeFromHost(script.openFail.reason ?? '');
       } else this.onopen?.({});
     });
