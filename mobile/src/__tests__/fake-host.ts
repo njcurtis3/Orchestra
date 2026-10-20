@@ -249,12 +249,16 @@ export class FakeSocket implements WebSocketLike {
   }
 }
 
-// Connection n uses scripts[n]; the last script repeats.
-export function fakeHost(v: Vector, ...scripts: Script[]): FakeHost {
+// Connection n uses scripts[n]; the last script repeats. One vector serves every path; a
+// {pair, link} pair serves /pair with the first and /link with the second, picked by URL.
+export type Vectors = Vector | { pair: Vector; link: Vector };
+
+export function fakeHost(vectors: Vectors, ...scripts: Script[]): FakeHost {
   const sockets: FakeSocket[] = [];
   const list = scripts.length ? scripts : [{}];
   class Bound extends FakeSocket {
     constructor(url: string) {
+      const v = 'pair' in vectors ? (url.endsWith('/pair') ? vectors.pair : vectors.link) : vectors;
       super(url, v, list[Math.min(sockets.length, list.length - 1)]);
       sockets.push(this);
     }

@@ -12,7 +12,7 @@ import {
   vectorRandom,
   welcomeMsg,
 } from './fake-host';
-import type { Script, Vector } from './fake-host';
+import type { Script, Vector, Vectors } from './fake-host';
 
 const ADDR = '192.168.1.20:47800';
 
@@ -33,9 +33,16 @@ function recordOf(v: Vector): HostRecord {
 function setup(
   v: Vector,
   scripts: Script[],
-  o: { hosts?: HostRecord[]; online?: boolean; pairing?: boolean; jitter?: number } = {},
+  o: {
+    hosts?: HostRecord[];
+    online?: boolean;
+    pairing?: boolean;
+    jitter?: number;
+    vectors?: Vectors;
+    random?: Deps['random'];
+  } = {},
 ) {
-  const host = fakeHost(v, ...scripts);
+  const host = fakeHost(o.vectors ?? v, ...scripts);
   const saved: HostRecord[] = [];
   const forgotten: string[] = [];
   const hosts = o.hosts ?? [];
@@ -51,7 +58,7 @@ function setup(
         forgotten.push(id);
       },
     },
-    random: vectorRandom(v, o.pairing ?? false),
+    random: o.random ?? vectorRandom(v, o.pairing ?? false),
     clientName: 'Vector phone',
     appVersion: '1.0.0',
     WebSocketImpl: host.WebSocketImpl,
@@ -487,18 +494,65 @@ describe('pairing', () => {
     t.ctl.dispose();
   });
 
-  it('dispose during pair with a stored host leaves nothing running', async () => {
-    const t = setup(v, [{ live: [] }], { pairing: true, hosts: [recordOf(v)] });
+  // A stored host dials /link (KK) first, then the offer dials /pair (IKpsk2). The draws are
+  // the link ephemeral, then the fresh static and the pair ephemeral.
+  const kk = loadVector('kk');
+  const twoPaths = (hosts: HostRecord[], scripts: Script[]) => {
+    const eph = vectorRandom(v, false);
+    const stat = vectorRandom(v, true);
+    let calls = 0;
+    return setup(v, scripts, {
+      hosts,
+      vectors: { pair: v, link: kk },
+      random: (n) => {
+        calls += 1;
+        return calls === 2 ? stat(n) : eph(n);
+      },
+    });
+  };
+
+  it('a stored host and a pairing offer each get their own vector', async () => {
+    const t = twoPaths([recordOf(kk)], [{}, { live: [] }]);
     await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    const p = t.ctl.pair(offer());
+    await tick(0);
+    const [link, pair] = t.host.sockets;
+    expect(link.url.endsWith('/link')).toBe(true);
+    expect(link.msg1Matches).toBe(true);
+    expect(pair.url.endsWith('/pair')).toBe(true);
+    expect(pair.msg1Matches).toBe(true);
+    t.ctl.cancelPair();
+    await tick(0);
+    await p;
+    t.ctl.dispose();
+  });
+
+  it('dispose during pair with a stored host leaves nothing running', async () => {
+    const t = twoPaths([recordOf(kk)], [{}, { live: [] }]);
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.host.sockets[0].url.endsWith('/link')).toBe(true);
+    expect(t.host.sockets[0].msg1Matches).toBe(true);
     const p = t.ctl.pair(offer());
     await tick(0);
     expect(t.ctl.getState().pairStep).toBe('confirm');
     t.ctl.dispose();
     await p;
     const before = t.host.sockets.length;
+    const pings = () => t.host.sockets.reduce((n, s) => n + s.pings, 0);
+    const pingsBefore = pings();
+    // The setup unsubscribes are no-ops, so these late callbacks still reach attempt().
+    t.ctl.retryNow();
+    t.foreground();
+    t.network(false);
+    t.network(true);
     await tick(180_000);
     expect(t.host.sockets.length).toBe(before);
     expect(jest.getTimerCount()).toBe(0);
+    expect(pings()).toBe(pingsBefore);
   });
 
   it('cancelPair while the host is being saved keeps nothing', async () => {
