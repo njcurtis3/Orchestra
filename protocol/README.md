@@ -458,3 +458,32 @@ wire change: `v` stays 1 and the desktop is unaffected.
   implementations.
 - **Reopened if** a snow upgrade changes a transcript (regenerate, and the phone must still
   agree), or the framing or prologue changes (a wire change, so `v` moves).
+
+## What A2 decided
+
+The phone answers what needs you. This section records the host facts the phone relies on
+and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture changes.
+
+- **inbox-updated carries one session's inbox (G1, corrects earlier wording).** The payload
+  is every item of the one session whose inbox changed, never another session's
+  (`core/src/session/mod.rs`, `events_for`). A client replaces that session's items and keeps
+  every other session's. The snapshot carries every session's items.
+- **An empty payload changes nothing (G2).** It names no session, and the host never sends
+  one, since `inbox_rev` moves only when an item exists. A client that receives an empty
+  payload leaves its inbox as it is.
+- **Answer limits (G6).** An answer map holds at most 32 keys, and each key and each value
+  is at most 4096 bytes, else the host returns `failed` with "answers too large". A deny
+  message and a reply text are capped at 32768 bytes. Each client copies these limits and
+  checks them before it sends; the host stays the authority.
+- **Expired answers come back `failed` (G11).** An item that was open when Orchestra closed
+  is expired on restart. Answering it returns `failed` with "this request expired when
+  Orchestra closed", not `already_answered`. `already_answered` means the item is resolved
+  or unknown. A client shows the two differently.
+- **Phone answer rules (G1 to G16 as approved).** The phone keeps its answer queue in
+  memory only, nothing is written to SecureStore. Each answer carries a client-generated
+  call id (non-empty, at most 128 bytes), so a resend is replayed by the host and applied
+  once. After a reconnect the phone reconciles against the snapshot: an item the snapshot
+  shows resolved or absent drops its queued answer. An answer that was sent has no undo.
+  A queued answer that the host refuses stays visible with the refusal.
+- **Reopened if** the host starts sending an empty `inbox-updated` for a reason, or a
+  client needs an answer to survive the app being closed (a persistent queue).

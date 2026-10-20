@@ -14,7 +14,7 @@ use orchestra_core::link::{LinkCallbacks, LinkConfig, LinkHost, LinkLog};
 use orchestra_core::session::store::StorageStatus;
 use orchestra_core::wire::message::HandshakeReply;
 use orchestra_core::wire::{
-    Call, ClientMessage, HostMessage, MAX_MESSAGE_BYTES, Method, Scope, decode_handshake_reply, encode_host,
+    Call, ClientMessage, HostEvent, HostMessage, MAX_MESSAGE_BYTES, Method, Scope, decode_handshake_reply, encode_host,
 };
 use serde_json::{Value, json};
 
@@ -308,6 +308,50 @@ fn answer_resend_after_reconnect_applies_once() {
     again.call("a1", answer());
     assert_eq!(again.result("a1").unwrap(), Value::Null);
     assert_eq!(rig.fake.lines.lock().unwrap().len(), before + 1);
+}
+
+#[test]
+fn answering_an_expired_item_over_the_link_is_failed_not_already_answered() {
+    let rig = Rig::new();
+    rig.start_session("go");
+    rig.feed(INIT);
+    rig.feed(PERM);
+    let item = rig.sessions.list_inbox().into_iter().find(|i| !i.resolved).unwrap();
+    let (_, mut conn) = rig.pair(&Identity::new(), "Pixel", None);
+    expect_snapshot(&mut conn);
+    // Closing Orchestra marks the open item resolved and expired, with no event.
+    rig.sessions.shutdown();
+    let answer = call_of(Method::Answer, json!({"kind": "permission", "item_id": item.id, "decision": "allow"}));
+    conn.call("a1", answer);
+    let err = conn.result("a1").unwrap_err();
+    assert_eq!(err.code, "failed");
+    assert!(err.message.contains("expired"), "{}", err.message);
+}
+
+#[test]
+fn inbox_updated_carries_only_the_changed_sessions_items() {
+    let rig = Rig::new();
+    let a = rig.start_session("first");
+    rig.feed(INIT);
+    rig.feed(PERM);
+    let b = rig.start_session("second");
+    rig.feed(INIT);
+    let (_, mut conn) = rig.pair(&Identity::new(), "Pixel", None);
+    let snap = expect_snapshot(&mut conn);
+    assert_eq!(snap.inbox.len(), 1);
+    assert_eq!(snap.inbox[0].session_id, a);
+
+    // `feed` targets the newest session, so the permission request belongs to B.
+    rig.feed(PERM);
+    let items = loop {
+        match conn.expect() {
+            HostMessage::Event { event: HostEvent::InboxUpdated(items), .. } => break items,
+            HostMessage::Event { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    assert!(!items.is_empty());
+    assert!(items.iter().all(|i| i.session_id == b), "A's open item must not ride along: {items:?}");
 }
 
 #[test]
