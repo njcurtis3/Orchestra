@@ -49,6 +49,7 @@ export function AnswerStatus({ entry, host, onCancel, onRetry, onDismiss }: Prop
   };
   // The host's reason is plain text from the host; the answer itself is never in it.
   const reason = entry.message?.trim() || extra.missing_reason;
+  // accessibilityLiveRegion is Android-only; iOS would need AccessibilityInfo.announceForAccessibility.
   return (
     <View
       accessibilityLiveRegion="polite"

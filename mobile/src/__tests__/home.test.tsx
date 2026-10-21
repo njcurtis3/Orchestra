@@ -206,6 +206,20 @@ describe('HomeScreen needs you', () => {
     expect(mockRouter.push).toHaveBeenCalledWith({ pathname: '/inbox/[id]', params: { id: 'new' } });
   });
 
+  it.each(['gone', 'answered', 'expired'])(
+    'lists a %s outcome whose item left the inbox until dismissed',
+    async (status) => {
+      const held = { item_id: 'x', status, call_id: 'c', attempt: 1, answer: { kind: 'permission' } };
+      await show({ sessions: two, inbox: [], outbox: { x: held } as never });
+      expect(screen.getAllByRole('button')).toHaveLength(1);
+      expect(
+        screen.getByRole('button', { name: /^Permission from Unknown project, /i }),
+      ).toBeTruthy();
+      await show({ sessions: two, inbox: [], outbox: {} });
+      expect(screen.queryByRole('button', { name: /^Permission from/ })).toBeNull();
+    },
+  );
+
   it('keeps a not-sent outcome listed until dismissed', async () => {
     const answered = { item_id: 'a', status: 'answered', call_id: 'c', attempt: 1, answer: {} };
     const inbox = [inboxItem('a', '1', { resolved: true })] as never;

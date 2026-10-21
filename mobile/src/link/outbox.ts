@@ -71,11 +71,12 @@ export function resultError(e: OutboxEntry, code: string, message: string, itemE
   return { ...e, status: 'failed', code, message };
 }
 
-// Cancel is for an answer that has not gone out, or one with no reply: the user's way out of a
-// replayed failure the phone cannot tell from a slow host. Null removes the entry, so a late
+// Cancel is for an answer that has not gone out, one with no reply, or one the host refused with a
+// failure: the user's way out of a replayed failure the phone cannot tell from a slow host, or of
+// an answer they no longer want to retry. Null removes the entry, so a late
 // result for its id matches nothing.
 export function cancel(e: OutboxEntry): OutboxEntry | null {
-  return e.status === 'queued' || e.status === 'unconfirmed' ? null : e;
+  return e.status === 'queued' || e.status === 'unconfirmed' || e.status === 'failed' ? null : e;
 }
 
 // Try again. From unconfirmed the id is kept, since the first call may have landed. From failed

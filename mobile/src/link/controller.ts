@@ -10,6 +10,7 @@ import type { KeyPair, Random } from './keys';
 import type { PairingOffer } from './offer';
 import * as box from './outbox';
 import type { Outbox, OutboxAnswer, OutboxEntry } from './outbox';
+import { clearDrafts } from '../inbox/drafts';
 import { initialData, reduce } from './state';
 import type { LinkData } from './state';
 import type { HostRecord } from './store';
@@ -237,7 +238,7 @@ export class LinkController {
     const epoch = this.epoch;
     this.stopLink();
     // Entries from a previous host must not show under the new host's name.
-    this.order = [];
+    this.emptyOutbox();
     this.set({ outbox: {} });
     this.set({ phase: 'pairing', pairStep: 'connecting', pairFingerprint: null, error: null, retryAt: null });
     const finish = (failure: LinkFailure | { kind: 'StoreFailed' }): PairOutcome => {
@@ -583,7 +584,7 @@ export class LinkController {
     this.flush();
   }
 
-  // Cancel an answer that has not gone out or has no reply. The draft stays in drafts.ts.
+  // Cancel an answer that has not gone out, has no reply, or failed. The draft stays in drafts.ts.
   cancelAnswer(itemId: string): void {
     this.update(itemId, box.cancel);
   }
@@ -697,7 +698,9 @@ export class LinkController {
     this.set({ outbox: next });
   }
 
+  // Forget, revoke and a new pairing end the old one: held answers and typed drafts go with it (A2-G5).
   private emptyOutbox(): void {
+    clearDrafts();
     this.order = [];
     if (this.callTimer !== null) clearTimeout(this.callTimer);
     this.callTimer = null;

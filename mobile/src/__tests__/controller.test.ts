@@ -1,3 +1,4 @@
+import { getDraft, setDraft, clearDrafts } from '../inbox/drafts';
 import { LinkController, backoffDelay } from '../link/controller';
 import type { Deps } from '../link/controller';
 import type { PairingOffer } from '../link/offer';
@@ -939,6 +940,21 @@ describe('answers', () => {
     expect(outbox(t)).toEqual({});
     expect(t.ctl.getState().data.inbox).toEqual([]);
     t.ctl.dispose();
+  });
+
+  it('Forget and revoke clear the drafts', async () => {
+    const t = await goLive([live(item('i1'))]);
+    setDraft('i1', { message: 'secret', question: { picks: {}, other: {} } });
+    await t.ctl.forget();
+    expect(getDraft('i1').message).toBe('');
+    t.ctl.dispose();
+    const r = await goLive([live(item('i1'))]);
+    setDraft('i1', { message: 'secret', question: { picks: {}, other: {} } });
+    r.host.sockets[0].pushHost({ v: 1, type: 'error', code: 'revoked', message: 'revoked' });
+    await tick(0);
+    expect(getDraft('i1').message).toBe('');
+    r.ctl.dispose();
+    clearDrafts();
   });
 
   it('revoked empties the outbox', async () => {

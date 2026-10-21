@@ -6,7 +6,7 @@ import { copy, fill, splitActions } from '@/constants/copy';
 import { clearDrafts } from '@/inbox/drafts';
 import type { LinkContextValue } from '@/link/provider';
 
-const mockRouter = { push: jest.fn(), replace: jest.fn(), back: jest.fn() };
+const mockRouter = { push: jest.fn(), replace: jest.fn(), back: jest.fn(), canGoBack: jest.fn(() => true) };
 let mockLink: LinkContextValue;
 let mockId = 'i1';
 
@@ -216,9 +216,10 @@ describe('question item', () => {
     expect(box().props.accessibilityState.checked).toBe(false);
   });
 
-  it('the question text is a header', async () => {
+  it('the question text and its header are both headers', async () => {
     await show({ inbox: [asking([question('Colour?')])] as never });
     expect(screen.getByText('Setup').props.accessibilityRole).toBe('header');
+    expect(screen.getByText('Colour?').props.accessibilityRole).toBe('header');
   });
 
   it('refuses a 4097-byte value, with copy, and keeps the text', async () => {
@@ -269,7 +270,7 @@ describe('status line', () => {
     ['sending', copy.sending, []],
     ['unconfirmed', copy.unconfirmed, ['Try again', 'Cancel']],
     ['sent', copy.sent, []],
-    ['failed', copy.failed, ['Try again']],
+    ['failed', copy.failed, ['Try again', 'Cancel']],
     ['refused', copy.no_answer_scope, ['Dismiss']],
     ['answered', copy.answered, ['Dismiss']],
     ['expired', copy.expired, ['Dismiss']],
@@ -343,6 +344,23 @@ describe('what hides the controls', () => {
     expect(screen.queryByRole('button', { name: copy.send_answers })).toBeNull();
   });
 
+  it('a gone outcome for an item the host no longer holds shows its status and Dismiss', async () => {
+    await show({ inbox: [], outbox: entry('gone', allow) as never });
+    expect(screen.getByText(plain(copy.gone))).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: 'Dismiss' }));
+    expect(mockLink.dismissAnswer).toHaveBeenCalledWith('i1');
+  });
+
+  it('a refused answer without the answer scope says so once', async () => {
+    await show({
+      inbox: [permission()] as never,
+      canAnswer: false,
+      scopes: ['read'],
+      outbox: entry('refused', allow) as never,
+    });
+    expect(screen.getAllByText(plain(copy.no_answer_scope))).toHaveLength(1);
+  });
+
   it('an unknown id shows the gone copy with Back', async () => {
     mockId = 'nope';
     await show({ inbox: [permission()] as never });
@@ -372,6 +390,14 @@ describe('drafts', () => {
     await first.unmount();
     await render(tree);
     expect(screen.getByLabelText(copy.deny_message).props.value).toBe('draft text');
+  });
+
+  it('Back with nothing behind it goes home', async () => {
+    mockRouter.canGoBack.mockReturnValueOnce(false);
+    await show({ inbox: [permission()] as never });
+    await fireEvent.press(screen.getByRole('button', { name: copy.back }));
+    expect(mockRouter.back).not.toHaveBeenCalled();
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
   it('Back is on screen and pops', async () => {

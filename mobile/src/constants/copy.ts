@@ -61,7 +61,7 @@ export const copy = {
   queued: 'Queued. It sends when <host> is back. Closing the app drops it. [Cancel]',
   unconfirmed: 'No reply from <host> yet. [Try again] [Cancel]',
   sent: 'Sent.',
-  failed: 'Not sent: <reason>. Your answer is kept. [Try again]',
+  failed: 'Not sent: <reason>. Your answer is kept. [Try again] [Cancel]',
   answered: 'This request was already answered. [Dismiss]',
   expired:
     'This request expired when Orchestra closed and can no longer be answered. [Dismiss]',
@@ -95,7 +95,6 @@ export const extra = {
   tool_label: 'Tool',
   input_label: 'Input',
   missing_reason: 'the desktop did not accept it',
-  refused_reason: 'this phone may not answer',
 } as const;
 
 const statusLabels: Readonly<Record<string, string>> = {

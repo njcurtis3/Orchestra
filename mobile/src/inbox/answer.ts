@@ -2,7 +2,7 @@
 // and the limits copy the host's (core/src/session/mod.rs): the host stays the authority.
 // Answer text is sensitive: nothing here logs it or copies it into a message.
 import type { Answer, InboxItem, Question } from '../../../protocol/types';
-import type { Outbox } from '@/link/outbox';
+import type { Outbox, OutboxEntry } from '@/link/outbox';
 
 export const MAX_ANSWERS = 32;
 export const MAX_ANSWER_BYTES = 4096;
@@ -137,10 +137,28 @@ const NOT_SENT = ['failed', 'refused', 'answered', 'expired', 'gone'];
 
 export const isNotSent = (status: string): boolean => NOT_SENT.includes(status);
 
+// An item that is no longer in the inbox, rebuilt from its outbox entry: the kind and the outcome
+// are all the phone still knows. It is listed so the outcome can be seen and dismissed.
+function missingItem(e: OutboxEntry): InboxItem {
+  return {
+    id: e.item_id,
+    session_id: '',
+    kind: e.answer.kind,
+    created_at: 0,
+    resolved: true,
+    expired: false,
+    summary: '',
+    tool_name: null,
+    tool_input_preview: null,
+    questions: null,
+    result_text: null,
+  };
+}
+
 // What home lists: pending permission and question items, plus any item holding a not-sent
-// outcome, newest first.
+// outcome (even one the host no longer sends), newest first; a missing item comes last.
 export function listedItems(inbox: InboxItem[], outbox: Outbox): InboxItem[] {
-  return inbox
+  const shown = inbox
     .filter((i) => {
       if (i.kind !== 'permission' && i.kind !== 'question') return false;
       if (!i.resolved && !i.expired) return true;
@@ -148,4 +166,9 @@ export function listedItems(inbox: InboxItem[], outbox: Outbox): InboxItem[] {
       return !!e && isNotSent(e.status);
     })
     .sort((a, b) => b.created_at - a.created_at);
+  const held = new Set(inbox.map((i) => i.id));
+  const missing = Object.values(outbox)
+    .filter((e) => !held.has(e.item_id) && isNotSent(e.status))
+    .map(missingItem);
+  return [...shown, ...missing];
 }

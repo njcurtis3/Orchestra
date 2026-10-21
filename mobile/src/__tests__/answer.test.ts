@@ -151,6 +151,22 @@ describe('listedItems', () => {
     expect(listedItems(inbox, {}).map((i) => i.id)).toEqual(['new', 'old']);
   });
 
+  it.each(['gone', 'answered', 'expired', 'failed', 'refused'])(
+    'lists a %s outcome whose item is not in the inbox, and drops it once dismissed',
+    (status) => {
+      const outbox: Outbox = { x: entry('x', status) };
+      const rows = listedItems([], outbox);
+      expect(rows.map((i) => i.id)).toEqual(['x']);
+      expect(rows[0].kind).toBe('permission');
+      expect(listedItems([], {})).toEqual([]);
+    },
+  );
+
+  it('lists a missing item after the pending ones, and not when its outcome is sent', () => {
+    const outbox: Outbox = { x: entry('x', 'gone'), y: entry('y', 'sent') };
+    expect(listedItems([item('p')], outbox).map((i) => i.id)).toEqual(['p', 'x']);
+  });
+
   it('keeps a not-sent outcome listed, drops sent', () => {
     const inbox = [item('a', { resolved: true }), item('b', { resolved: true })];
     const outbox: Outbox = { a: entry('a', 'answered'), b: entry('b', 'sent') };

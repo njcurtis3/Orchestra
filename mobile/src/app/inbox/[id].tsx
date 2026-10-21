@@ -55,10 +55,13 @@ export default function InboxItemScreen() {
     }
   }, [entry, blank, item, change]);
 
+  // A deep link opens this screen with nothing behind it: Back then goes home.
+  const goBack = () => (router.canGoBack() ? router.back() : router.replace('/'));
+
   const back = (
     <Touchable
       accessibilityLabel={copy.back}
-      onPress={() => router.back()}
+      onPress={goBack}
       style={[styles.back, { backgroundColor: theme.backgroundElement }]}>
       <ThemedText type="smallBold">{copy.back}</ThemedText>
     </Touchable>
@@ -88,7 +91,10 @@ export default function InboxItemScreen() {
   const questions = item.questions ?? [];
   let controls = null;
   if (pending && !link.canAnswer) {
-    controls = <ThemedText>{fill(copy.no_answer_scope, { host })}</ThemedText>;
+    // A refused answer's status line says the same; show it once.
+    if (entry?.status !== 'refused') {
+      controls = <ThemedText>{fill(copy.no_answer_scope, { host })}</ThemedText>;
+    }
   } else if (pending && item.kind === 'permission') {
     controls = (
       <AnswerPermission

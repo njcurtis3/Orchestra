@@ -44,7 +44,7 @@ export function AnswerQuestion({ questions, draft, disabled, onChange, onSend }:
                 {q.header}
               </ThemedText>
             ) : null}
-            <ThemedText type="smallBold" accessibilityRole={q.header ? undefined : 'header'}>
+            <ThemedText type="smallBold" accessibilityRole="header">
               {q.question}
             </ThemedText>
             {q.options.map((o) => {
