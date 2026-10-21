@@ -458,3 +458,42 @@ wire change: `v` stays 1 and the desktop is unaffected.
   implementations.
 - **Reopened if** a snow upgrade changes a transcript (regenerate, and the phone must still
   agree), or the framing or prologue changes (a wire change, so `v` moves).
+
+## What A2 decided
+
+The phone answers what needs you. This section records the host facts the phone relies on
+and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture changes.
+
+- **inbox-updated carries one session's inbox (G1, corrects earlier wording).** The payload
+  is every item of the one session whose inbox changed, never another session's
+  (`core/src/session/mod.rs`, `events_for`). A client replaces that session's items and keeps
+  every other session's. The snapshot carries every session's items.
+- **An empty payload changes nothing (G1).** It names no session, and the host never sends
+  one, since `inbox_rev` moves only when an item exists. A client that receives an empty
+  payload leaves its inbox as it is.
+- **Answer limits (G11).** An answer map holds at most 32 keys, and each key and each value
+  is at most 4096 bytes, else the host returns `failed` with "answers too large". A deny
+  message and a reply text are capped at 32768 bytes. Each client copies these limits and
+  checks them before it sends; the host stays the authority.
+- **Expired answers come back `failed` (G6, G7).** When a session is suspended, the host
+  marks every open permission or question item expired (`core/src/session/state.rs`), and
+  the saved state keeps that mark. Suspend happens when Orchestra shuts down, when a saved
+  session is loaded from disk, when an idle task session is retired, and on pause
+  (`core/src/session/mod.rs`). Answering an expired item returns `failed` with "this request
+  expired when Orchestra closed", not `already_answered`. `already_answered` means the item
+  is resolved or unknown. A client shows the two differently.
+- **Phone answer rules (G1 to G16 as approved).** The phone keeps its answer queue in
+  memory only, nothing is written to SecureStore. Each answer carries a client-generated
+  call id (non-empty, at most 128 bytes), so a resend is replayed by the host and applied
+  once. After a reconnect the phone reconciles against the snapshot: an item the snapshot
+  shows resolved or absent clears a sent answer, and an unsent one shows as answered,
+  expired or gone. An answer that was sent has no undo. A queued answer that the host
+  refuses stays visible with the refusal. A not-sent outcome (answered, expired, gone,
+  failed, refused) stays listed on home until the user dismisses it, even after the item
+  has left the inbox. Cancel is allowed on an answer that is queued, unconfirmed (sent, no
+  reply) or failed: it removes the entry from the phone and keeps the draft, so a late
+  result for that id matches nothing, and a fresh answer gets a new call id. Pairing a
+  host, Forget and a revoked pairing each empty the answer queue and clear the in-memory
+  drafts, so one host's entries never show under another's name.
+- **Reopened if** the host starts sending an empty `inbox-updated` for a reason, or a
+  client needs an answer to survive the app being closed (a persistent queue).

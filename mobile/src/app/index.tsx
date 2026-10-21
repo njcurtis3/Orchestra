@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { FlatList, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { InboxRow } from '@/components/inbox-row';
 import { LinkBanner, type BannerAction } from '@/components/link-banner';
 import { SessionRow } from '@/components/session-row';
 import { ThemedText } from '@/components/themed-text';
@@ -11,6 +12,7 @@ import { Touchable } from '@/components/touchable';
 import { copy, extra, fill, splitActions } from '@/constants/copy';
 import { MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { listedItems } from '@/inbox/answer';
 import { useLink } from '@/link/provider';
 
 // Ticks once a second while active, for the retry countdown.
@@ -54,6 +56,8 @@ export default function HomeScreen() {
     () => [...link.sessions].sort((a, b) => b.last_activity_at - a.last_activity_at),
     [link.sessions],
   );
+
+  const needYou = useMemo(() => listedItems(link.inbox, link.outbox), [link.inbox, link.outbox]);
 
   if (link.phase === 'loading') return <ThemedView style={styles.container} />;
 
@@ -125,6 +129,33 @@ export default function HomeScreen() {
         {notice ? <LinkBanner text={notice.text} actions={notice.actions} /> : null}
         <FlatList
           data={sessions}
+          ListHeaderComponent={
+            needYou.length > 0 || showEmpty ? (
+              <View style={styles.section}>
+                <ThemedText type="smallBold" accessibilityRole="header">
+                  {copy.inbox_title}
+                </ThemedText>
+                {needYou.length === 0 ? (
+                  <ThemedText themeColor="textSecondary">{copy.inbox_empty}</ThemedText>
+                ) : (
+                  needYou.map((item) => (
+                    <InboxRow
+                      key={item.id}
+                      item={item}
+                      project={
+                        link.sessions.find((x) => x.id === item.session_id)?.project_name ??
+                        extra.unknown_project
+                      }
+                      entry={link.outbox[item.id]}
+                      onPress={() =>
+                        router.push({ pathname: '/inbox/[id]', params: { id: item.id } })
+                      }
+                    />
+                  ))
+                )}
+              </View>
+            ) : null
+          }
           keyExtractor={(s) => s.id}
           renderItem={({ item }) => <SessionRow session={item} />}
           ItemSeparatorComponent={() => <View style={styles.gap} />}
@@ -164,6 +195,10 @@ const styles = StyleSheet.create({
   },
   gap: {
     height: Spacing.two,
+  },
+  section: {
+    gap: Spacing.two,
+    paddingBottom: Spacing.three,
   },
   primary: {
     borderRadius: Spacing.three,

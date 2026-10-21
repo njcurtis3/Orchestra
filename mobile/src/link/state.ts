@@ -79,7 +79,12 @@ export function reduce(data: LinkData, msg: HostMessage): Reduced {
             next.tasks = upsert(data.tasks, msg.payload);
             break;
           case 'inbox-updated':
-            next.inbox = msg.payload;
+            // One session's items: replace those sessions' items, keep every other session's.
+            // An empty payload names no session and changes nothing.
+            if (msg.payload.length > 0) {
+              const touched = new Set(msg.payload.map((i) => i.session_id));
+              next.inbox = [...data.inbox.filter((i) => !touched.has(i.session_id)), ...msg.payload];
+            }
             break;
           case 'transcript-appended':
             break;

@@ -184,6 +184,9 @@ export type Snapshot = {
 };
 export type HostEvent =
   | { v: 1; type: "event"; seq: number; name: "session-updated"; payload: SessionSummary }
+  // inbox-updated carries the whole inbox of one session: every item of that session, never another
+  // session's. A client replaces that session's items and keeps the rest. An empty payload names
+  // no session and changes nothing. See protocol/README.md, What A2 decided.
   | { v: 1; type: "event"; seq: number; name: "inbox-updated"; payload: InboxItem[] }
   | { v: 1; type: "event"; seq: number; name: "transcript-appended"; payload: TranscriptBatch }
   | { v: 1; type: "event"; seq: number; name: "task-updated"; payload: TaskSummary };

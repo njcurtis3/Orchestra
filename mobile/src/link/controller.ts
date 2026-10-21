@@ -1,13 +1,16 @@
 // Owns the one paired host (the most recently paired of listHosts): connect, keep alive, reconnect, and the
 // pairing flow. No React and no native modules; the app wires those in through Deps.
 // Keys are deleted only on `revoked` or on forget (G6). Nothing here logs.
-import type { HostMessage } from '../../../protocol/types';
+import type { Answer, HostMessage } from '../../../protocol/types';
 import { toHex } from './bytes';
 import { connect as realConnect } from './client';
 import type { ConnectOptions, LinkConnection, LinkFailure, LinkPhase, LinkMode } from './client';
 import { fingerprint, generateStaticKey } from './keys';
 import type { KeyPair, Random } from './keys';
 import type { PairingOffer } from './offer';
+import * as box from './outbox';
+import type { Outbox, OutboxAnswer, OutboxEntry } from './outbox';
+import { clearDrafts } from '../inbox/drafts';
 import { initialData, reduce } from './state';
 import type { LinkData } from './state';
 import type { HostRecord } from './store';
@@ -24,6 +27,8 @@ const IMMEDIATE_ONCE_MS = 60_000;
 export const LINK_REFUSED_LIMIT = 2;
 // A link must stay live this long before the backoff starts over.
 export const STABLE_LINK_MS = 30_000;
+// A call with no result this long, on a live link, may or may not have landed.
+export const CALL_RESULT_MS = 20_000;
 
 export type ControllerPhase =
   | 'loading'
@@ -42,6 +47,8 @@ export type ControllerState = {
   phase: ControllerPhase;
   host: HostSummary | null;
   data: LinkData;
+  // Answers the phone holds, by item id. In memory only.
+  outbox: Outbox;
   // The last failure; cleared when a connection is live.
   error: LinkFailure | null;
   // While pairing: connecting, then the desktop confirm wait.
@@ -95,6 +102,7 @@ export class LinkController {
     phase: 'loading',
     host: null,
     data: initialData,
+    outbox: {},
     error: null,
     pairStep: null,
     pairFingerprint: null,
@@ -123,6 +131,11 @@ export class LinkController {
   private lastImmediateAt = -Infinity;
   private attemptTimes: number[] = [];
   private unsubs: (() => void)[] = [];
+  // Item ids in the order their answers were queued; the flush is first in, first out.
+  private order: string[] = [];
+  // The connection on which a snapshot has been applied. Answers go out only on it.
+  private snapshotConn: LinkConnection | null = null;
+  private callTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly deps: Deps) {
     this.connectFn = deps.connect ?? realConnect;
@@ -191,7 +204,15 @@ export class LinkController {
     this.epoch++;
     this.stopLink();
     this.record = null;
-    this.set({ phase: 'unpaired', host: null, data: initialData, error: null, retryAt: null });
+    this.emptyOutbox();
+    this.set({
+      phase: 'unpaired',
+      host: null,
+      data: initialData,
+      outbox: {},
+      error: null,
+      retryAt: null,
+    });
     if (record) {
       try {
         await this.deps.store.forgetHost(record.host_id);
@@ -216,6 +237,9 @@ export class LinkController {
     this.epoch++;
     const epoch = this.epoch;
     this.stopLink();
+    // Entries from a previous host must not show under the new host's name.
+    this.emptyOutbox();
+    this.set({ outbox: {} });
     this.set({ phase: 'pairing', pairStep: 'connecting', pairFingerprint: null, error: null, retryAt: null });
     const finish = (failure: LinkFailure | { kind: 'StoreFailed' }): PairOutcome => {
       this.pairing = false;
@@ -317,10 +341,11 @@ export class LinkController {
   // ---- connecting ----
 
   private clearTimers(): void {
-    for (const t of [this.retryTimer, this.pingTimer, this.pongTimer, this.stableTimer]) {
+    for (const t of [this.retryTimer, this.pingTimer, this.pongTimer, this.stableTimer, this.callTimer]) {
       if (t !== null) clearTimeout(t);
     }
-    this.retryTimer = this.pingTimer = this.pongTimer = this.stableTimer = null;
+    this.retryTimer = this.pingTimer = this.pongTimer = this.stableTimer = this.callTimer = null;
+    this.linkDown();
   }
 
   // Close the socket and forget every timer; callbacks of the old socket are ignored.
@@ -406,12 +431,21 @@ export class LinkController {
   private onHost(msg: HostMessage): void {
     // Any message from the host is proof of life.
     this.clearPong();
+    // A result belongs to a call, not to the host's state: it is routed by id and never reduced.
+    if (msg.type === 'result') return this.onResult(msg);
     if (this.apply(msg)) {
       // A seq gap: v1 has no replay, so reconnect for a fresh snapshot.
       const conn = this.conn;
       this.conn = null;
       conn?.close();
       this.dropped({ kind: 'ProtocolError' });
+      return;
+    }
+    const inboxChanged = msg.type === 'event' && msg.name === 'inbox-updated';
+    if (msg.type === 'snapshot') this.snapshotConn = this.conn;
+    if (msg.type === 'snapshot' || inboxChanged) {
+      this.reconcileAll();
+      this.flush();
     }
   }
 
@@ -459,6 +493,7 @@ export class LinkController {
   private goLive(): void {
     this.refused = 0;
     this.set({ phase: 'live', error: null, retryAt: null });
+    this.flush();
     this.schedulePing();
     // Backoff starts over only for a link that stayed up; welcome-then-close keeps backing off.
     if (this.stableTimer !== null) clearTimeout(this.stableTimer);
@@ -485,7 +520,8 @@ export class LinkController {
         const record = this.record;
         this.epoch++;
         this.record = null;
-        this.set({ phase: 'unpaired', host: null, data: initialData, retryAt: null });
+        this.emptyOutbox();
+        this.set({ phase: 'unpaired', host: null, data: initialData, outbox: {}, retryAt: null });
         if (record) void this.deps.store.forgetHost(record.host_id).catch(() => undefined);
         return;
       }
@@ -527,6 +563,147 @@ export class LinkController {
       this.retryTimer = null;
       this.attempt();
     }, delay);
+  }
+
+  // ---- answers ----
+
+  // Queue an answer for an inbox item. It goes out once the link is live and a snapshot is applied.
+  answer(a: Answer): void {
+    if (this.disposed || (a.kind !== 'permission' && a.kind !== 'question')) return;
+    const held = this.state.outbox[a.item_id];
+    if (held && ['queued', 'sending', 'unconfirmed', 'failed'].includes(held.status)) return;
+    let entry: OutboxEntry;
+    try {
+      entry = box.enqueue(a, this.newCallId());
+    } catch {
+      entry = { ...box.enqueue(a, ''), status: 'failed', code: 'local', message: 'Could not make a request id.' };
+    }
+    if (!this.order.includes(a.item_id)) this.order.push(a.item_id);
+    this.setEntry(a.item_id, entry);
+    this.reconcileAll();
+    this.flush();
+  }
+
+  // Cancel an answer that has not gone out, has no reply, or failed. The draft stays in drafts.ts.
+  cancelAnswer(itemId: string): void {
+    this.update(itemId, box.cancel);
+  }
+
+  // Try again: the same id from unconfirmed, a new id from failed.
+  retryAnswer(itemId: string): void {
+    this.reconcileAll();
+    const e = this.state.outbox[itemId];
+    if (!e || (e.status !== 'unconfirmed' && e.status !== 'failed')) return;
+    let id = e.call_id;
+    if (e.status === 'failed') {
+      try {
+        id = this.newCallId();
+      } catch {
+        return;
+      }
+    }
+    this.setEntry(itemId, box.retry(e, id));
+    this.reconcileAll();
+    this.flush();
+  }
+
+  dismissAnswer(itemId: string): void {
+    this.update(itemId, box.dismiss);
+  }
+
+  private newCallId(): string {
+    return 'a-' + toHex(this.deps.random(16));
+  }
+
+  private setEntry(itemId: string, entry: OutboxEntry | null): void {
+    const next = { ...this.state.outbox };
+    if (entry) next[itemId] = entry;
+    else {
+      delete next[itemId];
+      this.order = this.order.filter((x) => x !== itemId);
+    }
+    this.set({ outbox: next });
+  }
+
+  private update(itemId: string, f: (e: OutboxEntry) => OutboxEntry | null): void {
+    const e = this.state.outbox[itemId];
+    if (!e) return;
+    const n = f(e);
+    if (n !== e) this.setEntry(itemId, n);
+  }
+
+  // Compare every entry with the held inbox; when nothing changes, nobody is notified.
+  private reconcileAll(): void {
+    const inbox = this.state.data.inbox;
+    let next: Outbox | null = null;
+    for (const id of this.order) {
+      const e = this.state.outbox[id];
+      if (!e) continue;
+      const r = box.reconcile(e, inbox);
+      if (r === e) continue;
+      next = next ?? { ...this.state.outbox };
+      if (r) next[id] = r;
+      else delete next[id];
+    }
+    if (!next) return;
+    const kept = next;
+    this.order = this.order.filter((id) => id in kept);
+    this.set({ outbox: kept });
+  }
+
+  // One answer call in flight, oldest first. Only on a live link whose snapshot is applied.
+  private flush(): void {
+    const conn = this.conn;
+    if (this.disposed || !conn || this.state.phase !== 'live' || this.snapshotConn !== conn) return;
+    const outbox = this.state.outbox;
+    if (this.order.some((id) => outbox[id]?.status === 'sending')) return;
+    const id = this.order.find((x) => outbox[x]?.status === 'queued');
+    if (id === undefined) return;
+    const e = box.sending(outbox[id]);
+    const args: OutboxAnswer = e.answer;
+    if (!conn.send({ v: 1, type: 'call', id: e.call_id, method: 'answer', args })) return;
+    this.setEntry(id, e);
+    const callId = e.call_id;
+    this.callTimer = setTimeout(() => {
+      this.callTimer = null;
+      if (this.state.outbox[id]?.call_id !== callId) return;
+      this.update(id, box.timedOut);
+      this.flush();
+    }, CALL_RESULT_MS);
+  }
+
+  private onResult(msg: Extract<HostMessage, { type: 'result' }>): void {
+    const id = this.order.find((x) => this.state.outbox[x]?.call_id === msg.id);
+    // An id this phone did not send, or no longer holds, is ignored.
+    if (id === undefined) return;
+    const e = this.state.outbox[id];
+    if (e.status === 'sending' && this.callTimer !== null) {
+      clearTimeout(this.callTimer);
+      this.callTimer = null;
+    }
+    const expired = this.state.data.inbox.some((i) => i.id === id && i.expired);
+    const next = 'error' in msg ? box.resultError(e, msg.error.code, msg.error.message, expired) : box.resultOk(e);
+    if (next !== e) this.setEntry(id, next);
+    this.reconcileAll();
+    this.flush();
+  }
+
+  // The link is gone: nothing is in flight, and a call with no result goes back to the queue.
+  private linkDown(): void {
+    this.snapshotConn = null;
+    const outbox = this.state.outbox;
+    if (!this.order.some((id) => outbox[id]?.status === 'sending')) return;
+    const next = { ...outbox };
+    for (const id of this.order) if (next[id]) next[id] = box.linkDropped(next[id]);
+    this.set({ outbox: next });
+  }
+
+  // Forget, revoke and a new pairing end the old one: held answers and typed drafts go with it (A2-G5).
+  private emptyOutbox(): void {
+    clearDrafts();
+    this.order = [];
+    if (this.callTimer !== null) clearTimeout(this.callTimer);
+    this.callTimer = null;
   }
 
   // ---- keepalive ----

@@ -1,3 +1,4 @@
+import { getDraft, setDraft, clearDrafts } from '../inbox/drafts';
 import { LinkController, backoffDelay } from '../link/controller';
 import type { Deps } from '../link/controller';
 import type { PairingOffer } from '../link/offer';
@@ -5,6 +6,7 @@ import type { HostRecord } from '../link/store';
 import {
   eventMsg,
   fakeHost,
+  inboxItem,
   loadVector,
   sessionOf,
   snapshotMsg,
@@ -687,6 +689,308 @@ describe('which stored host is loaded', () => {
     const t = setup(kk, [{}], { hosts: [at(ID_A, 7), at(ID_B, 7)] });
     await t.ctl.start();
     expect(t.ctl.getState().host?.host_id).toBe(ID_B);
+    t.ctl.dispose();
+  });
+});
+
+describe('answers', () => {
+  const kk = loadVector('kk');
+  const item = (id: string, over: Record<string, unknown> = {}) => ({ ...inboxItem(id), ...over });
+  const allow = (id: string) => ({ kind: 'permission' as const, item_id: id, decision: 'allow' as const });
+  const snap = (...inbox: unknown[]) => snapshotMsg(1, { inbox });
+  const live = (...inbox: unknown[]): Script => ({ live: [welcomeMsg(kk), snap(...inbox)] });
+  const ok = (id: string) => ({ v: 1, type: 'result', id, ok: null });
+  const err = (id: string, code: string, message = 'm') => ({ v: 1, type: 'result', id, error: { code, message } });
+
+  // The vector's key bytes for the handshake, counted bytes for call ids.
+  function randomWithIds(): Deps['random'] {
+    const keys = vectorRandom(kk, false);
+    let n = 0;
+    return (length) => {
+      if (length === 32) return keys(length);
+      n += 1;
+      return new Uint8Array(length).fill(n);
+    };
+  }
+
+  async function goLive(scripts: Script[]) {
+    const t = setup(kk, scripts, { hosts: [recordOf(kk)], random: randomWithIds() });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    return t;
+  }
+
+  const outbox = (t: { ctl: LinkController }) => t.ctl.getState().outbox;
+
+  it('queued offline, then sent once after the snapshot', async () => {
+    const t = await goLive([live(item('i1')), { live: [welcomeMsg(kk)] }]);
+    t.host.sockets[0].closeFromHost();
+    await tick(0);
+    t.ctl.answer(allow('i1'));
+    expect(outbox(t).i1.status).toBe('queued');
+    expect(t.host.sockets[0].calls).toEqual([]);
+    await tick(1_000);
+    // Live after welcome, but no snapshot yet: nothing goes out.
+    expect(t.ctl.getState().phase).toBe('live');
+    expect(t.host.sockets[1].calls).toEqual([]);
+    t.host.sockets[1].pushHost(snap(item('i1')));
+    await tick(0);
+    const calls = t.host.sockets[1].calls;
+    expect(calls.length).toBe(1);
+    expect(calls[0].method).toBe('answer');
+    expect(calls[0].args).toEqual(allow('i1'));
+    expect(calls[0].id).toMatch(/^a-[0-9a-f]{32}$/);
+    await tick(5_000);
+    expect(t.host.sockets[1].calls.length).toBe(1);
+    expect(outbox(t).i1.status).toBe('sending');
+    t.ctl.dispose();
+  });
+
+  it('a result routes to its entry by id, an unknown id is ignored', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    const before = outbox(t);
+    t.host.sockets[0].pushHost(ok('a-unknown'));
+    t.host.sockets[0].pushHost(err('a-other', 'failed'));
+    await tick(0);
+    expect(outbox(t)).toBe(before);
+    t.host.sockets[0].pushHost(ok(id));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('sent');
+    t.ctl.dispose();
+  });
+
+  it('a drop mid-call resends the SAME id after the next snapshot', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].closeFromHost();
+    await tick(0);
+    expect(outbox(t).i1).toMatchObject({ status: 'queued', call_id: id });
+    await tick(1_000);
+    expect(t.host.sockets[1].calls.map((c) => c.id)).toEqual([id]);
+    expect(outbox(t).i1).toMatchObject({ status: 'sending', attempt: 2 });
+    t.ctl.dispose();
+  });
+
+  it('failed on a resend goes unconfirmed, and Try again keeps the id', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].closeFromHost();
+    await tick(1_000);
+    t.host.sockets[1].pushHost(err(id, 'failed', 'whatever the host says'));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('unconfirmed');
+    t.ctl.retryAnswer('i1');
+    await tick(0);
+    expect(t.host.sockets[1].calls.map((c) => c.id)).toEqual([id, id]);
+    t.ctl.dispose();
+  });
+
+  it('Cancel frees an unconfirmed replayed failure, a late result is ignored, a new answer gets a new id', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].closeFromHost();
+    await tick(1_000);
+    t.host.sockets[1].pushHost(err(id, 'failed', 'replayed'));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('unconfirmed');
+    t.ctl.retryAnswer('i1');
+    await tick(0);
+    t.host.sockets[1].pushHost(err(id, 'failed', 'replayed'));
+    await tick(0);
+    expect(outbox(t).i1).toMatchObject({ status: 'unconfirmed', call_id: id });
+    t.ctl.answer(allow('i1'));
+    expect(outbox(t).i1.call_id).toBe(id);
+    t.ctl.cancelAnswer('i1');
+    expect(outbox(t)).toEqual({});
+    t.host.sockets[1].pushHost(ok(id));
+    await tick(0);
+    expect(outbox(t)).toEqual({});
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    expect(outbox(t).i1.call_id).not.toBe(id);
+    expect(outbox(t).i1.status).toBe('sending');
+    t.ctl.dispose();
+  });
+
+  it('pair empties the outbox', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    expect(outbox(t).i1).toBeDefined();
+    const pv = loadVector('ikpsk2');
+    void t.ctl.pair({
+      v: 1,
+      host_id: vectorHostId(pv),
+      host_name: 'Other desktop',
+      host_key: pv.host_static_public_hex,
+      secret: pv.psk_hex!,
+      addrs: [ADDR],
+      expires_at: Date.now() + 300_000,
+    });
+    expect(outbox(t)).toEqual({});
+    t.ctl.dispose();
+  });
+
+  it('a definitive failed keeps the answer and Try again uses a new id', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].pushHost(err(id, 'failed', 'disk'));
+    await tick(0);
+    expect(outbox(t).i1).toMatchObject({ status: 'failed', message: 'disk' });
+    t.ctl.retryAnswer('i1');
+    await tick(0);
+    const ids = t.host.sockets[0].calls.map((c) => c.id);
+    expect(ids.length).toBe(2);
+    expect(ids[1]).not.toBe(id);
+    t.ctl.dispose();
+  });
+
+  it('a queued answer whose item is resolved / expired / missing becomes answered / expired / gone and is never sent', async () => {
+    const t = await goLive([
+      live(item('i1'), item('i2'), item('i3')),
+      live(item('i1', { resolved: true }), item('i2', { resolved: true, expired: true })),
+    ]);
+    t.host.sockets[0].closeFromHost();
+    await tick(0);
+    for (const id of ['i1', 'i2', 'i3']) t.ctl.answer(allow(id));
+    await tick(1_000);
+    expect(outbox(t).i1.status).toBe('answered');
+    expect(outbox(t).i2.status).toBe('expired');
+    expect(outbox(t).i3.status).toBe('gone');
+    expect(t.host.sockets[1].calls).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('an expired failed never retries', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    t.host.sockets[0].pushHost(err(id, 'failed', 'this request expired when Orchestra closed'));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('failed');
+    t.host.sockets[0].pushHost(eventMsg(2, 'inbox-updated', [item('i1', { resolved: true, expired: true })]));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('expired');
+    t.ctl.retryAnswer('i1');
+    await tick(0);
+    expect(t.host.sockets[0].calls.length).toBe(1);
+    t.ctl.dispose();
+  });
+
+  it('an inbox-updated leaves a call in flight to its result', async () => {
+    const t = await goLive([live(item('i1'), item('i2'))]);
+    t.ctl.answer(allow('i1'));
+    t.ctl.answer(allow('i2'));
+    await tick(0);
+    t.host.sockets[0].pushHost(eventMsg(2, 'inbox-updated', [item('i1', { resolved: true }), item('i2')]));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('sending');
+    expect(outbox(t).i2.status).toBe('queued');
+    t.ctl.dispose();
+  });
+
+  it('20 s with no result goes unconfirmed, and a late result still lands', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    const id = t.host.sockets[0].calls[0].id;
+    await tick(19_999);
+    expect(outbox(t).i1.status).toBe('sending');
+    await tick(1);
+    expect(outbox(t).i1).toMatchObject({ status: 'unconfirmed', call_id: id });
+    t.host.sockets[0].pushHost(ok(id));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('sent');
+    t.ctl.dispose();
+  });
+
+  it('never two answer calls in flight', async () => {
+    const t = await goLive([live(item('i1'), item('i2'))]);
+    t.ctl.answer(allow('i1'));
+    t.ctl.answer(allow('i2'));
+    await tick(0);
+    const calls = t.host.sockets[0].calls;
+    expect(calls.length).toBe(1);
+    expect(calls[0].args.item_id).toBe('i1');
+    expect(outbox(t).i2.status).toBe('queued');
+    t.host.sockets[0].pushHost(ok(calls[0].id));
+    await tick(0);
+    expect(calls.map((c) => c.args.item_id)).toEqual(['i1', 'i2']);
+    t.ctl.dispose();
+  });
+
+  it('Forget empties the outbox', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    await t.ctl.forget();
+    expect(outbox(t)).toEqual({});
+    expect(t.ctl.getState().data.inbox).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('Forget and revoke clear the drafts', async () => {
+    const t = await goLive([live(item('i1'))]);
+    setDraft('i1', { message: 'secret', question: { picks: {}, other: {} } });
+    await t.ctl.forget();
+    expect(getDraft('i1').message).toBe('');
+    t.ctl.dispose();
+    const r = await goLive([live(item('i1'))]);
+    setDraft('i1', { message: 'secret', question: { picks: {}, other: {} } });
+    r.host.sockets[0].pushHost({ v: 1, type: 'error', code: 'revoked', message: 'revoked' });
+    await tick(0);
+    expect(getDraft('i1').message).toBe('');
+    r.ctl.dispose();
+    clearDrafts();
+  });
+
+  it('revoked empties the outbox', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer(allow('i1'));
+    await tick(0);
+    t.host.sockets[0].pushHost({ v: 1, type: 'error', code: 'revoked', message: 'revoked' });
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('unpaired');
+    expect(outbox(t)).toEqual({});
+    t.ctl.dispose();
+  });
+
+  it('cancel removes a queued answer only, dismiss clears one that is over', async () => {
+    const t = await goLive([live(item('i1'), item('i2'))]);
+    t.ctl.answer(allow('i1'));
+    t.ctl.answer(allow('i2'));
+    await tick(0);
+    t.ctl.cancelAnswer('i1');
+    expect(outbox(t).i1.status).toBe('sending');
+    t.ctl.cancelAnswer('i2');
+    expect(outbox(t).i2).toBeUndefined();
+    t.host.sockets[0].pushHost(err(t.host.sockets[0].calls[0].id, 'forbidden'));
+    await tick(0);
+    expect(outbox(t).i1.status).toBe('refused');
+    t.ctl.dismissAnswer('i1');
+    expect(outbox(t)).toEqual({});
+    t.ctl.dispose();
+  });
+
+  it('a reply is refused and queues nothing', async () => {
+    const t = await goLive([live(item('i1'))]);
+    t.ctl.answer({ kind: 'reply', session_id: 's1', text: 'hi' });
+    await tick(0);
+    expect(outbox(t)).toEqual({});
+    expect(t.host.sockets[0].calls).toEqual([]);
     t.ctl.dispose();
   });
 });

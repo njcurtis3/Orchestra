@@ -52,13 +52,23 @@ describe('reduce', () => {
     expect(r.data.inbox.map((i) => i.id)).toEqual(['i1']);
   });
 
-  it('inbox-updated replaces the whole list, it does not merge', () => {
+  it('two sessions with open items: an event for one keeps the other\'s', () => {
+    const inS2 = (id: string) => ({ ...inboxItem(id), session_id: 's2' });
     const d = apply(
-      apply(start(), eventMsg(6, 'inbox-updated', [inboxItem('a'), inboxItem('b')])).data,
-      eventMsg(7, 'inbox-updated', [inboxItem('c')]),
+      start(),
+      eventMsg(6, 'inbox-updated', [inboxItem('a'), inboxItem('b')]),
+      eventMsg(7, 'inbox-updated', [inS2('x')]),
+      eventMsg(8, 'inbox-updated', [inboxItem('c')]),
     ).data;
-    expect(d.inbox.map((i) => i.id)).toEqual(['c']);
-    expect(apply(d, eventMsg(8, 'inbox-updated', [])).data.inbox).toEqual([]);
+    expect(d.inbox.map((i) => i.id).sort()).toEqual(['c', 'x']);
+    expect(d.lastSeq).toBe(8);
+  });
+
+  it('an empty inbox-updated changes nothing', () => {
+    const before = apply(start(), eventMsg(6, 'inbox-updated', [inboxItem('a')])).data;
+    const after = apply(before, eventMsg(7, 'inbox-updated', [])).data;
+    expect(after.inbox).toEqual(before.inbox);
+    expect(after.lastSeq).toBe(7);
   });
 
   it('session-updated upserts one item and leaves the others', () => {

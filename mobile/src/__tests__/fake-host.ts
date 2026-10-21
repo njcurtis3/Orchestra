@@ -152,6 +152,8 @@ export class FakeSocket implements WebSocketLike {
   hello: unknown = null;
   helloMatchesVector: boolean | null = null;
   pings = 0;
+  // Every call the host read after the hello, as sent.
+  calls: { id: string; method: string; args: Record<string, unknown> }[] = [];
   private host: Transport | null = null;
   private binaries = 0;
 
@@ -244,9 +246,12 @@ export class FakeSocket implements WebSocketLike {
       if (this.script.textAfterHello !== undefined) this.pushText(this.script.textAfterHello);
       return;
     }
-    if ((JSON.parse(plain) as { type?: string }).type === 'ping') {
+    const read = JSON.parse(plain) as { type?: string; id: string; method: string; args: Record<string, unknown> };
+    if (read.type === 'ping') {
       this.pings += 1;
       if (!this.script.noPong) this.pushHost({ v: 1, type: 'pong' });
+    } else if (read.type === 'call') {
+      this.calls.push({ id: read.id, method: read.method, args: read.args });
     }
   }
 
