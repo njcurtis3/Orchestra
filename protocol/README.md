@@ -475,20 +475,25 @@ and the rules approved at the A2 gate. No wire change: `v` stays 1, no fixture c
   is at most 4096 bytes, else the host returns `failed` with "answers too large". A deny
   message and a reply text are capped at 32768 bytes. Each client copies these limits and
   checks them before it sends; the host stays the authority.
-- **Expired answers come back `failed` (G6, G7).** When a session is suspended, which
-  happens when Orchestra shuts down, the host marks every open permission or question item
-  expired (`core/src/session/state.rs`), and the saved state keeps that mark. Answering it
-  returns `failed` with "this request expired when Orchestra closed", not `already_answered`. `already_answered` means the item is resolved
-  or unknown. A client shows the two differently.
+- **Expired answers come back `failed` (G6, G7).** When a session is suspended, the host
+  marks every open permission or question item expired (`core/src/session/state.rs`), and
+  the saved state keeps that mark. Suspend happens when Orchestra shuts down, when a saved
+  session is loaded from disk, when an idle task session is retired, and on pause
+  (`core/src/session/mod.rs`). Answering an expired item returns `failed` with "this request
+  expired when Orchestra closed", not `already_answered`. `already_answered` means the item
+  is resolved or unknown. A client shows the two differently.
 - **Phone answer rules (G1 to G16 as approved).** The phone keeps its answer queue in
   memory only, nothing is written to SecureStore. Each answer carries a client-generated
   call id (non-empty, at most 128 bytes), so a resend is replayed by the host and applied
   once. After a reconnect the phone reconciles against the snapshot: an item the snapshot
-  shows resolved or absent clears a sent answer, and an unsent one shows as answered or gone. An answer that was sent has no undo.
-  A queued answer that the host refuses stays visible with the refusal. Cancel is allowed on
-  an answer that is queued or unconfirmed (sent, no reply): it removes the entry from the
-  phone and keeps the draft, so a late result for that id matches nothing, and a fresh
-  answer gets a new call id. Pairing a host empties the answer queue, so one host's
-  entries never show under another's name.
+  shows resolved or absent clears a sent answer, and an unsent one shows as answered,
+  expired or gone. An answer that was sent has no undo. A queued answer that the host
+  refuses stays visible with the refusal. A not-sent outcome (answered, expired, gone,
+  failed, refused) stays listed on home until the user dismisses it, even after the item
+  has left the inbox. Cancel is allowed on an answer that is queued, unconfirmed (sent, no
+  reply) or failed: it removes the entry from the phone and keeps the draft, so a late
+  result for that id matches nothing, and a fresh answer gets a new call id. Pairing a
+  host, Forget and a revoked pairing each empty the answer queue and clear the in-memory
+  drafts, so one host's entries never show under another's name.
 - **Reopened if** the host starts sending an empty `inbox-updated` for a reason, or a
   client needs an answer to survive the app being closed (a persistent queue).
