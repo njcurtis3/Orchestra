@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { FlatList, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { AlertsCard } from '@/components/alerts-card';
 import { InboxRow } from '@/components/inbox-row';
 import { LinkBanner, type BannerAction } from '@/components/link-banner';
 import { SessionRow } from '@/components/session-row';
@@ -156,6 +157,7 @@ export default function HomeScreen() {
               </View>
             ) : null
           }
+          ListFooterComponent={<AlertsCard />}
           keyExtractor={(s) => s.id}
           renderItem={({ item }) => <SessionRow session={item} />}
           ItemSeparatorComponent={() => <View style={styles.gap} />}

@@ -22,6 +22,8 @@ import type { PairingOffer } from './offer';
 import type { Outbox } from './outbox';
 import { random } from './random';
 import type { LinkData } from './state';
+import { notifier } from '../notify/notifier';
+import { setHandler } from '../notify/os';
 import { forgetHost, listHosts, saveHost } from './store';
 
 export type LinkContextValue = {
@@ -54,7 +56,8 @@ export type LinkContextValue = {
 const LinkContext = createContext<LinkContextValue | null>(null);
 
 function createController(): LinkController {
-  return new LinkController({
+  setHandler();
+  const controller: LinkController = new LinkController({
     store: { listHosts, saveHost, forgetHost },
     random,
     clientName: Device.deviceName || Device.modelName || 'Android phone',
@@ -70,7 +73,9 @@ function createController(): LinkController {
       });
       return () => sub.remove();
     },
+    onInbox: (e) => notifier.onInbox(e, controller.getState().data.sessions),
   });
+  return controller;
 }
 
 export function LinkProvider({ children }: { children: ReactNode }) {

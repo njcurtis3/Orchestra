@@ -1,10 +1,11 @@
 // Owns the one paired host (the most recently paired of listHosts): connect, keep alive, reconnect, and the
 // pairing flow. No React and no native modules; the app wires those in through Deps.
 // Keys are deleted only on `revoked` or on forget (G6). Nothing here logs.
-import type { Answer, HostMessage } from '../../../protocol/types';
+import type { Answer, HostMessage, InboxItem } from '../../../protocol/types';
 import { toHex } from './bytes';
 import { connect as realConnect } from './client';
 import type { ConnectOptions, LinkConnection, LinkFailure, LinkPhase, LinkMode } from './client';
+import { FreshTracker } from './fresh';
 import { fingerprint, generateStaticKey } from './keys';
 import type { KeyPair, Random } from './keys';
 import type { PairingOffer } from './offer';
@@ -84,6 +85,9 @@ export type Deps = {
   now?: () => number;
   // [0, 1); Math.random is fine for jitter, never for keys.
   jitter?: () => number;
+  // New pending items and notified ids that are gone. Optional; the controller knows nothing of how they are shown.
+  // reset: forget or revoke, every notification goes.
+  onInbox?: (e: { fresh: InboxItem[]; gone: string[]; reset?: boolean }) => void;
 };
 
 export function backoffDelay(index: number, jitter: number): number {
@@ -136,6 +140,7 @@ export class LinkController {
   // The connection on which a snapshot has been applied. Answers go out only on it.
   private snapshotConn: LinkConnection | null = null;
   private callTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly freshItems = new FreshTracker();
 
   constructor(private readonly deps: Deps) {
     this.connectFn = deps.connect ?? realConnect;
@@ -205,6 +210,7 @@ export class LinkController {
     this.stopLink();
     this.record = null;
     this.emptyOutbox();
+    this.resetFresh();
     this.set({
       phase: 'unpaired',
       host: null,
@@ -442,11 +448,27 @@ export class LinkController {
       return;
     }
     const inboxChanged = msg.type === 'event' && msg.name === 'inbox-updated';
-    if (msg.type === 'snapshot') this.snapshotConn = this.conn;
+    if (msg.type === 'snapshot') {
+      this.snapshotConn = this.conn;
+      // A snapshot only seeds the tracker: items present at connect or reconnect are never notified.
+      this.emitInbox(this.freshItems.seed(this.state.data.inbox));
+    } else if (inboxChanged && this.snapshotConn === this.conn) {
+      this.emitInbox(this.freshItems.update(this.state.data.inbox));
+    }
     if (msg.type === 'snapshot' || inboxChanged) {
       this.reconcileAll();
       this.flush();
     }
+  }
+
+  private emitInbox(e: { fresh: InboxItem[]; gone: string[] }): void {
+    if (e.fresh.length > 0 || e.gone.length > 0) this.deps.onInbox?.(e);
+  }
+
+  // Forget and revoke: the tracker empties and every notification is dismissed.
+  private resetFresh(): void {
+    const gone = this.freshItems.clear();
+    this.deps.onInbox?.({ fresh: [], gone, reset: true });
   }
 
   private attempt(): void {
@@ -521,6 +543,7 @@ export class LinkController {
         this.epoch++;
         this.record = null;
         this.emptyOutbox();
+        this.resetFresh();
         this.set({ phase: 'unpaired', host: null, data: initialData, outbox: {}, retryAt: null });
         if (record) void this.deps.store.forgetHost(record.host_id).catch(() => undefined);
         return;

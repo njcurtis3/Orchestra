@@ -42,6 +42,7 @@ function setup(
     jitter?: number;
     vectors?: Vectors;
     random?: Deps['random'];
+    onInbox?: Deps['onInbox'];
   } = {},
 ) {
   const host = fakeHost(o.vectors ?? v, ...scripts);
@@ -74,6 +75,7 @@ function setup(
       return () => undefined;
     },
     jitter: () => o.jitter ?? 0,
+    onInbox: o.onInbox,
   };
   const ctl = new LinkController(deps);
   return {
@@ -991,6 +993,96 @@ describe('answers', () => {
     await tick(0);
     expect(outbox(t)).toEqual({});
     expect(t.host.sockets[0].calls).toEqual([]);
+    t.ctl.dispose();
+  });
+});
+
+describe('fresh inbox items', () => {
+  const kk = loadVector('kk');
+  const item = (id: string, over: Record<string, unknown> = {}) => ({ ...inboxItem(id), ...over });
+  const live = (...inbox: unknown[]): Script => ({ live: [welcomeMsg(kk), snapshotMsg(1, { inbox })] });
+  type Ev = { fresh: { id: string }[]; gone: string[]; reset?: boolean };
+
+  async function start(scripts: Script[]) {
+    const events: Ev[] = [];
+    const t = setup(kk, scripts, { hosts: [recordOf(kk)], onInbox: (e) => events.push(e) });
+    await t.ctl.start();
+    await tick(0);
+    expect(t.ctl.getState().phase).toBe('live');
+    const freshIds = () => events.flatMap((e) => e.fresh.map((i) => i.id));
+    return { ...t, events, freshIds };
+  }
+
+  it('a snapshot with pending items notifies nothing', async () => {
+    const t = await start([live(item('i1'), item('i2'), item('i3', { kind: 'question' }))]);
+    expect(t.events).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('an inbox-updated adding one id gives exactly that item', async () => {
+    const t = await start([live(item('i1'))]);
+    t.host.sockets[0].pushHost(eventMsg(2, 'inbox-updated', [item('i1'), item('i2')]));
+    await tick(0);
+    expect(t.freshIds()).toEqual(['i2']);
+    t.host.sockets[0].pushHost(eventMsg(3, 'inbox-updated', [item('i1'), item('i2')]));
+    await tick(0);
+    expect(t.freshIds()).toEqual(['i2']);
+    t.ctl.dispose();
+  });
+
+  it('a reconnect snapshot after a drop gives nothing fresh', async () => {
+    const t = await start([live(item('i1')), live(item('i1'), item('i9'))]);
+    t.host.sockets[0].closeFromHost();
+    await tick(1_000);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.ctl.getState().data.inbox.map((i) => i.id)).toEqual(['i1', 'i9']);
+    expect(t.freshIds()).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('an inbox-updated before this connection snapshot gives nothing fresh', async () => {
+    const t = await start([
+      live(item('i1')),
+      { live: [welcomeMsg(kk), eventMsg(2, 'inbox-updated', [item('i1'), item('i5')]), snapshotMsg(1, { inbox: [item('i1')] })] },
+    ]);
+    t.host.sockets[0].closeFromHost();
+    await tick(1_000);
+    expect(t.host.sockets.length).toBe(2);
+    expect(t.freshIds()).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('resolved, expired, finished and error items are never fresh', async () => {
+    const t = await start([live(item('i1'))]);
+    t.host.sockets[0].pushHost(
+      eventMsg(2, 'inbox-updated', [
+        item('i1'),
+        item('r', { resolved: true }),
+        item('x', { expired: true }),
+        item('f', { kind: 'finished' }),
+        item('e', { kind: 'error' }),
+      ]),
+    );
+    await tick(0);
+    expect(t.freshIds()).toEqual([]);
+    t.ctl.dispose();
+  });
+
+  it('a notified item that is answered is reported gone', async () => {
+    const t = await start([live(item('i1'))]);
+    t.host.sockets[0].pushHost(eventMsg(2, 'inbox-updated', [item('i1'), item('i2')]));
+    t.host.sockets[0].pushHost(eventMsg(3, 'inbox-updated', [item('i1'), item('i2', { resolved: true })]));
+    await tick(0);
+    expect(t.events.map((e) => e.gone)).toEqual([[], ['i2']]);
+    t.ctl.dispose();
+  });
+
+  it('forget clears the tracker and asks for a reset', async () => {
+    const t = await start([live(item('i1')), live(item('i1'))]);
+    t.host.sockets[0].pushHost(eventMsg(2, 'inbox-updated', [item('i1'), item('i2')]));
+    await tick(0);
+    await t.ctl.forget();
+    expect(t.events[t.events.length - 1]).toEqual({ fresh: [], gone: ['i2'], reset: true });
     t.ctl.dispose();
   });
 });
