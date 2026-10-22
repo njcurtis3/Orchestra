@@ -16,7 +16,9 @@ export type NotifyPayload = {
 function body(summary: string): string {
   const s = summary.replace(/\s+/g, ' ').trim();
   if (!s) return BODY_FALLBACK;
-  return s.length > BODY_MAX ? s.slice(0, BODY_MAX - 1).trimEnd() + '…' : s;
+  const chars = Array.from(s);
+  // Cut on a code point, not a UTF-16 unit, so no lone surrogate is left before the ellipsis.
+  return chars.length > BODY_MAX ? chars.slice(0, BODY_MAX - 1).join('').trimEnd() + '…' : s;
 }
 
 export function buildPayload(item: InboxItem, projectName: string | null | undefined): NotifyPayload {

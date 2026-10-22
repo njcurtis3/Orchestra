@@ -37,6 +37,14 @@ describe('buildPayload', () => {
     expect(buildPayload(item({ summary: 'short' }), 'P').content.body).toBe('short');
   });
 
+  it('does not split a surrogate pair when cutting', () => {
+    const body = buildPayload(item({ summary: 'a'.repeat(98) + '\u{1F600}' + 'tail' }), 'P').content.body;
+    expect(body).toBe('a'.repeat(98) + '\u{1F600}' + '…');
+    expect(body).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    const long = buildPayload(item({ summary: 'a'.repeat(97) + '\u{1F600}' + 'tail' }), 'P').content.body;
+    expect(Array.from(long).length).toBe(BODY_MAX);
+  });
+
   it('falls back when the summary is empty', () => {
     expect(buildPayload(item({ summary: '   ' }), 'P').content.body).toBe(BODY_FALLBACK);
     expect(BODY_FALLBACK).toBe('Open Orchestra to answer.');

@@ -33,6 +33,8 @@ export async function request(): Promise<AlertStatus> {
 }
 
 export async function post(p: NotifyPayload): Promise<void> {
+  // The channel carries the lock-screen privacy; on Android 8-12 request() never runs, so ensure it here.
+  await ensureChannel();
   await Notifications.scheduleNotificationAsync({
     identifier: p.identifier,
     content: { title: p.content.title, body: p.content.body, data: p.content.data },

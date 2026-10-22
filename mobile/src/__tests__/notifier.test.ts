@@ -95,6 +95,19 @@ describe('os adapter', () => {
     );
   });
 
+  it('ensures the channel before it schedules a post', async () => {
+    const order: string[] = [];
+    (Notifications.setNotificationChannelAsync as jest.Mock).mockImplementationOnce(async () => {
+      order.push('channel');
+    });
+    (Notifications.scheduleNotificationAsync as jest.Mock).mockImplementationOnce(async () => {
+      order.push('schedule');
+      return 'id';
+    });
+    await os.post({ identifier: 'i1', content: { title: 't', body: 'b', data: { id: 'i1', kind: 'permission' } } });
+    expect(order).toEqual(['channel', 'schedule']);
+  });
+
   it('posts on the channel with only id and kind as data', async () => {
     await os.post({ identifier: 'i1', content: { title: 't', body: 'b', data: { id: 'i1', kind: 'permission' } } });
     expect(Notifications.scheduleNotificationAsync).toHaveBeenCalledWith({
