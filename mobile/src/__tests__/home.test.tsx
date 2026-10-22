@@ -3,6 +3,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import HomeScreen from '@/app/index';
 import { copy, extra, fill, splitActions } from '@/constants/copy';
+import * as os from '@/notify/os';
 import type { LinkContextValue } from '@/link/provider';
 
 const mockRouter = { push: jest.fn(), replace: jest.fn(), back: jest.fn() };
@@ -10,6 +11,11 @@ let mockLink: LinkContextValue;
 
 jest.mock('expo-router', () => ({ useRouter: () => mockRouter }));
 jest.mock('@/link/provider', () => ({ useLink: () => mockLink }));
+jest.mock('@/notify/os', () => ({
+  // Pending by default, so the card stays out of the other tests' button counts.
+  getStatus: jest.fn(() => new Promise(() => undefined)),
+  request: jest.fn(),
+}));
 
 const metrics = {
   frame: { x: 0, y: 0, width: 360, height: 800 },
@@ -116,6 +122,19 @@ describe('HomeScreen connected', () => {
   it('shows the empty state when live with no sessions', async () => {
     await show();
     expect(screen.getByText(text(copy.no_sessions))).toBeTruthy();
+  });
+});
+
+describe('HomeScreen alerts card', () => {
+  it('shows at the bottom when paired, and not when unpaired', async () => {
+    (os.getStatus as jest.Mock).mockResolvedValueOnce({ status: 'undetermined', canAskAgain: true });
+    await show();
+    expect(await screen.findByText(copy.alerts_title)).toBeTruthy();
+  });
+
+  it('is absent when not paired', async () => {
+    await show({ phase: 'unpaired', host: null, scopes: [] });
+    expect(screen.queryByText(copy.alerts_title)).toBeNull();
   });
 });
 

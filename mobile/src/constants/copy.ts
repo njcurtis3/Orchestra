@@ -73,6 +73,17 @@ export const copy = {
   too_many_questions: 'This question has more parts than Orchestra can send.',
   no_questions:
     'This question has nothing to choose from. It stays open until the session ends.',
+  alerts_title: 'Get alerts when an agent needs you',
+  alerts_body:
+    'Orchestra can alert you when an agent asks for permission or has a question. Alerts only arrive while Orchestra is open or was used recently, and only while this phone is on the same network as your desktop, or on Tailscale. If the app is closed or the phone has been asleep for a while, no alert arrives.',
+  alerts_button: 'Turn on alerts',
+  alerts_not_now: 'Not now',
+  alerts_denied_retry:
+    'Alerts are off. You can still see what needs you when Orchestra is open. [Try again]',
+  alerts_denied_settings:
+    'Alerts are off. To get them, allow notifications for Orchestra in Settings. [Open settings]',
+  alerts_on:
+    "Alerts are on. They arrive only while Orchestra is open or recently used, on your desktop's network. [Notification settings]",
 } as const;
 
 // Wording the approved copy does not cover: the home header, and what to call an unnamed host.

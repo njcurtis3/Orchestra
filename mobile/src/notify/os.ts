@@ -12,6 +12,7 @@ export async function ensureChannel(): Promise<void> {
     name: 'Needs you',
     description: 'An agent is asking for permission or has a question.',
     importance: Notifications.AndroidImportance.HIGH,
+    showBadge: false,
     // A secure lock screen shows only the app name, not the contents.
     lockscreenVisibility: Notifications.AndroidNotificationVisibility.PRIVATE,
   });
@@ -48,6 +49,22 @@ export async function dismiss(id: string): Promise<void> {
 
 export async function dismissAll(): Promise<void> {
   await Notifications.dismissAllNotificationsAsync();
+}
+
+// A tap while the app runs. Returns the unsubscribe.
+export function onTap(cb: (data: unknown) => void): () => void {
+  const sub = Notifications.addNotificationResponseReceivedListener((r) =>
+    cb(r.notification.request.content.data),
+  );
+  return () => sub.remove();
+}
+
+// The tap that launched the app, if any. Cleared so it is handled once.
+export async function takeLaunchTap(): Promise<{ data: unknown } | null> {
+  const r = await Notifications.getLastNotificationResponseAsync();
+  if (!r) return null;
+  await Notifications.clearLastNotificationResponseAsync();
+  return { data: r.notification.request.content.data };
 }
 
 // Banner and list shown, sound on, no badge.
