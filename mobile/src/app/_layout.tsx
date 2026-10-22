@@ -5,8 +5,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { LinkProvider } from '@/link/provider';
 import { notifier } from '@/notify/notifier';
-import { onTap, takeLaunchTap } from '@/notify/os';
-import { parseTap } from '@/notify/payload';
+import { onTap, takeLaunchTap, tapRoute } from '@/notify/os';
 
 // Taps and route changes. A bad payload goes home; a gone item shows the item screen's gone state.
 function NotifyBridge() {
@@ -19,22 +18,13 @@ function NotifyBridge() {
 
   useEffect(() => {
     const open = (data: unknown) => {
-      const id = parseTap(data);
-      if (id) router.push({ pathname: '/inbox/[id]', params: { id } });
+      const route = tapRoute(data);
+      if (route) router.push(route);
       else router.replace('/');
     };
-    let live = true;
-    takeLaunchTap().then(
-      (tap) => {
-        if (live && tap) open(tap.data);
-      },
-      () => undefined,
-    );
-    const off = onTap(open);
-    return () => {
-      live = false;
-      off();
-    };
+    const launch = takeLaunchTap();
+    if (launch) open(launch.data);
+    return onTap(open);
   }, [router]);
 
   return null;

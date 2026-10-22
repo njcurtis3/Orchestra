@@ -1,7 +1,7 @@
 // The one file that imports expo-notifications. In memory only: nothing is written to disk or logged.
 import * as Notifications from 'expo-notifications';
 
-import type { NotifyPayload } from './payload';
+import { parseTap, type NotifyPayload } from './payload';
 
 export const CHANNEL_ID = 'needs-you';
 
@@ -51,20 +51,28 @@ export async function dismissAll(): Promise<void> {
   await Notifications.dismissAllNotificationsAsync();
 }
 
-// A tap while the app runs. Returns the unsubscribe.
+// A tap while the app runs. Returns the unsubscribe. Android keeps every response as the last one,
+// so it is cleared first: a remounted root must not replay it as a cold start.
 export function onTap(cb: (data: unknown) => void): () => void {
-  const sub = Notifications.addNotificationResponseReceivedListener((r) =>
-    cb(r.notification.request.content.data),
-  );
+  const sub = Notifications.addNotificationResponseReceivedListener((r) => {
+    Notifications.clearLastNotificationResponse();
+    cb(r.notification.request.content.data);
+  });
   return () => sub.remove();
 }
 
 // The tap that launched the app, if any. Cleared so it is handled once.
-export async function takeLaunchTap(): Promise<{ data: unknown } | null> {
-  const r = await Notifications.getLastNotificationResponseAsync();
+export function takeLaunchTap(): { data: unknown } | null {
+  const r = Notifications.getLastNotificationResponse();
   if (!r) return null;
-  await Notifications.clearLastNotificationResponseAsync();
+  Notifications.clearLastNotificationResponse();
   return { data: r.notification.request.content.data };
+}
+
+// Where a tap goes: a valid id opens that item (a gone one shows the gone screen), anything else goes home.
+export function tapRoute(data: unknown): { pathname: '/inbox/[id]'; params: { id: string } } | null {
+  const id = parseTap(data);
+  return id ? { pathname: '/inbox/[id]', params: { id } } : null;
 }
 
 // Banner and list shown, sound on, no badge.

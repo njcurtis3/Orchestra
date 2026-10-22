@@ -10,8 +10,10 @@ jest.mock('expo-notifications', () => ({
   AndroidNotificationVisibility: { PRIVATE: 2 },
   setNotificationChannelAsync: jest.fn(async () => null),
   addNotificationResponseReceivedListener: jest.fn(() => ({ remove: (...a: unknown[]) => mockRemove(...a) })),
-  getLastNotificationResponseAsync: jest.fn(async () => mockLast),
-  clearLastNotificationResponseAsync: jest.fn(async () => undefined),
+  getLastNotificationResponse: jest.fn(() => mockLast),
+  clearLastNotificationResponse: jest.fn(() => {
+    mockLast = null;
+  }),
 }));
 
 const response = (data: unknown) => ({ notification: { request: { content: { data } } } });
@@ -40,11 +42,30 @@ describe('os adapter', () => {
     expect(mockRemove).toHaveBeenCalled();
   });
 
-  it('takeLaunchTap returns the data and clears it, or null with no tap', async () => {
-    expect(await os.takeLaunchTap()).toBeNull();
-    expect(Notifications.clearLastNotificationResponseAsync).not.toHaveBeenCalled();
+  it('a warm tap is cleared, so a remounted root does not replay it', () => {
+    const cb = jest.fn();
+    os.onTap(cb);
+    const listener = (Notifications.addNotificationResponseReceivedListener as jest.Mock).mock.calls[0][0];
+    mockLast = response({ id: 'i1' });
+    listener(mockLast);
+    expect(Notifications.clearLastNotificationResponse).toHaveBeenCalled();
+    expect(os.takeLaunchTap()).toBeNull();
+  });
+
+  it('takeLaunchTap returns the data and clears it, or null with no tap', () => {
+    expect(os.takeLaunchTap()).toBeNull();
+    expect(Notifications.clearLastNotificationResponse).not.toHaveBeenCalled();
     mockLast = response({ id: 'i2' });
-    expect(await os.takeLaunchTap()).toEqual({ data: { id: 'i2' } });
-    expect(Notifications.clearLastNotificationResponseAsync).toHaveBeenCalled();
+    expect(os.takeLaunchTap()).toEqual({ data: { id: 'i2' } });
+    expect(Notifications.clearLastNotificationResponse).toHaveBeenCalled();
+    expect(os.takeLaunchTap()).toBeNull();
+  });
+
+  it('tapRoute opens a valid id and sends bad data home', () => {
+    expect(os.tapRoute({ id: 'i3', kind: 'question' })).toEqual({ pathname: '/inbox/[id]', params: { id: 'i3' } });
+    expect(os.tapRoute({ id: '' })).toBeNull();
+    expect(os.tapRoute({ id: 5 })).toBeNull();
+    expect(os.tapRoute(null)).toBeNull();
+    expect(os.tapRoute({ id: 'x'.repeat(129) })).toBeNull();
   });
 });
