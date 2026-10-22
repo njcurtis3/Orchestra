@@ -19,6 +19,7 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.telosrg.orchestra",
+      "permissions": ["android.permission.POST_NOTIFICATIONS"],
       "blockedPermissions": ["android.permission.RECORD_AUDIO"]
     },
     "web": {
@@ -36,6 +37,13 @@
         }
       ],
       "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/android-icon-monochrome.png",
+          "color": "#208AEF"
+        }
+      ],
       [
         "expo-camera",
         {
