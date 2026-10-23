@@ -68,6 +68,12 @@
     },
     "runtimeVersion": {
       "policy": "fingerprint"
+    },
+    "owner": "njcurtis3",
+    "extra": {
+      "eas": {
+        "projectId": "6337eede-6f1a-4a2b-85b8-8aec6edcdef9"
+      }
     }
   }
 }
