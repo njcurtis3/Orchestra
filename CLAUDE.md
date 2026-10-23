@@ -159,7 +159,9 @@ and allowed to drift.
 - **Cleartext is allowed app-wide** (`expo-build-properties`, `android.usesCleartextTraffic`),
   because the link is `ws://` to a LAN or Tailscale IP and Android 9+ blocks that by default.
   The Noise channel carries the security, not the transport; the app opens no other
-  connection, so no `http://` or `https://` URL belongs in `src`. The camera plugin declares
+  connection, so no `http://` or `https://` URL belongs in `src`. Release and production
+  builds carry cleartext too, a decided trade-off (R2) for a LAN/Tailscale-only app: an Android
+  network security config can list domains but not IP ranges, so it cannot narrow this. The camera plugin declares
   no microphone, and `RECORD_AUDIO` is also in `expo.android.blockedPermissions` (the
   merged manifest carries it as `tools:node="remove"`, so no library can add it back).
 - **`src/link/` is the phone link**: pairing offer parsing (`offer.ts`), per-host key storage
