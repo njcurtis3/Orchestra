@@ -18,6 +18,9 @@ pub struct ProjectEntry {
     /// The folder was gone when the state was loaded. It stays in the store, hidden and
     /// unusable, until the user picks it again.
     missing: bool,
+    /// Taken out of service by the host (`retain`): unlike `missing` it also bars the
+    /// project's task sessions and tasks, and it is not cleared by the folder existing.
+    hidden: bool,
 }
 
 /// A project as written to the state file.
@@ -44,6 +47,7 @@ impl Projects {
         }
         if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
             e.missing = false;
+            e.hidden = false;
             return Ok(e.project.clone());
         }
         let name = path
@@ -53,31 +57,41 @@ impl Projects {
             .unwrap_or_else(|| "project".to_string());
         self.next += 1;
         let project = Project { id: format!("p{}", self.next), name };
-        self.entries.push(ProjectEntry { project: project.clone(), path: path.to_path_buf(), missing: false });
+        self.entries.push(ProjectEntry { project: project.clone(), path: path.to_path_buf(), missing: false, hidden: false });
         Ok(project)
     }
 
-    /// Hide every project whose folder is not in `allowed`, as if its folder were gone: it
-    /// leaves `list` and `get`, so nothing new can start there, and stays in the store with
-    /// its id, so adding the folder again brings it back. Nothing is deleted. Returns how
-    /// many were newly hidden. For a host whose project set comes from a config file.
+    /// Take every project whose folder is not in `allowed` out of service (`hidden`): it
+    /// leaves `list` and `get`, and `is_hidden` lets the session manager refuse its task
+    /// sessions and tasks too. It stays in the store with its id, so adding the folder again
+    /// brings it back. Nothing is deleted. Returns how many were newly hidden. For a host
+    /// whose project set comes from a config file.
     pub fn retain(&mut self, allowed: &[PathBuf]) -> usize {
         let mut hidden = 0;
-        for e in self.entries.iter_mut().filter(|e| !e.missing && !allowed.contains(&e.path)) {
-            e.missing = true;
-            hidden += 1;
+        for e in self.entries.iter_mut() {
+            let out = !allowed.contains(&e.path);
+            hidden += usize::from(out && !e.hidden);
+            e.hidden = out;
         }
         hidden
     }
 
+    pub fn hidden_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.hidden).count()
+    }
+
+    pub fn is_hidden(&self, id: &str) -> bool {
+        self.entries.iter().any(|e| e.project.id == id && e.hidden)
+    }
+
     /// Usable projects only.
     pub fn list(&self) -> Vec<Project> {
-        self.entries.iter().filter(|e| !e.missing).map(|e| e.project.clone()).collect()
+        self.entries.iter().filter(|e| !e.missing && !e.hidden).map(|e| e.project.clone()).collect()
     }
 
     /// A usable project; a missing folder is `None`.
     pub fn get(&self, id: &str) -> Option<&ProjectEntry> {
-        self.entries.iter().find(|e| e.project.id == id && !e.missing)
+        self.entries.iter().find(|e| e.project.id == id && !e.missing && !e.hidden)
     }
 
     pub fn to_stored(&self) -> Vec<StoredProject> {
@@ -101,7 +115,7 @@ impl Projects {
                     next = next.max(n);
                 }
                 let missing = !p.path.is_dir();
-                ProjectEntry { project: Project { id: p.id, name: p.name }, path: p.path, missing }
+                ProjectEntry { project: Project { id: p.id, name: p.name }, path: p.path, missing, hidden: false }
             })
             .collect();
         Self { entries, next }

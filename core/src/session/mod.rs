@@ -241,6 +241,10 @@ impl Inner {
     /// session, the task's worktree for a task session. Checked with `is_dir` each time, so
     /// a folder that vanished is a refusal here and not a spawn failure.
     fn cwd_of(&self, session: &Session) -> Result<PathBuf, CwdError> {
+        // Before the worktree is looked at: a hidden project's task sessions may not run.
+        if self.projects.is_hidden(&session.project_id) {
+            return Err(CwdError::Hidden);
+        }
         let dir = match &session.task_id {
             Some(tid) => {
                 let task = self.tasks.iter().find(|t| &t.id == tid).ok_or(CwdError::Worktree)?;
@@ -441,10 +445,15 @@ fn remove_branch(repo: &Path, branch: Option<&str>, outcome: Outcome) -> bool {
     }
 }
 
+/// Said when work is asked of a project the host has taken out of service. No path.
+const HIDDEN_PROJECT: &str = "this project is not available on this host";
+
 /// Why a session has no working folder to spawn in.
 enum CwdError {
     Project,
     Worktree,
+    /// The host took the project out of service (`Sessions::retain_projects`).
+    Hidden,
 }
 
 impl CwdError {
@@ -452,6 +461,7 @@ impl CwdError {
         match self {
             CwdError::Project => "the project folder no longer exists",
             CwdError::Worktree => "the task worktree no longer exists",
+            CwdError::Hidden => HIDDEN_PROJECT,
         }
     }
 }
@@ -716,14 +726,22 @@ impl Sessions {
         Ok(project)
     }
 
-    /// Keep only the projects whose folders are in `allowed`; the rest are hidden, not
-    /// deleted (see `Projects::retain`). A hidden project's existing sessions and tasks stay
-    /// in the state file with their worktrees: they cannot be resumed or landed until the
-    /// folder is allowed again, exactly as when a project folder has gone. Only a host whose
-    /// projects come from a config calls this; the desktop never does. The hidden flag is not
-    /// persisted, so the host calls this on every start. Returns how many were hidden.
+    /// Keep only the projects whose folders are in `allowed`; the rest are taken out of
+    /// service, not deleted (see `Projects::retain`). Everything that would run an agent for a
+    /// hidden project is refused with one message and no path: a new session or task, a
+    /// reply that would resume a session (plain or task), a queued task's start (it stays
+    /// queued), and land, review, discard and cleanup retry (a pending cleanup stays pending
+    /// and its worktree is never touched). Running agents are not stopped by this; call it
+    /// before any run starts (`host::open_host` does). Existing sessions, tasks, worktrees
+    /// and `state.json` entries are left as they are. The flag is not persisted, so a host
+    /// calls this on every start; the desktop never does. Returns how many were newly hidden.
     pub fn retain_projects(&self, allowed: &[PathBuf]) -> usize {
         self.lock().projects.retain(allowed)
+    }
+
+    /// How many projects `retain_projects` has taken out of service.
+    pub fn hidden_project_count(&self) -> usize {
+        self.lock().projects.hidden_count()
     }
 
     pub fn list_projects(&self) -> Vec<Project> {
@@ -821,6 +839,9 @@ impl Sessions {
     ) -> Result<(TaskCtx, Busy<'_>), String> {
         let mut inner = self.lock();
         let project_id = inner.tasks.iter().find(|t| t.id == task_id).ok_or("unknown task")?.project_id.clone();
+        if inner.projects.is_hidden(&project_id) {
+            return Err(HIDDEN_PROJECT.into());
+        }
         let repo = inner.projects.get(&project_id).map(|e| e.path.clone());
         let t = inner.tasks.iter_mut().find(|t| t.id == task_id).ok_or("unknown task")?;
         if t.busy || t.starting {
@@ -1143,7 +1164,10 @@ impl Sessions {
             if inner.shutting_down || inner.active_tasks() >= MAX_RUNNING_TASKS {
                 return None;
             }
-            let idx = inner.tasks.iter().position(|t| t.status == TaskStatus::Queued && !t.starting && !t.busy)?;
+            // A hidden project's queued task waits: it neither starts nor fails.
+            let idx = inner.tasks.iter().position(|t| {
+                t.status == TaskStatus::Queued && !t.starting && !t.busy && !inner.projects.is_hidden(&t.project_id)
+            })?;
             let project_id = inner.tasks[idx].project_id.clone();
             let Some(repo) = inner.projects.get(&project_id).map(|e| e.path.clone()) else {
                 let t = &mut inner.tasks[idx];
@@ -1506,7 +1530,7 @@ impl Sessions {
             }
             // The task keeps its state: the worktree is the only place this conversation
             // may continue, and it is never resumed anywhere else.
-            Err(CwdError::Worktree) => return Err(CwdError::Worktree.message().into()),
+            Err(e @ (CwdError::Worktree | CwdError::Hidden)) => return Err(e.message().into()),
         };
         if is_task && inner.task_of_session(session_id).is_some_and(|t| t.busy) {
             return Err(BUSY_TASK.into());
@@ -1822,12 +1846,69 @@ mod tests {
         let (r, p) = rig();
         r.sessions.start(&p.id, "first", SessionSettings::default()).unwrap();
         assert_eq!(r.sessions.retain_projects(&[]), 1);
+        assert_eq!(r.sessions.hidden_project_count(), 1);
         assert!(r.sessions.list_projects().is_empty());
         assert_eq!(r.sessions.start(&p.id, "again", SessionSettings::default()).unwrap_err(), "unknown project");
         assert!(r.sessions.create_task(&p.id, "work", SessionSettings::default()).is_err(), "no new task there");
         assert_eq!(r.sessions.list_sessions().len(), 1, "the session record stays");
         assert_eq!(r.sessions.add_project(&std::env::temp_dir()).unwrap().id, p.id);
         assert_eq!(r.sessions.list_projects().len(), 1);
+        assert_eq!(r.sessions.hidden_project_count(), 0);
+    }
+
+    #[test]
+    fn a_follow_up_to_a_hidden_projects_task_session_is_refused() {
+        let (r, p, repo) = rig_repo("hiddenreply");
+        let sid = done_task(&r, &p);
+        // The rig's own temp-dir project and the repo: both go.
+        assert_eq!(r.sessions.retain_projects(&[]), 2);
+        assert_eq!(r.sessions.hidden_project_count(), 2);
+        let err = r.sessions.reply(&sid, "and then?").unwrap_err();
+        assert_eq!(err, HIDDEN_PROJECT);
+        assert!(!err.contains(repo.to_str().unwrap()), "no path in the refusal");
+        assert_eq!(r.spawns.lock().unwrap().len(), 1, "nothing was resumed");
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Done);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended, "and the session is intact");
+        // Review, land, discard and cleanup retry are refused the same way, touching nothing.
+        for result in [
+            r.sessions.get_task_diff("t1").map(|_| ()),
+            r.sessions.land_task("t1").map(|_| ()),
+            r.sessions.discard_task("t1").map(|_| ()),
+            r.sessions.retry_cleanup("t1").map(|_| ()),
+        ] {
+            assert_eq!(result.unwrap_err(), HIDDEN_PROJECT);
+        }
+        assert!(r.base.join(&p.id).join("t1").is_dir(), "the worktree is left alone");
+        // Listing the folder again lifts all of it.
+        r.sessions.add_project(&repo).unwrap();
+        r.sessions.reply(&sid, "and then?").unwrap();
+        assert_eq!(r.spawns.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_reply_to_a_hidden_plain_session_is_refused_and_leaves_it_resumable() {
+        let (r, p) = rig();
+        let s = r.sessions.start(&p.id, "first", SessionSettings::default()).unwrap();
+        r.feed(INIT_UUID);
+        r.feed(DONE);
+        r.sessions.shutdown();
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended);
+        r.sessions.retain_projects(&[]);
+        assert_eq!(r.sessions.reply(&s.id, "more").unwrap_err(), HIDDEN_PROJECT);
+        assert_eq!(r.sessions.list_sessions()[0].status, SessionStatus::Suspended, "not ended for good");
+    }
+
+    #[test]
+    fn a_hidden_projects_queued_task_waits_and_neither_starts_nor_fails() {
+        let (r, _) = rig();
+        let dir = scratch("hiddenqueue");
+        restore_tasks(&r, &dir, vec![], vec![stored_task("t1", "queued", None, None)]);
+        r.sessions.retain_projects(&[]);
+        r.sessions.pump();
+        assert_eq!(task_status(&r, "t1"), TaskStatus::Queued);
+        assert!(r.spawns.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     impl Rig {

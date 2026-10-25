@@ -60,6 +60,8 @@ pub fn run() {
                         .body(notify::body(project, notice.kind))
                         .show();
                 }),
+                // The desktop serves every project the user picked.
+                None,
             );
             // The phone link: its files sit beside the app's, and it is off unless the saved
             // settings say otherwise. Starting it waits on sockets, so it runs off this thread.

@@ -637,6 +637,9 @@ mod linux {
             log::error(problem);
         }
 
+        // open_host restores every project ever saved, so the config's verdict goes in with
+        // it: the rest are hidden (not deleted) before any background work can start there.
+        let (mut configured, accepted) = vet_projects(&config, euid);
         let (sessions, storage) = open_host(
             Some(&state_dir),
             // Link subscribers get events from Sessions directly; nobody else listens.
@@ -645,14 +648,12 @@ mod linux {
             Box::new(|project, notice| {
                 log::info(&log::clean(&notify::body(project, notice.kind)));
             }),
+            Some(&accepted),
         );
         if !storage.ok {
             log::error(&format!("state is not being saved ({})", storage.reason.unwrap_or("unknown")));
         }
-        // open_host restored every project ever saved. Serve exactly the config's accepted
-        // ones: the rest are hidden (not deleted), then the accepted ones are added.
-        let (mut configured, accepted) = vet_projects(&config, euid);
-        let hidden = sessions.retain_projects(&accepted);
+        let hidden = sessions.hidden_project_count();
         if hidden > 0 {
             log::warn(&format!("{hidden} saved project(s) are not in the config and are hidden"));
         }
