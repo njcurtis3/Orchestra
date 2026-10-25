@@ -2557,6 +2557,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestrad"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "orchestra-core",
+ "qrcode",
+ "serde",
+ "serde_json",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "ordered-stream"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -13,9 +13,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use orchestra_core::link::addr::{DEFAULT_PORT, Kind, classify, port_error};
+
 pub const SCHEMA: u64 = 1;
-pub const DEFAULT_PORT: u16 = 47800;
-pub const MIN_PORT: u32 = 1024;
 const FILE: &str = "config.json";
 const MAX_BINDS: usize = 16;
 
@@ -95,38 +95,12 @@ pub fn save(dir: &Path, settings: &Settings) -> io::Result<()> {
 
 // ---- addresses ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Loopback,
-    Lan,
-    Tailscale,
-    Other,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Interface {
     pub ip: String,
     pub kind: Kind,
     /// The adapter's name, or "This computer only" for loopback.
     pub name: String,
-}
-
-/// Which kind of address this is, or `None` when it must never be offered: the unspecified
-/// address, link-local, multicast, broadcast, and any loopback other than 127.0.0.1.
-pub fn classify(ip: Ipv4Addr) -> Option<Kind> {
-    if ip == Ipv4Addr::LOCALHOST {
-        return Some(Kind::Loopback);
-    }
-    if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() {
-        return None;
-    }
-    let o = ip.octets();
-    // 100.64.0.0/10 is the carrier-grade NAT range Tailscale hands out.
-    if o[0] == 100 && (o[1] & 0b1100_0000) == 64 {
-        return Some(Kind::Tailscale);
-    }
-    if ip.is_private() { Some(Kind::Lan) } else { Some(Kind::Other) }
 }
 
 /// 127.0.0.1 first, then the usable IPv4 addresses of `adapters` (name, address), each once.
@@ -182,16 +156,6 @@ pub fn socket_addrs(ips: &[Ipv4Addr], port: u16) -> Vec<SocketAddr> {
 }
 
 // ---- a change asked for by the UI ----
-
-/// Why `port` may not be used, or `None` when it is in 1024..=65535. The one place the range
-/// lives: `validate` refuses a save with it and the link refuses to start on a saved port it fails.
-pub fn port_error(port: u32) -> Option<String> {
-    if (MIN_PORT..=65535).contains(&port) {
-        None
-    } else {
-        Some("the port must be between 1024 and 65535".to_string())
-    }
-}
 
 /// The firewall notice must be shown before a first non-loopback enable.
 pub const FIREWALL_FIRST: &str = "firewall_notice_required";

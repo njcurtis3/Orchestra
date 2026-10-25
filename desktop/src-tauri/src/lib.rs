@@ -8,11 +8,11 @@ mod window;
 use tauri::{Emitter, Manager, RunEvent};
 use tauri_plugin_notification::NotificationExt;
 
-use orchestra_core::{notify, projects, session};
+use orchestra_core::{host, notify, projects, session};
 
 use commands::AppSessions;
 use link::{LinkRef, LinkState};
-use session::{Event, Sessions, process, store, transcript};
+use session::{Event, process};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -35,21 +35,8 @@ pub fn run() {
             let notify_handle = app.handle().clone();
             // Saving stays off for the run when the file cannot be loaded; see `store::open`.
             let data_dir = app.path().app_data_dir().ok();
-            let (snapshot, status, writer) = match &data_dir {
-                Some(dir) => store::open(&dir.join("state.json")),
-                None => (None, store::StorageStatus::unreadable(), None),
-            };
-            // Transcripts follow the state file: with saving off they stay in memory.
-            let transcripts = match (&data_dir, &writer) {
-                (Some(dir), Some(_)) => transcript::TranscriptStore::disk(dir.join("transcripts")),
-                _ => transcript::TranscriptStore::memory(),
-            };
-            // Task worktrees live under the app data dir, nowhere near the projects.
-            let worktree_base = match &data_dir {
-                Some(dir) => dir.join("worktrees"),
-                None => std::env::temp_dir().join("orchestra-worktrees"),
-            };
-            let sessions: AppSessions = Sessions::with_writer(
+            let (sessions, status): (AppSessions, _) = host::open_host(
+                data_dir.as_deref(),
                 Box::new(move |event| {
                     let _ = match event {
                         Event::SessionUpdated(s) => handle.emit("session-updated", s),
@@ -73,17 +60,7 @@ pub fn run() {
                         .body(notify::body(project, notice.kind))
                         .show();
                 }),
-                writer,
-                transcripts,
-                worktree_base,
             );
-            if let Some(snapshot) = snapshot {
-                sessions.restore(snapshot);
-            }
-            // Restore spawns nothing; queued tasks start now, off the setup thread.
-            sessions.pump_in_background();
-            // Cleanups left pending get one more try now that no child can be holding a folder.
-            sessions.retry_pending_in_background();
             // The phone link: its files sit beside the app's, and it is off unless the saved
             // settings say otherwise. Starting it waits on sockets, so it runs off this thread.
             let link_handle = app.handle().clone();

@@ -5,6 +5,7 @@
 //! the listener (`server`) and one thread per connection (`conn`). See
 //! `protocol/README.md` "What P3 decided".
 
+pub mod addr;
 pub mod clients;
 mod conn;
 pub mod frame;
