@@ -1,0 +1,57 @@
+# orchestrad: the Orchestra headless host. Installed by hand; see ../README.md.
+# Copy to /etc/systemd/system/orchestrad.service. Nothing installs this file for you.
+
+[Unit]
+Description=Orchestra headless host (orchestrad)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orchestra
+Group=orchestra
+ExecStart=/usr/local/bin/orchestrad run --config /etc/orchestrad/config.toml
+# Sign-in secrets (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY), root-owned, mode 0600.
+# The leading "-" lets the unit start without the file (status then reports no sign-in).
+EnvironmentFile=-/etc/orchestrad/env
+# claude keeps its credentials under $HOME/.claude, so HOME is the state directory.
+Environment=HOME=/var/lib/orchestra
+StateDirectory=orchestra
+RuntimeDirectory=orchestrad
+RuntimeDirectoryMode=0700
+WorkingDirectory=/var/lib/orchestra
+StateDirectoryMode=0700
+UMask=0077
+
+# Stop takes the whole cgroup, so every claude process (and anything it spawned) goes with
+# the daemon. Written out because orchestrad runs no reaper of its own.
+KillMode=control-group
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Sandbox. Least privilege for a daemon that runs agents as a normal user.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# Deliberately NOT set:
+#   MemoryDenyWriteExecute  Node's JIT (claude is a Node program) maps writable and executable memory.
+#   RestrictNamespaces      Claude Code's bash sandbox may need user namespaces. Unconfirmed on a
+#                           real box; tighten it only after testing there.
+# Project folders outside /var/lib/orchestra need ReadWritePaths= in a drop-in (see the README).
+
+[Install]
+WantedBy=multi-user.target

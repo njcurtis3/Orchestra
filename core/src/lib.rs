@@ -1,4 +1,5 @@
 pub mod git;
+pub mod host;
 pub mod link;
 pub mod notify;
 pub mod paths;

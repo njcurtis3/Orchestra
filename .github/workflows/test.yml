@@ -31,12 +31,18 @@ jobs:
         run: uname -a && uname -m
       - name: No GUI crate in the core
         run: |
-          if cargo tree -p orchestra-core --locked -e normal,build | grep -iE 'gtk|web.?kit|tauri|wry'; then
-            echo "the core pulls in a GUI crate"
-            exit 1
-          fi
+          set -o pipefail
+          for pkg in orchestra-core orchestrad; do
+            tree=$(cargo tree -p "$pkg" --locked -e normal,build) || { echo "cargo tree failed for $pkg"; exit 1; }
+            if echo "$tree" | grep -iE 'gtk|web.?kit|tauri|wry'; then
+              echo "$pkg pulls in a GUI crate"
+              exit 1
+            fi
+          done
       - name: Test
         run: cargo test -p orchestra-core --locked
+      - name: Test orchestrad
+        run: cargo test -p orchestrad --locked
 
   windows-workspace:
     name: windows workspace
