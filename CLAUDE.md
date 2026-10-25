@@ -39,7 +39,7 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (259 core + 32 link + 4 wire fixtures + 44 shell, plus orchestrad's own)
+cd .. && cargo test --workspace  # Rust tests from the repo root (265 core + 32 link + 4 wire fixtures + 44 shell, plus orchestrad's own)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
 cargo test -p orchestrad --locked  # the headless host; its unit_file test pins the systemd sandbox
 cargo build --release -p orchestrad  # Linux only; install by hand, see orchestrad/README.md
