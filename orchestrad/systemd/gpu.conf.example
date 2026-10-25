@@ -1,0 +1,14 @@
+# Opt-in GPU access for orchestrad. Not installed by default; the default unit sees no devices.
+# Copy to /etc/systemd/system/orchestrad.service.d/gpu.conf, then:
+#   systemctl daemon-reload && systemctl restart orchestrad
+# Remove the file to take the access away again. GPU workloads are planned work (H4); this
+# only opens the device nodes, it adds no GPU support to orchestrad itself.
+# Every agent the daemon runs can then use the GPU. Enable it only on a box you mean that for.
+
+[Service]
+PrivateDevices=no
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia* rw
+DeviceAllow=/dev/dri rw
+SupplementaryGroups=video render
