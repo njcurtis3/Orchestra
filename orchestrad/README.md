@@ -38,7 +38,10 @@ systemctl daemon-reload
 Edit the config before you start. `binds` is the address the phone connects to (a LAN or
 Tailscale IPv4 address, never `0.0.0.0`); with no `binds` the link stays off and the daemon
 listens on nothing. Each `[[projects]]` path must be an absolute directory owned by the
-`orchestra` user (`chown -R orchestra:orchestra <dir>`), or it is logged and skipped. A bad
+`orchestra` user (`chown -R orchestra:orchestra <dir>`), or it is logged and skipped. The daemon serves exactly the projects in the config: one that
+was saved earlier but is no longer listed (or no longer passes the check) is hidden from phones,
+not deleted, and comes back when it is listed again. Its old sessions stay in the state
+file and its worktrees stay on disk, but nothing new can start there. A bad
 value, an unknown field or an unknown `schema` stops the daemon at start and names the field.
 
 The unit lets the daemon write only under `/var/lib/orchestra`. For a project folder
@@ -94,9 +97,10 @@ sudo -u orchestra orchestrad pair
 
 It prints a QR code on your terminal only. Scan it in the Orchestra app. The terminal then
 shows the phone's name and fingerprint; check it is your phone, and answer `y` to confirm
-or `N` to reject. Ctrl-C closes the pairing window. A client command finds the socket from `--socket PATH`, else `$RUNTIME_DIRECTORY`, else
-`$XDG_RUNTIME_DIR`, else `/run/orchestrad/control.sock`, so under `sudo` the default is the
-right one. The QR is drawn light on dark: on a light-theme terminal, switch to a dark theme
+or `N` to reject. Ctrl-C closes the pairing window. A client command finds the socket from `--socket PATH`, else
+`$RUNTIME_DIRECTORY/control.sock`, else `$XDG_RUNTIME_DIR/orchestrad/control.sock`, else
+`/run/orchestrad/control.sock`. Plain `sudo` clears those variables, so the last one is used;
+if you keep your environment (`sudo -E`), pass `--socket /run/orchestrad/control.sock`. The QR is drawn light on dark: on a light-theme terminal, switch to a dark theme
 before scanning. The same commands apply to:
 
 - `orchestrad clients` lists paired phones.
