@@ -35,6 +35,8 @@ struct Daemon {
     child: Child,
     dir: PathBuf,
     socket: PathBuf,
+    /// Remove `dir` on drop; off when several runs share one.
+    cleanup: bool,
 }
 
 impl Daemon {
@@ -55,7 +57,9 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if self.cleanup {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -72,8 +76,13 @@ fn cli(socket: &Path, args: &[&str]) -> std::process::Output {
 
 /// Start the daemon with a config body (after `schema = 1`) and wait until `status` answers.
 fn start(tag: &str, config_body: &str) -> Daemon {
-    let dir = temp_dir(tag);
-    std::fs::write(dir.join("config.toml"), format!("schema = 1\n{config_body}")).unwrap();
+    spawn_in(temp_dir(tag), config_body, true)
+}
+
+/// `start` in an existing directory, so a second run sees the first run's state.
+fn spawn_in(dir: PathBuf, config_body: &str, cleanup: bool) -> Daemon {
+    std::fs::write(dir.join("config.toml"), format!("schema = 1
+{config_body}")).unwrap();
     let run_dir = dir.join("run");
     let stderr = std::fs::File::create(dir.join("stderr.log")).unwrap();
     let child = Command::new(BIN)
@@ -92,7 +101,7 @@ fn start(tag: &str, config_body: &str) -> Daemon {
         .stderr(stderr)
         .spawn()
         .unwrap();
-    let daemon = Daemon { child, socket: run_dir.join("control.sock"), dir };
+    let daemon = Daemon { child, socket: run_dir.join("control.sock"), dir, cleanup };
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if daemon.cli(&["status"]).status.success() {
@@ -100,7 +109,8 @@ fn start(tag: &str, config_body: &str) -> Daemon {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("the daemon never answered status; its stderr:\n{}", daemon.stderr());
+    panic!("the daemon never answered status; its stderr:
+{}", daemon.stderr());
 }
 
 fn text(out: &[u8]) -> String {
@@ -180,6 +190,34 @@ fn the_pairing_secret_never_reaches_stderr() {
     assert!(log.contains("pairing window opened"), "{log}");
     assert!(!log.contains(&secret), "the pairing secret reached the daemon's stderr");
     assert!(!log.contains(&offer));
+}
+
+#[test]
+fn a_project_dropped_from_the_config_is_hidden_after_a_restart() {
+    skip_as_root!();
+    let dir = temp_dir("restart");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let with = format!("[[projects]]
+path = \"{}\"
+", project.display());
+    let mut first = spawn_in(dir.clone(), &with, false);
+    assert!(text(&first.cli(&["status"]).stdout).contains("proj"));
+    // SAFETY: signalling a child process this test started.
+    assert_eq!(unsafe { libc::kill(first.pid(), libc::SIGTERM) }, 0);
+    assert_eq!(first.child.wait().unwrap().code(), Some(0), "{}", first.stderr());
+    // Same state dir, project no longer in the config: it was saved, so it must be hidden.
+    let second = spawn_in(dir.clone(), "", false);
+    let log = second.stderr();
+    assert!(log.contains("1 saved project(s) are not in the config and are hidden"), "{log}");
+    assert!(text(&second.cli(&["status"]).stdout).contains("projects: none configured"));
+    // A third run with it listed again brings it back, with nothing hidden.
+    drop(second);
+    let third = spawn_in(dir.clone(), &with, false);
+    assert!(!third.stderr().contains("are hidden"), "{}", third.stderr());
+    assert!(third.stderr().contains("project proj ready"), "{}", third.stderr());
+    drop(third);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

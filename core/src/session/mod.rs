@@ -716,6 +716,16 @@ impl Sessions {
         Ok(project)
     }
 
+    /// Keep only the projects whose folders are in `allowed`; the rest are hidden, not
+    /// deleted (see `Projects::retain`). A hidden project's existing sessions and tasks stay
+    /// in the state file with their worktrees: they cannot be resumed or landed until the
+    /// folder is allowed again, exactly as when a project folder has gone. Only a host whose
+    /// projects come from a config calls this; the desktop never does. The hidden flag is not
+    /// persisted, so the host calls this on every start. Returns how many were hidden.
+    pub fn retain_projects(&self, allowed: &[PathBuf]) -> usize {
+        self.lock().projects.retain(allowed)
+    }
+
     pub fn list_projects(&self) -> Vec<Project> {
         self.lock().projects.list()
     }
@@ -1805,6 +1815,19 @@ mod tests {
         );
         let project = sessions.add_project(&std::env::temp_dir()).unwrap();
         (Rig { sessions, fake, sink, base, events, spawns, spawn_settings, notices }, project)
+    }
+
+    #[test]
+    fn retain_projects_hides_the_rest_and_blocks_new_work() {
+        let (r, p) = rig();
+        r.sessions.start(&p.id, "first", SessionSettings::default()).unwrap();
+        assert_eq!(r.sessions.retain_projects(&[]), 1);
+        assert!(r.sessions.list_projects().is_empty());
+        assert_eq!(r.sessions.start(&p.id, "again", SessionSettings::default()).unwrap_err(), "unknown project");
+        assert!(r.sessions.create_task(&p.id, "work", SessionSettings::default()).is_err(), "no new task there");
+        assert_eq!(r.sessions.list_sessions().len(), 1, "the session record stays");
+        assert_eq!(r.sessions.add_project(&std::env::temp_dir()).unwrap().id, p.id);
+        assert_eq!(r.sessions.list_projects().len(), 1);
     }
 
     impl Rig {

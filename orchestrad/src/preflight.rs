@@ -52,7 +52,18 @@ pub fn check(env: impl Fn(&str) -> Option<String>, is_file: impl Fn(&Path) -> bo
 
 /// `check` over the real environment and file system.
 pub fn check_system() -> Preflight {
-    check(|k| std::env::var(k).ok(), |p| p.is_file())
+    check(|k| std::env::var(k).ok(), |p| p.is_file() && (p.file_name() != Some(std::ffi::OsStr::new("claude")) || executable(p)))
+}
+
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn executable(_: &Path) -> bool {
+    true
 }
 
 impl Preflight {

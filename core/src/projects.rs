@@ -57,6 +57,19 @@ impl Projects {
         Ok(project)
     }
 
+    /// Hide every project whose folder is not in `allowed`, as if its folder were gone: it
+    /// leaves `list` and `get`, so nothing new can start there, and stays in the store with
+    /// its id, so adding the folder again brings it back. Nothing is deleted. Returns how
+    /// many were newly hidden. For a host whose project set comes from a config file.
+    pub fn retain(&mut self, allowed: &[PathBuf]) -> usize {
+        let mut hidden = 0;
+        for e in self.entries.iter_mut().filter(|e| !e.missing && !allowed.contains(&e.path)) {
+            e.missing = true;
+            hidden += 1;
+        }
+        hidden
+    }
+
     /// Usable projects only.
     pub fn list(&self) -> Vec<Project> {
         self.entries.iter().filter(|e| !e.missing).map(|e| e.project.clone()).collect()
@@ -130,6 +143,26 @@ mod tests {
         assert_eq!(p.add(&gone).unwrap().id, "p2", "a folder that came back is usable again");
         assert!(p.get("p2").is_some());
         let _ = std::fs::remove_dir_all(&gone);
+    }
+
+    #[test]
+    fn retain_hides_the_rest_and_add_brings_one_back() {
+        let dir = std::env::temp_dir();
+        let other = dir.join(format!("orchestra-retain-{}", std::process::id()));
+        std::fs::create_dir_all(&other).unwrap();
+        let mut p = Projects::default();
+        let a = p.add(&dir).unwrap();
+        let b = p.add(&other).unwrap();
+        assert_eq!(p.retain(&[dir.clone()]), 1);
+        assert_eq!(p.list(), vec![a.clone()]);
+        assert!(p.get(&b.id).is_none(), "a hidden project cannot start work");
+        assert_eq!(p.to_stored().len(), 2, "nothing is deleted");
+        assert_eq!(p.retain(&[dir.clone()]), 0, "already hidden");
+        assert_eq!(p.retain(&[]), 1);
+        assert!(p.list().is_empty());
+        assert_eq!(p.add(&other).unwrap().id, b.id, "the same id comes back");
+        assert!(p.get(&b.id).is_some());
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]

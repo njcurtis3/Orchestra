@@ -366,7 +366,11 @@ mod linux {
     use crate::{log, preflight, qr};
 
     /// A signal gets this long to finish the shutdown before the process gives up.
-    const SHUTDOWN_BUDGET: Duration = Duration::from_secs(4);
+    const SHUTDOWN_BUDGET: Duration = Duration::from_secs(12);
+    /// How long to wait for the link to close its connections. A phone stuck in a write can
+    /// hold `LinkHost::stop` for up to 30 s; by then the state is saved and agents are killed,
+    /// so the stop is still clean.
+    const LINK_STOP_WAIT: Duration = Duration::from_secs(6);
 
     fn euid() -> u32 {
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -423,7 +427,6 @@ mod linux {
         link: Option<Arc<LinkHost>>,
         state_dir: PathBuf,
         storage: StorageStatus,
-        preflight: Preflight,
         /// What became of each configured project at start.
         configured: Vec<(PathBuf, Option<Skip>)>,
         queue: Arc<PairQueue<PendingPairing>>,
@@ -495,7 +498,7 @@ mod linux {
                 listening,
                 paired: self.link.as_ref().and_then(|l| l.list_clients().ok()).map(|c| c.len()),
                 pairing_open: self.pairing_open(),
-                preflight: self.preflight.clone(),
+                preflight: preflight::check_system(),
                 projects,
                 sessions: counts,
             }
@@ -570,30 +573,29 @@ mod linux {
         }
     }
 
-    /// Add the configured projects that are folders owned by this user; log the rest.
-    fn add_projects(sessions: &Sessions, config: &Config, euid: u32) -> Vec<(PathBuf, Option<Skip>)> {
+    /// Decide which configured projects are served: folders owned by this user, judged on
+    /// the real path (symlinks resolved, so a link cannot be retargeted after the check).
+    /// Returns what became of each configured path and the accepted real paths.
+    fn vet_projects(config: &Config, euid: u32) -> (Vec<(PathBuf, Option<Skip>)>, Vec<PathBuf>) {
         let mut out = Vec::new();
+        let mut accepted = Vec::new();
         for path in &config.projects {
-            let meta = std::fs::metadata(path).ok();
-            let verdict = project_verdict(meta.as_ref().is_some_and(|m| m.is_dir()), meta.as_ref().map(|m| m.uid()), euid);
-            match verdict {
-                Ok(()) => match sessions.add_project(path) {
-                    Ok(p) => {
-                        log::info(&format!("project {} added", log::clean(&p.name)));
-                        out.push((path.clone(), None));
+            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let meta = std::fs::metadata(&real).ok();
+            match project_verdict(meta.as_ref().is_some_and(|m| m.is_dir()), meta.as_ref().map(|m| m.uid()), euid) {
+                Ok(()) => {
+                    if !accepted.contains(&real) {
+                        accepted.push(real);
                     }
-                    Err(e) => {
-                        log::warn(&format!("project {} skipped: {}", path.display(), log::clean(&e)));
-                        out.push((path.clone(), Some(Skip::NotAFolder)));
-                    }
-                },
+                    out.push((path.clone(), None));
+                }
                 Err(why) => {
                     log::warn(&format!("project {} skipped: {why}", path.display()));
                     out.push((path.clone(), Some(why)));
                 }
             }
         }
-        out
+        (out, accepted)
     }
 
     /// Start the host and serve until SIGTERM or SIGINT. The return value is the exit code.
@@ -647,7 +649,26 @@ mod linux {
         if !storage.ok {
             log::error(&format!("state is not being saved ({})", storage.reason.unwrap_or("unknown")));
         }
-        let configured = add_projects(&sessions, &config, euid);
+        // open_host restored every project ever saved. Serve exactly the config's accepted
+        // ones: the rest are hidden (not deleted), then the accepted ones are added.
+        let (mut configured, accepted) = vet_projects(&config, euid);
+        let hidden = sessions.retain_projects(&accepted);
+        if hidden > 0 {
+            log::warn(&format!("{hidden} saved project(s) are not in the config and are hidden"));
+        }
+        for path in &accepted {
+            match sessions.add_project(path) {
+                Ok(p) => log::info(&format!("project {} ready", log::clean(&p.name))),
+                Err(e) => {
+                    log::warn(&format!("project {} skipped: {}", path.display(), log::clean(&e)));
+                    for (c, skip) in configured.iter_mut() {
+                        if std::fs::canonicalize(&*c).is_ok_and(|r| &r == path) {
+                            *skip = Some(Skip::NotAFolder);
+                        }
+                    }
+                }
+            }
+        }
 
         let queue: Arc<PairQueue<PendingPairing>> = Arc::new(PairQueue::default());
         let mut link_config = LinkConfig::new(
@@ -696,7 +717,6 @@ mod linux {
             link: link.clone(),
             state_dir: state_dir.clone(),
             storage,
-            preflight,
             configured,
             queue,
             pairing_ttl,
@@ -726,6 +746,7 @@ mod linux {
 
         wait_signal(&signals);
         log::notice("stopping");
+        // Hard stop, inside the unit's TimeoutStopSec=15, for a hang in the steps below.
         std::thread::spawn(|| {
             std::thread::sleep(SHUTDOWN_BUDGET);
             log::error("shutdown did not finish in time; exiting");
@@ -733,10 +754,19 @@ mod linux {
         });
         daemon.close_pairing();
         drop(server);
-        if let Some(link) = &link {
-            link.stop();
-        }
+        // Sessions first: it saves the final state and kills the agents, and does not
+        // depend on any phone. Then the link, which a slow phone may hold up.
         sessions.shutdown();
+        if let Some(link) = link {
+            let (done, wait) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                link.stop();
+                let _ = done.send(());
+            });
+            if wait.recv_timeout(LINK_STOP_WAIT).is_err() {
+                log::warn("a phone connection was slow to close; exiting without waiting for it");
+            }
+        }
         log::notice("stopped");
         0
     }
