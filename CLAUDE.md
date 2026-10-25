@@ -16,13 +16,14 @@ Standalone app under the repos/ umbrella. Never import from a sibling app; see .
 | Path | What | Stack |
 |---|---|---|
 | `core/` | `orchestra-core`: the host engine (sessions, tasks, projects, notifications) and `link/`, the host side of the phone link (off until given an address); no tauri dependency | Rust 2024 |
+| `orchestrad/` | `orchestrad`: the headless host, a Linux daemon over `core/` (config file, local control socket, terminal pairing QR) with a hardened systemd unit in `systemd/`; no tauri dependency | Rust 2024 |
 | `desktop/` | Tauri shell over `core/` (`desktop/src-tauri`), UI in `desktop/src` | Tauri 2, React, TypeScript, Vite |
 | `mobile/` | Android remote | Expo (React Native, TypeScript), expo-router |
 | `protocol/` | Client <-> host message format, with shared JSON fixtures | TypeScript (source of truth), Rust copy in `core/src/wire` (`orchestra_core::wire`) |
 | `fleet/` | Vendored orchestration model | synced from upstream, **never hand-edited** |
-| `.github/workflows/` | `test.yml` (core on Linux x64 and arm64, Windows workspace, both front ends, macOS check); release matrix (desktop) | GitHub Actions, tauri-action |
+| `.github/workflows/` | `test.yml` (core and orchestrad on Linux x64 and arm64, Windows workspace, both front ends, macOS check); release matrix (desktop) | GitHub Actions, tauri-action |
 
-There is no root `package.json`. The root `Cargo.toml` is a Rust workspace (`core/`,
+There is no root `package.json`. The root `Cargo.toml` is a Rust workspace (`core/`, `orchestrad/`,
 `desktop/src-tauri`); `desktop/` and `mobile/` each install on their own.
 
 ## Commands
@@ -38,9 +39,11 @@ npm run tauri dev          # run the app (needs Rust)
 npm run build              # typecheck + build the frontend only (no Rust needed)
 npm test                   # frontend tests (vitest), including the protocol fixtures
 npx tsc -p ../protocol/tsconfig.json --noEmit  # typecheck protocol/ on its own
-cd .. && cargo test --workspace  # Rust tests from the repo root (255 core + 30 link + 4 wire fixtures + 44 shell)
+cd .. && cargo test --workspace  # Rust tests from the repo root (259 core + 32 link + 4 wire fixtures + 44 shell, plus orchestrad's own)
 cargo test -p orchestra-core --test wire_fixtures  # the Rust copy against protocol/fixtures
-# Linux behaviour (process groups, PDEATHSIG, symlink guards) is proven only in CI: test.yml runs the core tests there
+cargo test -p orchestrad --locked  # the headless host; its unit_file test pins the systemd sandbox
+cargo build --release -p orchestrad  # Linux only; install by hand, see orchestrad/README.md
+# Linux behaviour (process groups, PDEATHSIG, symlink guards, the orchestrad socket and daemon) is proven only in CI: test.yml runs the core and orchestrad tests there
 
 # mobile
 cd mobile && npm install

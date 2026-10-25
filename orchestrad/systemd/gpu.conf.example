@@ -1,0 +1,27 @@
+# Opt-in GPU access for orchestrad. Not installed by default; the default unit sees no devices.
+# Copy to /etc/systemd/system/orchestrad.service.d/gpu.conf, then:
+#   systemctl daemon-reload && systemctl restart orchestrad
+# Remove the file to take the access away again. GPU workloads are planned work (H4); this
+# only opens the device nodes, it adds no GPU support to orchestrad itself.
+# Every agent the daemon runs can then use the GPU. Enable it only on a box you mean that for.
+#
+# DeviceAllow= takes device nodes or class names from /proc/devices (char-NAME), never a glob
+# on a /dev path or a directory such as /dev/dri, so the classes are named here.
+# The NVIDIA class names differ by driver version (nvidia, nvidiactl, nvidia-uvm, nvidia-caps,
+# older ones nvidia-frontend), so char-nvidia* covers them. Check yours: grep nvidia /proc/devices
+# PrivateDevices=no turns the device list into an allowlist, which drops the pty nodes
+# PrivateDevices=yes had provided; they are allowed again below.
+#
+# Access to the nodes also needs the file permissions: add the service user to the groups
+# that own them (typically video and render), by hand and only for groups that exist here:
+#   usermod -aG video orchestra
+#   usermod -aG render orchestra
+# This is not SupplementaryGroups= on purpose: naming a group the distro lacks (some have no
+# "render") would stop the unit from starting at all.
+
+[Service]
+PrivateDevices=no
+DeviceAllow=char-nvidia* rw
+DeviceAllow=char-drm rw
+DeviceAllow=/dev/ptmx rw
+DeviceAllow=char-pts rw
