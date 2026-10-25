@@ -41,7 +41,7 @@ pub struct ClientInfo {
     pub paired_at: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Ok,
@@ -52,6 +52,25 @@ pub enum Reply {
     Pending { pending: Option<Pending> },
     Clients { clients: Vec<ClientInfo> },
     Error { message: String },
+}
+
+/// `Debug` is written by hand because an `Offer` holds the pairing secret: it must not
+/// reach a log or an error message by way of `{:?}`.
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => f.write_str("Ok"),
+            Self::Status { text } => f.debug_struct("Status").field("text", text).finish(),
+            Self::Offer { .. } => f.write_str("Offer { offer: <redacted> }"),
+            Self::Pending { pending } => {
+                f.debug_struct("Pending").field("pending", pending).finish()
+            }
+            Self::Clients { clients } => {
+                f.debug_struct("Clients").field("clients", clients).finish()
+            }
+            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+        }
+    }
 }
 
 /// What the server calls for each request. Implemented by the daemon, not here.
@@ -149,7 +168,7 @@ pub use unix::{Server, request, serve};
 #[cfg(target_os = "linux")]
 mod unix {
     use std::io::{self, BufRead, BufReader, Read, Write};
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -166,10 +185,16 @@ mod unix {
     /// A peer that sends nothing for this long is dropped.
     const READ_TIMEOUT: Duration = Duration::from_secs(30);
     const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How often the accept loop looks at the stop flag.
+    const POLL: Duration = Duration::from_millis(50);
 
-    /// A running control socket. Dropping it stops accepting and removes the socket file.
+    /// A running control socket. Dropping it stops accepting and removes the socket file it
+    /// created (not a different file that has since taken the path). Peers already
+    /// connected are turned away at their next request.
     pub struct Server {
         path: PathBuf,
+        /// Identity (dev, ino) of the socket file `bind` created.
+        id: (u64, u64),
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
     }
@@ -182,13 +207,16 @@ mod unix {
 
     impl Drop for Server {
         fn drop(&mut self) {
+            // The accept loop polls this flag, so stopping never depends on the path.
             self.stop.store(true, Ordering::SeqCst);
-            // Wake the blocked accept(); it sees the flag and returns.
-            let _ = UnixStream::connect(&self.path);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
-            let _ = std::fs::remove_file(&self.path);
+            if std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|m| m.file_type().is_socket() && (m.dev(), m.ino()) == self.id)
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 
@@ -230,21 +258,26 @@ mod unix {
         Ok(Some(Ok(line)))
     }
 
-    fn write_reply(stream: &mut UnixStream, reply: &Reply) -> io::Result<()> {
+    fn write_reply(stream: &mut impl Write, reply: &Reply) -> io::Result<()> {
         let line = encode_reply(reply)
             .or_else(|_| encode_reply(&Reply::Error { message: "reply is too large".into() }));
         stream.write_all(&line.map_err(|e| io::Error::other(e.to_string()))?)
     }
 
-    fn serve_peer(stream: UnixStream, handler: &dyn Handler) -> io::Result<()> {
+    fn serve_peer(stream: UnixStream, handler: &dyn Handler, stop: &AtomicBool) -> io::Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         if !peer_allowed(peer_uid(&stream)?, own_euid()) {
-            return Ok(());
+            let message = "run this as the user the daemon runs as".to_string();
+            return write_reply(&mut &stream, &Reply::Error { message });
         }
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
-        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let mut writer = stream.try_clone()?;
         let mut reader = BufReader::new(stream);
         while let Some(read) = read_line(&mut reader)? {
+            if stop.load(Ordering::SeqCst) {
+                return write_reply(&mut writer, &Reply::Error { message: "shutting down".into() });
+            }
             let reply = match read.and_then(|line| decode_request(&line)) {
                 Ok(request) => handler.handle(request),
                 Err(CodecError::TooLong) => {
@@ -290,28 +323,43 @@ mod unix {
         unsafe { libc::umask(previous) };
         let listener = bound?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(path)?;
+        let id = (meta.dev(), meta.ino());
+        listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = std::thread::Builder::new().name("control".into()).spawn(move || {
-            for stream in listener.incoming() {
-                if flag.load(Ordering::SeqCst) {
-                    break;
+            while !flag.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let handler = handler.clone();
+                        let flag = flag.clone();
+                        let _ = std::thread::Builder::new().name("control-peer".into()).spawn(
+                            move || {
+                                let _ = serve_peer(stream, handler.as_ref(), &flag);
+                            },
+                        );
+                    }
+                    // Nothing waiting, or an accept error such as running out of fds: look
+                    // again after a pause rather than spin.
+                    Err(_) => std::thread::sleep(POLL),
                 }
-                let Ok(stream) = stream else { continue };
-                let handler = handler.clone();
-                let _ = std::thread::Builder::new().name("control-peer".into()).spawn(move || {
-                    let _ = serve_peer(stream, handler.as_ref());
-                });
             }
         })?;
-        Ok(Server { path: path.to_path_buf(), stop, thread: Some(thread) })
+        Ok(Server { path: path.to_path_buf(), id, stop, thread: Some(thread) })
     }
 
     /// Sends one request and reads the reply. `timeout` bounds each read and write; pass
     /// `None` to wait as long as the handler does (`NextPairingRequest`).
     pub fn request(path: &Path, request: &Request, timeout: Option<Duration>) -> io::Result<Reply> {
         let mut stream = UnixStream::connect(path)?;
+        if !peer_allowed(peer_uid(&stream)?, own_euid()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the control socket is not owned by this user",
+            ));
+        }
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
         stream.write_all(&encode_request(request).map_err(|e| io::Error::other(e.to_string()))?)?;
@@ -379,6 +427,28 @@ mod unix {
             assert_eq!(echo.0.lock().unwrap().len(), 2);
             drop(server);
             assert!(!dir.join("control.sock").exists());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn drop_returns_promptly_after_the_socket_file_was_deleted() {
+            let (dir, server, _) = start("rm");
+            std::fs::remove_file(server.path()).unwrap();
+            let began = std::time::Instant::now();
+            drop(server);
+            assert!(began.elapsed() < Duration::from_secs(2));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn drop_leaves_a_different_socket_at_the_path_alone() {
+            let (dir, server, _) = start("other");
+            let path = server.path().to_path_buf();
+            std::fs::remove_file(&path).unwrap();
+            let other = UnixListener::bind(&path).unwrap();
+            drop(server);
+            assert!(path.exists());
+            drop(other);
             let _ = std::fs::remove_dir_all(dir);
         }
 
@@ -529,6 +599,16 @@ mod tests {
         ];
         for reply in replies {
             assert_eq!(decode_reply(&encode_reply(&reply).unwrap()).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn debug_of_an_offer_reply_never_shows_the_secret() {
+        let secret = "0123456789abcdef".repeat(4);
+        let reply = Reply::Offer { offer: format!("{{\"v\":1,\"secret\":\"{secret}\"}}") };
+        for text in [format!("{reply:?}"), format!("{reply:#?}"), format!("{:?}", Some(&reply))] {
+            assert!(!text.contains(&secret), "{text}");
+            assert!(text.contains("redacted"));
         }
     }
 
