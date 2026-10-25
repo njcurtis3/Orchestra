@@ -1,0 +1,25 @@
+# orchestrad config. Copy to /etc/orchestrad/config.toml (root:orchestra, mode 0640).
+# A bad value, an unknown field or an unknown schema stops the daemon at start; it names the field.
+# A missing file is valid: the daemon then listens on nothing and has no projects.
+
+schema = 1
+
+# Shown to a phone when it pairs. Optional.
+# host_name = "build-box"
+
+[link]
+# TCP port for the phone link, 1024-65535 (never 0).
+port = 47800
+# IPv4 addresses to listen on, at most 16. Never 0.0.0.0 or ::. Empty or absent means the
+# link is off, and it is off until you uncomment this. Use a LAN or Tailscale address; do not put this on the public internet.
+# binds = ["100.64.0.10"]
+
+[limits]
+# Simultaneous phone connections, 1-16. This can only lower the built-in cap.
+# max_connections = 4
+
+# Project folders the agents work in. Absolute, no ".." component, a directory owned by the
+# orchestra user. Anything else is logged and skipped. Outside /var/lib/orchestra, the unit
+# also needs ReadWritePaths= (see README.md).
+[[projects]]
+path = "/var/lib/orchestra/projects/example"

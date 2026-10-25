@@ -377,7 +377,7 @@ provider are P3b (built; see below); the phone Noise is A1. Nothing starts liste
   host already took).
 - **Not in P3a, now built in P3b.** The desktop Devices view (QR, paired list, revoke,
   scope grants, the confirm dialog), the persisted enable flag, the keyring provider and the
-  Tauri commands. **Still not built:** the phone Noise and its test vectors (A1); a Rust client (H3); `orchestrad` (H2);
+  Tauri commands. **Still not built:** the phone Noise and its test vectors (A1); a Rust client (H3);
   replay after a reconnect; TLS, a relay and mDNS.
 
 ## What A1 decided
