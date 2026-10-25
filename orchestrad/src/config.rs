@@ -19,6 +19,8 @@ pub const MAX_BINDS: usize = 16;
 /// The product's cap; the file may only lower it.
 pub const MAX_CONNECTIONS_CAP: i64 = 16;
 const MAX_HOST_NAME: usize = 64;
+/// Longest piece of file content an error message repeats back.
+const MAX_ECHO: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -49,6 +51,26 @@ impl ConfigError {
     fn invalid(field: impl Into<String>, reason: impl Into<String>) -> Self {
         ConfigError::Invalid { field: field.into(), reason: reason.into() }
     }
+}
+
+/// `s` cut to `MAX_ECHO` characters, so a huge value in the file cannot flood the log.
+fn clip(s: &str) -> String {
+    if s.chars().count() <= MAX_ECHO {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(MAX_ECHO).collect::<String>())
+    }
+}
+
+/// A toml error as one line. `to_string` (unlike `message`) keeps the key path, so a
+/// wrong-typed value names its field. Bounded, as it can carry a user-written key.
+fn parse_error(e: toml::de::Error) -> ConfigError {
+    let one_line = e.to_string().split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut msg: String = one_line.chars().take(4 * MAX_ECHO).collect();
+    if msg.len() < one_line.len() {
+        msg.push_str("...");
+    }
+    ConfigError::Parse(msg)
 }
 
 impl fmt::Display for ConfigError {
@@ -105,8 +127,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 }
 
 pub fn parse(text: &str) -> Result<Config, ConfigError> {
-    let mut table: toml::Table =
-        text.parse().map_err(|e: toml::de::Error| ConfigError::Parse(e.message().to_string()))?;
+    let mut table: toml::Table = text.parse().map_err(parse_error)?;
     // The schema is checked before the rest so a newer file is reported as such, not as
     // a pile of unknown fields.
     match table.remove("schema") {
@@ -114,7 +135,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         Some(_) => return Err(ConfigError::invalid("schema", format!("only schema {SCHEMA} is known"))),
         None => return Err(ConfigError::invalid("schema", format!("missing; this build reads schema {SCHEMA}"))),
     }
-    let raw: Raw = table.try_into().map_err(|e: toml::de::Error| ConfigError::Parse(e.message().to_string()))?;
+    let raw: Raw = table.try_into().map_err(parse_error)?;
     validate(raw)
 }
 
@@ -151,7 +172,7 @@ fn validate(raw: Raw) -> Result<Config, ConfigError> {
         let ip: IpAddr = text
             .trim()
             .parse()
-            .map_err(|_| ConfigError::invalid(&field, format!("{text:?} is not an IP address")))?;
+            .map_err(|_| ConfigError::invalid(&field, format!("{:?} is not an IP address", clip(text))))?;
         let v4 = match ip {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(v6) => {
@@ -196,7 +217,12 @@ fn validate(raw: Raw) -> Result<Config, ConfigError> {
         if path.components().any(|c| c == Component::ParentDir) {
             return Err(ConfigError::invalid(&field, "must not contain '..'"));
         }
-        projects.push(path);
+        if p.path.contains('\0') {
+            return Err(ConfigError::invalid(&field, "must not contain a NUL byte"));
+        }
+        if !projects.contains(&path) {
+            projects.push(path);
+        }
     }
 
     Ok(Config { host_name, port, binds, max_connections, projects })
@@ -340,6 +366,66 @@ mod tests {
         let c = parse("schema = 1\n[limits]\nmax_connections = 16\n").unwrap();
         assert_eq!(to_link_limits(&c).max_connections, 16);
         assert_eq!(to_link_limits(&Config::default()).max_connections, 16);
+    }
+
+    #[test]
+    fn a_wrong_type_names_its_field() {
+        let cases = [
+            ("schema = 1
+host_name = 5
+", "host_name"),
+            ("schema = 1
+[link]
+port = \"5000\"
+", "link.port"),
+            ("schema = 1
+[link]
+binds = \"127.0.0.1\"
+", "link.binds"),
+            ("schema = 1
+[limits]
+max_connections = \"4\"
+", "limits.max_connections"),
+            ("schema = 1
+[[projects]]
+path = 5
+", "path"),
+            ("schema = 1
+link = 5
+", "link"),
+        ];
+        for (text, field) in cases {
+            match parse(text) {
+                Err(ConfigError::Parse(m)) => assert!(m.contains(field), "{text:?} -> {m}"),
+                other => panic!("{text:?} -> {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn echoed_input_is_truncated() {
+        let huge = "x".repeat(10_000);
+        let bind = parse(&with_binds(&format!("\"{huge}\""))).unwrap_err().to_string();
+        assert!(bind.len() < 300, "{}", bind.len());
+        let key = parse(&format!("schema = 1
+{huge} = 1
+")).unwrap_err().to_string();
+        assert!(key.len() < 600, "{}", key.len());
+    }
+
+    #[test]
+    fn duplicate_projects_collapse_and_nul_is_refused() {
+        let c = parse("schema = 1
+[[projects]]
+path = \"/a\"
+[[projects]]
+path = \"/a\"
+").unwrap();
+        assert_eq!(c.projects.len(), 1);
+        assert_eq!(field_of(parse("schema = 1
+[[projects]]
+path = \"/a\\u0000b\"
+")), "projects[0].path");
     }
 
     #[test]
