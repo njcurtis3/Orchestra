@@ -7,6 +7,8 @@
 #
 # DeviceAllow= takes device nodes or class names from /proc/devices (char-NAME), never a glob
 # on a /dev path or a directory such as /dev/dri, so the classes are named here.
+# The NVIDIA class names differ by driver version (nvidia, nvidiactl, nvidia-uvm, nvidia-caps,
+# older ones nvidia-frontend), so char-nvidia* covers them. Check yours: grep nvidia /proc/devices
 # PrivateDevices=no turns the device list into an allowlist, which drops the pty nodes
 # PrivateDevices=yes had provided; they are allowed again below.
 #
@@ -19,8 +21,7 @@
 
 [Service]
 PrivateDevices=no
-DeviceAllow=char-nvidia-frontend rw
-DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=char-nvidia* rw
 DeviceAllow=char-drm rw
 DeviceAllow=/dev/ptmx rw
 DeviceAllow=char-pts rw

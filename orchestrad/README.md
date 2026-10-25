@@ -75,7 +75,7 @@ it keeps running, logs an error that names `claude setup-token` and the env file
 ```bash
 systemctl enable --now orchestrad
 journalctl -u orchestrad -f          # logs; client ids only, never keys or secrets
-sudo -u orchestra env RUNTIME_DIRECTORY=/run/orchestrad orchestrad status
+sudo -u orchestra orchestrad status
 ```
 
 `status` prints the version, state directory, listening addresses, paired phones, whether
@@ -85,16 +85,19 @@ Docker, use `--init`.
 
 ## Pair a phone
 
-The control socket is `$RUNTIME_DIRECTORY/control.sock`, mode 0600, and only the daemon's
+The control socket is `/run/orchestrad/control.sock`, mode 0600, and only the daemon's
 own user may talk to it, so run the commands as `orchestra`:
 
 ```bash
-sudo -u orchestra env RUNTIME_DIRECTORY=/run/orchestrad orchestrad pair
+sudo -u orchestra orchestrad pair
 ```
 
 It prints a QR code on your terminal only. Scan it in the Orchestra app. The terminal then
 shows the phone's name and fingerprint; check it is your phone, and answer `y` to confirm
-or `N` to reject. Ctrl-C closes the pairing window. Instead of the environment word, any of these commands also takes `--socket /run/orchestrad/control.sock`. The same applies to:
+or `N` to reject. Ctrl-C closes the pairing window. A client command finds the socket from `--socket PATH`, else `$RUNTIME_DIRECTORY`, else
+`$XDG_RUNTIME_DIR`, else `/run/orchestrad/control.sock`, so under `sudo` the default is the
+right one. The QR is drawn light on dark: on a light-theme terminal, switch to a dark theme
+before scanning. The same commands apply to:
 
 - `orchestrad clients` lists paired phones.
 - `orchestrad revoke <id>` removes one.

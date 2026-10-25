@@ -83,8 +83,9 @@ fn gpu_example_carries_the_device_lines() {
     assert!(has(GPU, "PrivateDevices=no"));
     // DeviceAllow takes device nodes or char-/block- class names; it takes no globs on
     // /dev paths and no directories, so /dev/nvidia* and /dev/dri would be silently dropped.
-    assert!(has(GPU, "DeviceAllow=char-nvidia-frontend rw"));
-    assert!(has(GPU, "DeviceAllow=char-nvidia-uvm rw"));
+    assert!(has(GPU, "DeviceAllow=char-nvidia* rw"));
+    // Newer drivers have no nvidia-frontend class, so naming it alone would deny the GPU.
+    assert!(!has(GPU, "DeviceAllow=char-nvidia-frontend rw"));
     assert!(has(GPU, "DeviceAllow=char-drm rw"));
     // With PrivateDevices=no the allowlist applies, so the pty nodes must be re-allowed.
     assert!(has(GPU, "DeviceAllow=/dev/ptmx rw"));
