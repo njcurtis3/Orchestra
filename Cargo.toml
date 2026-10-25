@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "desktop/src-tauri"]
+members = ["core", "desktop/src-tauri", "orchestrad"]
 
 # Profiles are read from the workspace root only; a member's own profile is ignored.
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
