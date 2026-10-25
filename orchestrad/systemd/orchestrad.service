@@ -20,6 +20,7 @@ StateDirectory=orchestra
 RuntimeDirectory=orchestrad
 RuntimeDirectoryMode=0700
 WorkingDirectory=/var/lib/orchestra
+StateDirectoryMode=0700
 UMask=0077
 
 # Stop takes the whole cgroup, so every claude process (and anything it spawned) goes with

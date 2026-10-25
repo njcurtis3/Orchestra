@@ -11,8 +11,8 @@ schema = 1
 # TCP port for the phone link, 1024-65535 (never 0).
 port = 47800
 # IPv4 addresses to listen on, at most 16. Never 0.0.0.0 or ::. Empty or absent means the
-# link is off. Use a LAN or Tailscale address; do not put this on the public internet.
-binds = ["100.64.0.10"]
+# link is off, and it is off until you uncomment this. Use a LAN or Tailscale address; do not put this on the public internet.
+# binds = ["100.64.0.10"]
 
 [limits]
 # Simultaneous phone connections, 1-16. This can only lower the built-in cap.

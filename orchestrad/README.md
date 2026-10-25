@@ -94,7 +94,7 @@ sudo -u orchestra env RUNTIME_DIRECTORY=/run/orchestrad orchestrad pair
 
 It prints a QR code on your terminal only. Scan it in the Orchestra app. The terminal then
 shows the phone's name and fingerprint; check it is your phone, and answer `y` to confirm
-or `N` to reject. Ctrl-C closes the pairing window. The same two environment words apply to:
+or `N` to reject. Ctrl-C closes the pairing window. Instead of the environment word, any of these commands also takes `--socket /run/orchestrad/control.sock`. The same applies to:
 
 - `orchestrad clients` lists paired phones.
 - `orchestrad revoke <id>` removes one.
@@ -106,6 +106,7 @@ Keep the terminal private while the QR is on screen: it carries the pairing secr
 The unit sees no devices (`PrivateDevices=yes`). To open them, copy
 `systemd/gpu.conf.example` to `/etc/systemd/system/orchestrad.service.d/gpu.conf`, run
 `systemctl daemon-reload && systemctl restart orchestrad`. Every agent can then use the GPU.
+Add the `orchestra` user to the groups that own the device nodes yourself (`usermod -aG video orchestra`, and `render` if your distro has it); the drop-in does not, because a group that does not exist would stop the unit from starting.
 This only opens the device nodes; GPU workloads are planned work (H4).
 
 ## Security notes

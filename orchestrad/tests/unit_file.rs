@@ -72,6 +72,7 @@ fn nodes_jit_and_user_namespaces_stay_allowed() {
 #[test]
 fn state_and_secrets_paths() {
     assert!(has(UNIT, "StateDirectory=orchestra"));
+    assert!(has(UNIT, "StateDirectoryMode=0700"));
     assert!(has(UNIT, "RuntimeDirectory=orchestrad"));
     assert!(has(UNIT, "EnvironmentFile=-/etc/orchestrad/env"));
     assert!(has(UNIT, "ExecStart=/usr/local/bin/orchestrad run --config /etc/orchestrad/config.toml"));
@@ -80,7 +81,19 @@ fn state_and_secrets_paths() {
 #[test]
 fn gpu_example_carries_the_device_lines() {
     assert!(has(GPU, "PrivateDevices=no"));
-    assert!(has(GPU, "DeviceAllow=/dev/nvidia* rw"));
-    assert!(has(GPU, "DeviceAllow=/dev/dri rw"));
-    assert!(has(GPU, "SupplementaryGroups=video render"));
+    // DeviceAllow takes device nodes or char-/block- class names; it takes no globs on
+    // /dev paths and no directories, so /dev/nvidia* and /dev/dri would be silently dropped.
+    assert!(has(GPU, "DeviceAllow=char-nvidia-frontend rw"));
+    assert!(has(GPU, "DeviceAllow=char-nvidia-uvm rw"));
+    assert!(has(GPU, "DeviceAllow=char-drm rw"));
+    // With PrivateDevices=no the allowlist applies, so the pty nodes must be re-allowed.
+    assert!(has(GPU, "DeviceAllow=/dev/ptmx rw"));
+    assert!(has(GPU, "DeviceAllow=char-pts rw"));
+    assert!(!lines(GPU).iter().any(|l| l.starts_with("DeviceAllow=/dev/nvidia") || l.starts_with("DeviceAllow=/dev/dri")));
+}
+
+#[test]
+fn gpu_example_does_not_make_a_missing_group_fatal() {
+    // SupplementaryGroups= naming a group the distro lacks (e.g. render) fails the start.
+    assert!(!key_present(GPU, "SupplementaryGroups"));
 }
